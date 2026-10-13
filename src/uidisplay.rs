@@ -1287,7 +1287,7 @@ mod tests {
             s.write_all(&buf).unwrap();
             return;
         }
-        s.write_all(&setup(crate::util::Geometry::default(), 0x0020_0000)).unwrap();
+        s.write_all(&setup(crate::util::Geometry::default(), crate::bridge::x11::CLIENT_RESOURCE_ID_BASE)).unwrap();
         let mut req = [0u8; 4];
         // InternAtom: header + name
         s.read_exact(&mut req).unwrap();
