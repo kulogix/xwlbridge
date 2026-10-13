@@ -11,7 +11,10 @@ pub const DEFAULT_HELPERS: &[&str] = &["xembedsniproxy", "xpra"];
 
 /// Programs whose XTest is the desktop's, whatever the X server does with it:
 /// VNC servers (RealVNC's agent and cores, x11vnc, TigerVNC's scraping server,
-/// GNOME's old Vino, KDE's krfb) and keyboard/mouse-sharing clients.
+/// GNOME's old Vino, KDE's krfb), keyboard/mouse-sharing clients, and
+/// remote-support tools such as TeamViewer's capture process
+/// (`TeamViewer_Desktop`, whose kernel `comm` is truncated to
+/// `TeamViewer_Desk`, so it is recognised by its executable or `argv[0]`).
 pub const DEFAULT_DRIVERS: &[&str] = &[
     "vncagent",
     "vncserver-x11",
@@ -20,6 +23,7 @@ pub const DEFAULT_DRIVERS: &[&str] = &[
     "x0vncserver",
     "vino-server",
     "krfb",
+    "TeamViewer_Desktop",
     "barrierc",
     "input-leapc",
     "deskflow-core",
@@ -170,6 +174,28 @@ mod tests {
         assert_eq!(r.classify(&["anything".into()]), Class::Driver);
         let r = Rules::new(Some(""), Some("none"));
         assert_eq!(r.classify(&["x11vnc".into()]), Class::Other);
+    }
+
+    #[test]
+    fn teamviewer_desktop_is_a_default_driver() {
+        let names = [
+            "TeamViewer_Desk".to_string(),
+            "TeamViewer_Desktop".to_string(),
+            "/opt/teamviewer/tv_bin/TeamViewer_Desktop".to_string(),
+        ];
+        let r = Rules::new(None, None);
+        assert_eq!(r.classify(&names), Class::Driver);
+        assert_eq!(r.classify(&["TeamViewer_Desk".into()]), Class::Other);
+        let r = Rules::new(None, Some("TeamViewer_Desktop"));
+        assert_eq!(r.classify(&names), Class::Driver);
+        assert_eq!(r.classify(&["TeamViewer_Desk".into()]), Class::Other);
+        assert_eq!(r.classify(&["x11vnc".into()]), Class::Other);
+        let r = Rules::new(None, Some("default,TeamViewer_Desktop"));
+        assert_eq!(r.classify(&names), Class::Driver);
+        assert_eq!(r.classify(&["TeamViewer_Desk".into()]), Class::Other);
+        assert_eq!(r.classify(&["x11vnc".into()]), Class::Driver);
+        let r = Rules::new(None, Some("none"));
+        assert_eq!(r.classify(&names), Class::Other);
     }
 
     #[test]

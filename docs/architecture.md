@@ -67,7 +67,7 @@ With the gnome backend the remote-desktop session runs on demand. It starts whil
 Only XTest meant for the desktop is forwarded.
 
 - `-xtesthelpers names`: programs whose XTest only drives windows on the bridge display. Default `xembedsniproxy,xpra`.
-- `-xtestdrivers names`: programs whose XTest always reaches the desktop. Default: the VNC servers and KVM clients. Stock engines.
+- `-xtestdrivers names`: programs whose XTest always reaches the desktop. Default: the VNC servers, the KVM clients, and TeamViewer's capture process. Stock engines.
 - `-xtestgrace ms`: keys a one-shot client leaves held stay down this long for another client to release. Default 1000.
 - `-xtestpersist`: keep held keys like Xorg.
 

@@ -2,6 +2,12 @@
 
 All notable changes to xwlbridge are listed here. The format follows Keep a Changelog.
 
+## Unreleased
+
+### Fixed
+
+- TeamViewer's capture process (`TeamViewer_Desktop`) is a default desktop driver: its keys reach the desktop without `-xtestdrivers` naming it (the process is matched by its executable and `argv[0]`; its kernel `comm` is truncated to `TeamViewer_Desk`). Before, its keys stayed on the bridge display unless `-xtestdrivers` named it.
+
 ## 0.1.0 (2026-10-13)
 
 First release under the name xwlbridge. It is based on xwlrvnc 0.0.8 by Patrick Gaskin.
