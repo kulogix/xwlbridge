@@ -7,7 +7,7 @@ set -u
 W=${W:-/w}
 T=$W/tools/x11-a11y-proxy
 TA=$T/tests/apps
-BIN=${BIN:-$W/target/release/xwlrvnc}
+BIN=${BIN:-$W/target/release/xwlbridge}
 BRIDGE_FLAGS=${BRIDGE_FLAGS:--a11ybus -reverseinput}
 mkdir -p "$OUT"
 SIZE=${SIZE:-1280x720} W=$W source $T/tests/bed/shell_session.sh >"$OUT/session.txt" 2>&1

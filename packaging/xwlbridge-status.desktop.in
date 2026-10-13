@@ -2,8 +2,8 @@
 Type=Application
 Name=VNC Server (Wayland desktop)
 GenericName=Remote desktop sharing
-Comment=RealVNC Server's status and options for this GNOME desktop (xwlrvnc)
-Exec=@BINDIR@/xwlrvnc-ctl show
+Comment=RealVNC Server's status and options for this GNOME desktop (xwlbridge)
+Exec=@BINDIR@/xwlbridge-ctl show
 Icon=@ICON@
 Terminal=false
 Categories=Network;RemoteAccess;

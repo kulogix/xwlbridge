@@ -1,7 +1,7 @@
 # Remote desktop on the lock screen (GNOME Shell extension)
 
-`xwlrvnc-lockscreen@xwlrvnc` keeps remote desktop sessions open while the screen is locked, so a remote user
-(RealVNC Server through xwlrvnc, or any other client of mutter's RemoteDesktop/ScreenCast D-Bus APIs) sees the
+`xwlbridge-lockscreen@xwlbridge` keeps remote desktop sessions open while the screen is locked, so a remote user
+(RealVNC Server through xwlbridge, or any other client of mutter's RemoteDesktop/ScreenCast D-Bus APIs) sees the
 lock screen and can unlock it with the account password, as with VNC on Xorg.
 
 ## Why it is needed
@@ -10,7 +10,7 @@ When the screen locks, gnome-shell switches to its `unlock-dialog` session mode.
 screencasts, so gnome-shell asks mutter to inhibit remote access, and mutter closes every remote desktop session
 and refuses new ones until someone unlocks at the computer. Without the extension:
 
-- xwlrvnc shows a padlock to its X clients (and so to every VNC viewer) for as long as the screen is locked,
+- xwlbridge shows a padlock to its X clients (and so to every VNC viewer) for as long as the screen is locked,
   rather than the last picture of the desktop;
 - a remote user cannot unlock: someone has to unlock at the computer, and then the picture comes back by itself.
 
@@ -35,16 +35,16 @@ default back.
 
 ```sh
 mkdir -p ~/.local/share/gnome-shell/extensions
-cp -r contrib/gnome-shell/xwlrvnc-lockscreen@xwlrvnc ~/.local/share/gnome-shell/extensions/
-gnome-extensions enable xwlrvnc-lockscreen@xwlrvnc     # a running Wayland session only sees new extensions
+cp -r contrib/gnome-shell/xwlbridge-lockscreen@xwlbridge ~/.local/share/gnome-shell/extensions/
+gnome-extensions enable xwlbridge-lockscreen@xwlbridge     # a running Wayland session only sees new extensions
 # ...after the next login; to have it enabled then without a second step:
 gsettings set org.gnome.shell enabled-extensions "$(python3 -c 'import ast,subprocess; \
   v=ast.literal_eval(subprocess.check_output(["gsettings","get","org.gnome.shell","enabled-extensions"],text=True).replace("@as ","")); \
-  u="xwlrvnc-lockscreen@xwlrvnc"; print(v if u in v else v+[u])')"
+  u="xwlbridge-lockscreen@xwlbridge"; print(v if u in v else v+[u])')"
 ```
 
-Then log out and in once. Check with `gnome-extensions info xwlrvnc-lockscreen@xwlrvnc` (State: ACTIVE);
-xwlrvnc also logs at start which lock-screen behaviour viewers will get.
+Then log out and in once. Check with `gnome-extensions info xwlbridge-lockscreen@xwlbridge` (State: ACTIVE);
+xwlbridge also logs at start which lock-screen behaviour viewers will get.
 
 GNOME turns all user extensions off when gnome-shell crashes shortly after it started
 (`org.gnome.Shell-disable-extensions.service`). If remote unlock stops working after such a crash, check
@@ -60,11 +60,11 @@ the password into it. Tested on GDM/GNOME Shell 50.1 (Ubuntu 26.04): the login s
 viewer, the password typed in the viewer, the user's session and its own service then took over.
 
 1. Install system-wide (the login screen does not read users' home directories):
-   `sudo cp -r xwlrvnc-lockscreen@xwlrvnc /usr/share/gnome-shell/extensions/`
+   `sudo cp -r xwlbridge-lockscreen@xwlbridge /usr/share/gnome-shell/extensions/`
 2. Enable it for GDM. Ubuntu/Debian: append to `/etc/gdm3/greeter.dconf-defaults`
    ```
    [org/gnome/shell]
-   enabled-extensions=['xwlrvnc-lockscreen@xwlrvnc']
+   enabled-extensions=['xwlbridge-lockscreen@xwlbridge']
    ```
    then `sudo /usr/share/gdm/generate-config` (Fedora/RHEL: a keyfile in `/etc/dconf/db/gdm.d/` and
    `sudo dconf update`). It applies from the next login screen on.
@@ -73,7 +73,7 @@ viewer, the password typed in the viewer, the user's session and its own service
    be started per login screen as that user with that bus (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`,
    `WAYLAND_DISPLAY=wayland-0`). This was tested by hand (a transient unit with `systemd-run --uid=<uid>`, x11vnc
    on a local port with no authentication behind an ssh tunnel), not with a packaged unit or with RealVNC as
-   that user. xwlrvnc exits with 69 about 10 s after the login screen's session (and bus) ends.
+   that user. xwlbridge exits with 69 about 10 s after the login screen's session (and bus) ends.
 4. Ports: RealVNC Server does not retry a listening port it found busy ("TcpListenerManager: not accepting
    connections: failed to listen on at least one address") and then runs without listening. A login-screen
    server on the same port as the user's must be gone before the user's service starts, or use another port.
@@ -84,7 +84,7 @@ intent; the per-user install (above) does not do this.
 
 ## Tested
 
-GNOME Shell 50.1 (Ubuntu 26.04, real Wayland session in a KVM VM) with RealVNC Server 6.11 through xwlrvnc and
+GNOME Shell 50.1 (Ubuntu 26.04, real Wayland session in a KVM VM) with RealVNC Server 6.11 through xwlbridge and
 the real RealVNC Viewer: locking with `loginctl lock-session`, `org.gnome.ScreenSaver.Lock` and Super+L typed in
 the viewer; connecting to an already locked screen; unlocking with the password typed in the viewer; idle
 lock and display blanking (a VM test of the session lifecycle). GNOME Shell 46 and 48

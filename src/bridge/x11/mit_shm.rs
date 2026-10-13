@@ -54,7 +54,7 @@ impl Shm {
         // SAFETY: plain syscalls; the fd is owned from here on, and the
         // mapping is recorded and unmapped on detach/drop.
         unsafe {
-            let raw = libc::memfd_create(c"xwlrvnc-shm".as_ptr(), libc::MFD_CLOEXEC);
+            let raw = libc::memfd_create(c"xwlbridge-shm".as_ptr(), libc::MFD_CLOEXEC);
             if raw < 0 {
                 return Err(io::Error::last_os_error());
             }

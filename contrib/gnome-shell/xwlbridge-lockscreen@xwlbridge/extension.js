@@ -1,4 +1,4 @@
-// Remote desktop on the lock screen (xwlrvnc) — GNOME Shell 46–50.
+// Remote desktop on the lock screen (xwlbridge) — GNOME Shell 46–50.
 //
 // When the screen locks, gnome-shell switches to its 'unlock-dialog' session mode, which does not allow
 // screencasts, and tells mutter's remote access controller to inhibit remote access

@@ -29,7 +29,7 @@ from .window import ProxyWindow  # noqa: E402
 
 ACCESSIBILITY_CONF = ('/usr/share/defaults/at-spi2/accessibility.conf',
                       '/usr/local/share/defaults/at-spi2/accessibility.conf')
-IGNORED_TITLES = re.compile(r'^(Qt Selection Owner for .*|sun-awt-X11-.*|xwlrvnc.*)$')
+IGNORED_TITLES = re.compile(r'^(Qt Selection Owner for .*|sun-awt-X11-.*|xwlbridge.*)$')
 
 
 def parse_args(argv):

@@ -280,7 +280,7 @@ impl Classifier {
             return w.clone();
         }
         let who = if base == self.agent_base {
-            Who { base, class: Class::Agent, name: "xwlrvnc".into(), program: String::new(), pid: None }
+            Who { base, class: Class::Agent, name: "xwlbridge".into(), program: String::new(), pid: None }
         } else {
             let pid = self.conn.as_ref().and_then(|c| attrib::client_pid(c, base));
             let names = pid.map(crate::bridge::injectors::process_names).unwrap_or_default();

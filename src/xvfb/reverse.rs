@@ -24,7 +24,7 @@
 //!   toplevel, the compositor's close as `WM_DELETE_WINDOW`, and the
 //!   compositor's size as the X window's size.
 //! - Input: the desktop's pointer and keyboard on a shown window are injected
-//!   with XTest on a separate XInput2 master device ("xwlrvnc-reverse"), so
+//!   with XTest on a separate XInput2 master device ("xwlbridge-reverse"), so
 //!   they reach that window and nothing else: the agent ignores raw events
 //!   from that master instead of forwarding them to the desktop, and the core
 //!   (desktop) pointer is held by the agent's grab, so it can't reach a shown
@@ -71,7 +71,7 @@ use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE,
 
 /// The master device the desktop's input on shown windows (or a proxy's)
 /// goes through.
-pub const MASTER_NAME: &str = "xwlrvnc-reverse";
+pub const MASTER_NAME: &str = "xwlbridge-reverse";
 
 /// Largest side of a shown window, and the most bytes its two buffers may
 /// take: anything bigger is not shown (one client must not be able to break
@@ -450,7 +450,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         buttons_down: Vec::new(),
         released: Vec::new(),
         frame_done: Vec::new(),
-        throttle: std::env::var_os("XWLRVNC_SHOW_NOTHROTTLE").is_none_or(|v| v.is_empty()),
+        throttle: std::env::var_os("XWLBRIDGE_SHOW_NOTHROTTLE").is_none_or(|v| v.is_empty()),
         close: Vec::new(),
         resize: Vec::new(),
         placed: Vec::new(),
@@ -949,7 +949,7 @@ impl State {
                 s.frame_pending = false;
                 if let Some(t) = s.committed_at {
                     let ms = t.elapsed().as_millis();
-                    if ms > 30 && std::env::var_os("XWLRVNC_SHOW_FRAMELOG").is_some_and(|v| !v.is_empty()) {
+                    if ms > 30 && std::env::var_os("XWLBRIDGE_SHOW_FRAMELOG").is_some_and(|v| !v.is_empty()) {
                         crate::warning!("-showwindows: frame callback of {w:#x} {ms} ms after its commit (dirty: {})", s.dirty);
                     }
                 }
@@ -1488,8 +1488,8 @@ impl State {
         let surface = compositor.create_surface(qh, self.root);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, self.root);
         let toplevel = xdg_surface.get_toplevel(qh, self.root);
-        toplevel.set_title(format!("X display :{display} (xwlrvnc)"));
-        toplevel.set_app_id("xwlrvnc-screen".into());
+        toplevel.set_title(format!("X display :{display} (xwlbridge)"));
+        toplevel.set_app_id("xwlbridge-screen".into());
         let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, qh, ()));
         if viewport.is_some() {
             // fill the work area, scaled to fit (the X screen is the
@@ -1728,7 +1728,7 @@ impl State {
 }
 
 fn memfd(len: usize) -> Result<OwnedFd, AnyError> {
-    let fd = unsafe { libc::memfd_create(c"xwlrvnc-window".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"xwlbridge-window".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -2054,8 +2054,8 @@ mod tests {
 
     #[test]
     fn add_master_length_counts_header_and_padding() {
-        // "xwlrvnc-reverse": 4 + 4 + 15 = 23 bytes, padded to 24
-        assert_eq!(add_master_len(MASTER_NAME.len()), 6);
+        // "xwlbridge-reverse": 4 + 4 + 17 = 25 bytes, padded to 28
+        assert_eq!(add_master_len(MASTER_NAME.len()), 7);
         assert_eq!(add_master_len(0), 2);
         assert_eq!(add_master_len(4), 3);
         assert_eq!(add_master_len(5), 4);

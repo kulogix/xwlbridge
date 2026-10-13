@@ -95,7 +95,7 @@ pub fn mutter_major(conn: &Connection) -> Option<u32> {
 }
 
 /// The lock-screen extension shipped in `contrib/gnome-shell/`.
-pub const LOCKSCREEN_EXTENSION: &str = "xwlrvnc-lockscreen@xwlrvnc";
+pub const LOCKSCREEN_EXTENSION: &str = "xwlbridge-lockscreen@xwlbridge";
 
 /// A GNOME Shell extension's state (`org.gnome.Shell.Extensions`): `None` if
 /// it isn't installed (or the shell can't be asked), else gnome-shell's

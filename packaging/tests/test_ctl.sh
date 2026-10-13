@@ -1,11 +1,11 @@
 #!/bin/bash
-# Unit tests for xwlrvnc-ctl: settings parsing/editing, the command it builds,
+# Unit tests for xwlbridge-ctl: settings parsing/editing, the command it builds,
 # and the engine binary guard (RealVNC's set-uid Xvnc must never be chosen, nor
 # executed). Needs only bash + coreutils; runs as an ordinary user.
 #   bash packaging/tests/test_ctl.sh
 set -u
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-CTL=$HERE/../xwlrvnc-ctl
+CTL=$HERE/../xwlbridge-ctl
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 PASS=0; FAILN=0
 ok() { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
@@ -14,22 +14,22 @@ check() { local name=$1; shift; if "$@"; then ok "$name"; else bad "$name"; fi; 
 
 export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config XDG_RUNTIME_DIR=$T/run
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
-unset XWLRVNC_CONFIG DISPLAY
+unset XWLBRIDGE_CONFIG DISPLAY
 MARK=$T/EXECUTED
 
 # fake bridge: prints its argv and what "Xvnc"/"Xvfb" resolve to on its PATH
 mkdir -p "$T/pkg/bin"
-cat >"$T/pkg/bin/xwlrvnc" <<'EOF'
+cat >"$T/pkg/bin/xwlbridge" <<'EOF'
 #!/bin/bash
-[ "${1:-}" = -version ] && { echo "xwlrvnc 0.0.8"; exit 0; }
+[ "${1:-}" = -version ] && { echo "xwlbridge 0.0.8"; exit 0; }
 [ "${1:-}" = -help ] && { echo " -backend auto|wlr|gnome"; echo " -engine builtin|xvfb|xvnc"; echo " -uidisplay display|auto"; exit 0; }
 printf 'ARG=%s\n' "$@"
 printf 'XVNC=%s\n' "$(readlink -f "$(command -v Xvnc)" 2>/dev/null)"
 printf 'XVFB=%s\n' "$(readlink -f "$(command -v Xvfb)" 2>/dev/null)"
 EOF
-chmod 755 "$T/pkg/bin/xwlrvnc"
-cp "$CTL" "$T/pkg/bin/xwlrvnc-ctl"; chmod 755 "$T/pkg/bin/xwlrvnc-ctl"
-C=$T/pkg/bin/xwlrvnc-ctl
+chmod 755 "$T/pkg/bin/xwlbridge"
+cp "$CTL" "$T/pkg/bin/xwlbridge-ctl"; chmod 755 "$T/pkg/bin/xwlbridge-ctl"
+C=$T/pkg/bin/xwlbridge-ctl
 
 # fake RealVNC server programs
 mkdir -p "$T/rvnc"
@@ -46,17 +46,17 @@ printf '#!/bin/sh\ntouch %s\n' "$MARK" >"$T/xvfb/Xvfb"; chmod 755 "$T/xvfb/Xvfb"
 # the system's tools without any X server (the test machine may have TigerVNC/Xvfb installed)
 mkdir -p "$T/sys"
 for f in /usr/bin/* /bin/*; do
-  case ${f##*/} in X|Xorg|Xvnc|Xtigervnc|Xvfb|Xwayland|Xnest|Xephyr|xwlrvnc|xwlrvnc-ctl|vncserver-x11*) continue;; esac
+  case ${f##*/} in X|Xorg|Xvnc|Xtigervnc|Xvfb|Xwayland|Xnest|Xephyr|xwlbridge|xwlbridge-ctl|vncserver-x11*) continue;; esac
   [ -e "$T/sys/${f##*/}" ] || ln -s "$f" "$T/sys/${f##*/}"
 done
 SYS=$T/sys
 
-conf() { mkdir -p "$XDG_CONFIG_HOME/xwlrvnc"; printf '%s\n' "$@" >"$XDG_CONFIG_HOME/xwlrvnc/xwlrvnc.conf"; }
+conf() { mkdir -p "$XDG_CONFIG_HOME/xwlbridge"; printf '%s\n' "$@" >"$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf"; }
 
 # a private X socket directory with a live display :5 (the desktop's Xwayland stand-in)
-export XWLRVNC_X11_UNIX_DIR=$T/x11
-mkdir -p "$XWLRVNC_X11_UNIX_DIR"
-python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$XWLRVNC_X11_UNIX_DIR/X5" 2>/dev/null || \
+export XWLBRIDGE_X11_UNIX_DIR=$T/x11
+mkdir -p "$XWLBRIDGE_X11_UNIX_DIR"
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$XWLBRIDGE_X11_UNIX_DIR/X5" 2>/dev/null || \
   { echo "test_ctl.sh needs python3 to make a unix socket" >&2; exit 2; }
 cmdline() { PATH=$1 "$C" command 2>"$T/err"; }
 has_arg() { grep -qxF -- "$1" <<<"$2"; }
@@ -86,19 +86,19 @@ for want in "engine: 'nope'" "capture: 'x'" "rfb_port: '70000' is not a TCP port
   check "reports: $want" grep -qF -- "$want" "$T/err"
 done
 
-rm -f "$XDG_CONFIG_HOME/xwlrvnc/xwlrvnc.conf"
-cp "$HERE/../xwlrvnc.conf" "$T/pkg/bin/xwlrvnc.conf"   # template beside the script (source tree layout)
+rm -f "$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf"
+cp "$HERE/../xwlbridge.conf" "$T/pkg/bin/xwlbridge.conf"   # template beside the script (source tree layout)
 PATH="$T/empty:$SYS" "$C" config set rfb_port 5902 2>/dev/null
-check "config set creates the file from the template" grep -q '^# xwlrvnc: RealVNC Server' "$XDG_CONFIG_HOME/xwlrvnc/xwlrvnc.conf"
+check "config set creates the file from the template" grep -q '^# xwlbridge: RealVNC Server' "$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf"
 check "config get" test "$(PATH="$T/empty:$SYS" "$C" config get rfb_port)" = 5902
-check "config set replaces in place" test "$(grep -c '^rfb_port=' "$XDG_CONFIG_HOME/xwlrvnc/xwlrvnc.conf")" = 1
+check "config set replaces in place" test "$(grep -c '^rfb_port=' "$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf")" = 1
 PATH="$T/empty:$SYS" "$C" config set engine bogus 2>/dev/null; rc=$?
 check "config set rejects a bad value" test $rc -ne 0 -a "$(PATH="$T/empty:$SYS" "$C" config get engine)" = auto
 PATH="$T/empty:$SYS" "$C" config set server_args '-Authentication=VncAuth -Encryption=AlwaysOn' 2>/dev/null
 check "config set multi-word value" test "$(PATH="$T/empty:$SYS" "$C" config get server_args)" = "-Authentication=VncAuth -Encryption=AlwaysOn"
 PATH="$T/empty:$SYS" "$C" config unset rfb_port 2>/dev/null
 check "config unset -> default" test "$(PATH="$T/empty:$SYS" "$C" config get rfb_port)" = 5900
-check "config file mode 0600" test "$(stat -c %a "$XDG_CONFIG_HOME/xwlrvnc/xwlrvnc.conf")" = 600
+check "config file mode 0600" test "$(stat -c %a "$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf")" = 600
 
 # ---- engine guard
 base=("server=$T/rvnc/vncserver-x11" "uidisplay=:5")
@@ -126,8 +126,8 @@ check "auto + TigerVNC -> xvnc" grep -qx -- "ARG=xvnc" <<<"$out"
 conf "engine=xvfb" "${base[@]}"
 out=$(PATH="$T/xvfb:$T/empty:$SYS" "$C" run 2>/dev/null)
 check "xvfb engine via private PATH" grep -qx -- "XVFB=$T/xvfb/Xvfb" <<<"$out"
-check "private engine dir is 0700" test "$(stat -c %a "$XDG_RUNTIME_DIR/xwlrvnc/bin")" = 700
-check "no decoy or engine was ever executed by xwlrvnc-ctl" test ! -e "$MARK"
+check "private engine dir is 0700" test "$(stat -c %a "$XDG_RUNTIME_DIR/xwlbridge/bin")" = 700
+check "no decoy or engine was ever executed by xwlbridge-ctl" test ! -e "$MARK"
 
 # ---- uidisplay: RealVNC never runs on the built-in X server without its windows on the desktop
 # (its UI segfaults there every ~2 s); the stock engines may hide them
@@ -217,29 +217,29 @@ case "$*" in
   "--user is-active graphical-session.target")
     n=$(cat "$FAKE_DIR/gs" 2>/dev/null || echo 0); echo $((n + 1)) >"$FAKE_DIR/gs"
     if [ "$n" -lt 3 ]; then echo activating; exit 3; else echo active; fi;;
-  "--user is-active xwlrvnc.service") echo active;;
-  "--user enable xwlrvnc.service") mkdir -p "$HOME/.config/systemd/user/graphical-session.target.wants"
-    ln -sf ../xwlrvnc.service "$HOME/.config/systemd/user/graphical-session.target.wants/xwlrvnc.service";;
-  "--user disable --now xwlrvnc.service") rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/xwlrvnc.service";;
+  "--user is-active xwlbridge-realvnc.service") echo active;;
+  "--user enable xwlbridge-realvnc.service") mkdir -p "$HOME/.config/systemd/user/graphical-session.target.wants"
+    ln -sf ../xwlbridge-realvnc.service "$HOME/.config/systemd/user/graphical-session.target.wants/xwlbridge-realvnc.service";;
+  "--user disable --now xwlbridge-realvnc.service") rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/xwlbridge-realvnc.service";;
   *) ;;
 esac
 exit 0
 EOS
 chmod 755 "$T/fakebin/systemctl"
-cp "$HERE/../install.sh" "$HERE/../uninstall.sh" "$HERE/../xwlrvnc.service.in" "$HERE/../xwlrvnc-status.desktop.in" "$HERE/../xwlrvnc.conf" "$T/pkg/bin/"
+cp "$HERE/../install.sh" "$HERE/../uninstall.sh" "$HERE/../xwlbridge-realvnc.service.in" "$HERE/../xwlbridge-status.desktop.in" "$HERE/../xwlbridge.conf" "$T/pkg/bin/"
 before=$(cd "$H2" && find . | sort)
-out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlrvnc" 2>&1); rc=$?
+out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
 check "install.sh (no root, fake user manager) rc 0" test $rc -eq 0
 check "  ...waited for graphical-session.target" grep -q 'waiting for the GNOME session to finish starting (activating)' <<<"$out"
-check "  ...then (re)started the service" grep -qx -- '--user restart xwlrvnc.service' "$T/systemctl.log"
-check "  ...unit rendered with the install path" grep -qx "ExecStart=$H2/.local/bin/xwlrvnc-ctl run" "$H2/.config/systemd/user/xwlrvnc.service"
+check "  ...then (re)started the service" grep -qx -- '--user restart xwlbridge-realvnc.service' "$T/systemctl.log"
+check "  ...unit rendered with the install path" grep -qx "ExecStart=$H2/.local/bin/xwlbridge-ctl run" "$H2/.config/systemd/user/xwlbridge-realvnc.service"
 # a stop/logout exits 0 (the bridge's own doing); every failure status still restarts
 check "  ...unit: a crash restarts, a stop is a success by its status 0 alone" bash -c 'grep -qx "Restart=on-failure" "$1" &&
   ! grep -qE "^[[:space:]]*SuccessExitStatus[[:space:]]*=" "$1" &&
-  ! grep -qE "^[[:space:]]*RestartPreventExitStatus[[:space:]]*=.*\<(143|69|70|137|139)\>" "$1"' _ "$H2/.config/systemd/user/xwlrvnc.service"
-check "  ...settings 0600" test "$(stat -c %a "$H2/.config/xwlrvnc/xwlrvnc.conf")" = 600
-check "  ...app-grid entry" grep -qx "Exec=$H2/.local/bin/xwlrvnc-ctl show" "$H2/.local/share/applications/xwlrvnc-status.desktop"
-out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H2/.local/share/xwlrvnc/uninstall.sh" --purge 2>&1); rc=$?
+  ! grep -qE "^[[:space:]]*RestartPreventExitStatus[[:space:]]*=.*\<(143|69|70|137|139)\>" "$1"' _ "$H2/.config/systemd/user/xwlbridge-realvnc.service"
+check "  ...settings 0600" test "$(stat -c %a "$H2/.config/xwlbridge/xwlbridge.conf")" = 600
+check "  ...app-grid entry" grep -qx "Exec=$H2/.local/bin/xwlbridge-ctl show" "$H2/.local/share/applications/xwlbridge-status.desktop"
+out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H2/.local/share/xwlbridge/uninstall.sh" --purge 2>&1); rc=$?
 check "uninstall.sh --purge rc 0" test $rc -eq 0
 after=$(cd "$H2" && find . | sort)
 check "  ...HOME exactly as before the install" test "$before" = "$after"
@@ -248,49 +248,49 @@ check "  ...HOME exactly as before the install" test "$before" = "$after"
 H3=$T/home3; mkdir -p "$H3/.vnc/config.d" "$H3/.cache"
 printf '%s\n' 'RfbPort=5911' 'IpClientAddresses=+127.0.0.1,-' >"$H3/.vnc/config.d/vncserver-x11"
 before=$(cd "$H3" && find . | sort)
-out=$(HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlrvnc" --no-start 2>&1); rc=$?
-check "install with RealVNC's own RfbPort -> rfb_port=realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2" && grep -q "RfbPort=5911" <<<"$3"' _ $rc "$H3/.config/xwlrvnc/xwlrvnc.conf" "$out"
+out=$(HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start 2>&1); rc=$?
+check "install with RealVNC's own RfbPort -> rfb_port=realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2" && grep -q "RfbPort=5911" <<<"$3"' _ $rc "$H3/.config/xwlbridge/xwlbridge.conf" "$out"
 check "  ...RealVNC's file untouched" test "$(cat "$H3/.vnc/config.d/vncserver-x11")" = "$(printf '%s\n' 'RfbPort=5911' 'IpClientAddresses=+127.0.0.1,-')"
-# the bridge's -uidisplay hook copy (newer bridges: ~/.cache/xwlrvnc) is runtime litter of ours
-mkdir -p "$H3/.cache/xwlrvnc"; : >"$H3/.cache/xwlrvnc/xwlrvnc-uihook-0123456789abcdef.so"
-HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H3/.local/share/xwlrvnc/uninstall.sh" --purge >/dev/null 2>&1
+# the bridge's -uidisplay hook copy (newer bridges: ~/.cache/xwlbridge) is runtime litter of ours
+mkdir -p "$H3/.cache/xwlbridge"; : >"$H3/.cache/xwlbridge/xwlbridge-uihook-0123456789abcdef.so"
+HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H3/.local/share/xwlbridge/uninstall.sh" --purge >/dev/null 2>&1
 after=$(cd "$H3" && find . | sort)
 check "  ...uninstall --purge: HOME as before (hook cache dir removed, RealVNC settings kept)" test "$before" = "$after"
 # --purge without the before-list keeps ~/.vnc entirely (it cannot tell the user's files from RealVNC's new ones)
 H6=$T/home6; mkdir -p "$H6/.vnc/config.d"; printf 'Password=x\n' >"$H6/.vnc/config.d/vncserver-x11"
-HOME=$H6 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlrvnc" --no-start >/dev/null 2>&1
+HOME=$H6 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start >/dev/null 2>&1
 : >"$H6/.vnc/created-after-install"
-rm -f "$H6/.local/share/xwlrvnc/vnc-before.list"
-out=$(HOME=$H6 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H6/.local/share/xwlrvnc/uninstall.sh" --purge 2>&1)
+rm -f "$H6/.local/share/xwlbridge/vnc-before.list"
+out=$(HOME=$H6 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H6/.local/share/xwlbridge/uninstall.sh" --purge 2>&1)
 check "uninstall --purge without vnc-before.list keeps ~/.vnc" bash -c '[ -f "$1/.vnc/config.d/vncserver-x11" ] && [ -f "$1/.vnc/created-after-install" ] && grep -q "kept ~/.vnc" <<<"$2"' _ "$H6" "$out"
 # with the list: only what appeared since goes; a name with a newline cannot reach outside ~/.vnc
 H7=$T/home7; mkdir -p "$H7/.vnc/config.d"; printf 'Password=x\n' >"$H7/.vnc/config.d/vncserver-x11"; : >"$H7/victim"
-HOME=$H7 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlrvnc" --no-start >/dev/null 2>&1
+HOME=$H7 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start >/dev/null 2>&1
 : >"$H7/.vnc/new-after-install"
 mkdir -p "$H7/.vnc/evil"$'\n'"$H7" && : >"$H7/.vnc/evil"$'\n'"$H7/victim"   # find prints "...evil" + newline + "$H7/victim"
-HOME=$H7 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H7/.local/share/xwlrvnc/uninstall.sh" --purge >/dev/null 2>&1
+HOME=$H7 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H7/.local/share/xwlbridge/uninstall.sh" --purge >/dev/null 2>&1
 check "uninstall --purge: new files gone, old settings and files outside ~/.vnc kept" bash -c '[ ! -e "$1/.vnc/new-after-install" ] && [ -f "$1/.vnc/config.d/vncserver-x11" ] && [ -f "$1/victim" ]' _ "$H7"
 # a link inside ~/.vnc plus a crafted name: nothing outside ~/.vnc is reached
 H8=$T/home8; mkdir -p "$H8/.vnc/config.d"; printf 'Password=x\n' >"$H8/.vnc/config.d/vncserver-x11"; : >"$H8/victim"
-HOME=$H8 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlrvnc" --no-start >/dev/null 2>&1
+HOME=$H8 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start >/dev/null 2>&1
 ln -s "$H8" "$H8/.vnc/aaa"
 mkdir -p "$H8/.vnc/evil"$'\n'"$H8/.vnc/aaa" && : >"$H8/.vnc/evil"$'\n'"$H8/.vnc/aaa/victim"   # a line "$H8/.vnc/aaa/victim"
-HOME=$H8 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H8/.local/share/xwlrvnc/uninstall.sh" --purge >/dev/null 2>&1
+HOME=$H8 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H8/.local/share/xwlbridge/uninstall.sh" --purge >/dev/null 2>&1
 check "uninstall --purge: a link in ~/.vnc plus a crafted name keeps the file outside" bash -c '[ -f "$1/victim" ] && [ -f "$1/.vnc/config.d/vncserver-x11" ] && [ ! -e "$1/.vnc/aaa" ]' _ "$H8"
 # the -uidisplay hook stays while a bridge started by hand runs; stale engine dirs go
-H9=$T/home9; RT9=$T/rt9; mkdir -p "$H9" "$RT9" "$T/procs"; cp "$(command -v bash)" "$T/procs/xwlrvnc"
-HOME=$H9 XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_RUNTIME_DIR=$RT9 FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlrvnc" --no-start >/dev/null 2>&1
-: >"$RT9/xwlrvnc-uihook-0123456789abcdef.so"
-"$T/procs/xwlrvnc" -c 'sleep 30; :' & HANDMADE=$!
+H9=$T/home9; RT9=$T/rt9; mkdir -p "$H9" "$RT9" "$T/procs"; cp "$(command -v bash)" "$T/procs/xwlbridge"
+HOME=$H9 XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_RUNTIME_DIR=$RT9 FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start >/dev/null 2>&1
+: >"$RT9/xwlbridge-uihook-0123456789abcdef.so"
+"$T/procs/xwlbridge" -c 'sleep 30; :' & HANDMADE=$!
 sleep 30 & LIVE=$!; ( exit 0 ) & DEADP=$!; wait $DEADP
-mkdir -p "$RT9/xwlrvnc-$DEADP-abcdef" "$RT9/xwlrvnc-$LIVE-ghijkl"; : >"$RT9/xwlrvnc-$DEADP-abcdef/Xauthority"
-out=$(HOME=$H9 XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_RUNTIME_DIR=$RT9 FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H9/.local/share/xwlrvnc/uninstall.sh" 2>&1)
-check "uninstall keeps the hook while a hand-started bridge runs" bash -c '[ -f "$1/xwlrvnc-uihook-0123456789abcdef.so" ] && grep -q "kept the -uidisplay hook" <<<"$2"' _ "$RT9" "$out"
-check "  ...and removes a dead bridge's engine directory, not a live one's" bash -c '[ ! -e "$1/xwlrvnc-$2-abcdef" ] && [ -d "$1/xwlrvnc-$3-ghijkl" ]' _ "$RT9" "$DEADP" "$LIVE"
+mkdir -p "$RT9/xwlbridge-$DEADP-abcdef" "$RT9/xwlbridge-$LIVE-ghijkl"; : >"$RT9/xwlbridge-$DEADP-abcdef/Xauthority"
+out=$(HOME=$H9 XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_RUNTIME_DIR=$RT9 FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H9/.local/share/xwlbridge/uninstall.sh" 2>&1)
+check "uninstall keeps the hook while a hand-started bridge runs" bash -c '[ -f "$1/xwlbridge-uihook-0123456789abcdef.so" ] && grep -q "kept the -uidisplay hook" <<<"$2"' _ "$RT9" "$out"
+check "  ...and removes a dead bridge's engine directory, not a live one's" bash -c '[ ! -e "$1/xwlbridge-$2-abcdef" ] && [ -d "$1/xwlbridge-$3-ghijkl" ]' _ "$RT9" "$DEADP" "$LIVE"
 kill $HANDMADE $LIVE 2>/dev/null; wait $HANDMADE $LIVE 2>/dev/null
-out=$(HOME=$T/home4 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash -c 'mkdir -p "$HOME"; bash "$1" --bin "$2" --port realvnc --no-start' _ "$T/pkg/bin/install.sh" "$T/pkg/bin/xwlrvnc" 2>&1); rc=$?
-check "install --port realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2"' _ $rc "$T/home4/.config/xwlrvnc/xwlrvnc.conf"
-out=$(HOME=$T/home5 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash -c 'mkdir -p "$HOME"; bash "$1" --bin "$2" --port bogus --no-start' _ "$T/pkg/bin/install.sh" "$T/pkg/bin/xwlrvnc" 2>&1); rc=$?
+out=$(HOME=$T/home4 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash -c 'mkdir -p "$HOME"; bash "$1" --bin "$2" --port realvnc --no-start' _ "$T/pkg/bin/install.sh" "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
+check "install --port realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2"' _ $rc "$T/home4/.config/xwlbridge/xwlbridge.conf"
+out=$(HOME=$T/home5 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash -c 'mkdir -p "$HOME"; bash "$1" --bin "$2" --port bogus --no-start' _ "$T/pkg/bin/install.sh" "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
 check "install --port bogus -> refused" test $rc -ne 0
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"

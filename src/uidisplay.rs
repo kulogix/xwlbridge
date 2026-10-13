@@ -53,7 +53,7 @@ use x11rb_protocol::protocol::xproto::{
 use x11rb_protocol::x11_utils::{Request, TryParse};
 
 /// The hook, for the target this was built for.
-static HOOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libxwlrvnc_uihook.so"));
+static HOOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libxwlbridge_uihook.so"));
 
 /// Where RealVNC's UI goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,16 +63,16 @@ pub struct UiDisplay {
     pub xauthority: Option<OsString>,
 }
 
-/// Resolves `-uidisplay`: a display name, or `auto` for the X display xwlrvnc
+/// Resolves `-uidisplay`: a display name, or `auto` for the X display xwlbridge
 /// itself was started with (in a GNOME session, its Xwayland). The authority
-/// file is xwlrvnc's `XAUTHORITY`, or else mutter's Xwayland cookie in the
+/// file is xwlbridge's `XAUTHORITY`, or else mutter's Xwayland cookie in the
 /// runtime directory.
 pub fn resolve(arg: &str) -> Result<UiDisplay, String> {
     let display = if arg.eq_ignore_ascii_case("auto") {
         match env::var_os("DISPLAY") {
             Some(d) if !d.is_empty() => d,
             _ => {
-                return Err("-uidisplay auto: xwlrvnc has no DISPLAY to put RealVNC's UI on (run it from the \
+                return Err("-uidisplay auto: xwlbridge has no DISPLAY to put RealVNC's UI on (run it from the \
                             desktop session, or name the display: -uidisplay :0)"
                     .into());
             }
@@ -98,7 +98,7 @@ pub enum Choice {
 
 /// Resolves `-uidisplay`: `arg` is its value (`None`: not given), `realvnc`
 /// whether the command is RealVNC's server. Not given, RealVNC's UI goes on
-/// the X display xwlrvnc was started with, if that is a local one (in a
+/// the X display xwlbridge was started with, if that is a local one (in a
 /// desktop session: its Xwayland), as with `auto`. `Err` only for a value
 /// given explicitly.
 pub fn choose(arg: Option<&str>, realvnc: bool) -> Result<Choice, String> {
@@ -107,7 +107,7 @@ pub fn choose(arg: Option<&str>, realvnc: bool) -> Result<Choice, String> {
         Some(a) => Choice::Display(resolve(a)?),
         None if !realvnc => Choice::Off(None),
         None => match env::var_os("DISPLAY").filter(|d| !d.is_empty()) {
-            None => Choice::Off(Some("xwlrvnc has no DISPLAY: not started in a desktop session".into())),
+            None => Choice::Off(Some("xwlbridge has no DISPLAY: not started in a desktop session".into())),
             Some(d) if !is_local(&d) => {
                 Choice::Off(Some(format!("DISPLAY {} is not a local display", d.to_string_lossy())))
             }
@@ -138,7 +138,7 @@ pub fn is_local(display: &OsStr) -> bool {
         .is_some_and(|p| p.protocol.as_deref() == Some("unix") || (p.host.is_empty() && p.protocol.is_none()))
 }
 
-/// Whether `ui` is X display number `n` of this machine (xwlrvnc's own).
+/// Whether `ui` is X display number `n` of this machine (xwlbridge's own).
 pub fn same_display(ui: &UiDisplay, n: u32) -> bool {
     let Some(p) = ui.display.to_str().and_then(|d| parse(d).ok()) else {
         return false;
@@ -317,7 +317,7 @@ fn find_cookie(data: &[u8], host: &[u8], display: u16) -> Option<(Vec<u8>, Vec<u
 }
 
 /// Writes the hook where the wrapped command can load it: the runtime
-/// directory (private to the user), else `~/.cache/xwlrvnc`, under a name
+/// directory (private to the user), else `~/.cache/xwlbridge`, under a name
 /// derived from its contents, so runs share one copy and an older build's copy
 /// is never reused.
 ///
@@ -329,7 +329,7 @@ fn find_cookie(data: &[u8], host: &[u8], display: u16) -> Option<(Vec<u8>, Vec<u
 pub fn install_hook() -> io::Result<PathBuf> {
     let mut why = Vec::new();
     let runtime = env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
-    let cache = env::var_os("HOME").filter(|d| !d.is_empty()).map(|h| PathBuf::from(h).join(".cache/xwlrvnc"));
+    let cache = env::var_os("HOME").filter(|d| !d.is_empty()).map(|h| PathBuf::from(h).join(".cache/xwlbridge"));
     for (dir, create) in [(runtime, false), (cache, true)] {
         let Some(dir) = dir else { continue };
         if create && let Err(e) = fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
@@ -372,11 +372,11 @@ fn usable_dir(dir: &Path) -> io::Result<()> {
 }
 
 fn install_in(dir: &Path) -> io::Result<PathBuf> {
-    let path = dir.join(format!("xwlrvnc-uihook-{:016x}.so", fnv1a(HOOK)));
+    let path = dir.join(format!("xwlbridge-uihook-{:016x}.so", fnv1a(HOOK)));
     if is_our_copy(&path) {
         return Ok(path);
     }
-    let tmp = dir.join(format!(".xwlrvnc-uihook-{}.tmp", std::process::id()));
+    let tmp = dir.join(format!(".xwlbridge-uihook-{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp); // a leftover of a crashed run with our pid
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -589,9 +589,9 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// Creates the gate for this xwlrvnc process in `dir`.
+    /// Creates the gate for this xwlbridge process in `dir`.
     pub fn create(dir: &Path, on: bool) -> io::Result<Gate> {
-        let path = dir.join(format!("xwlrvnc-ui-{}.gate", std::process::id()));
+        let path = dir.join(format!("xwlbridge-ui-{}.gate", std::process::id()));
         let mut gate = Gate { path, on: !on };
         gate.set(on)?;
         Ok(gate)
@@ -610,7 +610,7 @@ impl Gate {
             return Ok(());
         }
         let dir = self.path.parent().unwrap_or(Path::new("."));
-        let tmp = dir.join(format!(".xwlrvnc-ui-{}.gate.tmp", std::process::id()));
+        let tmp = dir.join(format!(".xwlbridge-ui-{}.gate.tmp", std::process::id()));
         let _ = fs::remove_file(&tmp);
         let mut f = fs::OpenOptions::new()
             .write(true)
@@ -913,18 +913,18 @@ pub fn apply(cmd: &mut Command, hook: &Path, ui: Option<(&UiDisplay, Option<&Pat
         preload.push(":");
         preload.push(&previous);
     }
-    cmd.env("LD_PRELOAD", preload).env("XWLRVNC_UI_LD_PRELOAD", previous);
+    cmd.env("LD_PRELOAD", preload).env("XWLBRIDGE_UI_LD_PRELOAD", previous);
     // what the user may have exported must not steer the hook
-    for var in ["XWLRVNC_UI_DISPLAY", "XWLRVNC_UI_XAUTHORITY", "XWLRVNC_UI_GATE"] {
+    for var in ["XWLBRIDGE_UI_DISPLAY", "XWLBRIDGE_UI_XAUTHORITY", "XWLBRIDGE_UI_GATE"] {
         cmd.env_remove(var);
     }
     if let Some((ui, gate)) = ui {
-        cmd.env("XWLRVNC_UI_DISPLAY", &ui.display);
+        cmd.env("XWLBRIDGE_UI_DISPLAY", &ui.display);
         if let Some(auth) = &ui.xauthority {
-            cmd.env("XWLRVNC_UI_XAUTHORITY", auth);
+            cmd.env("XWLBRIDGE_UI_XAUTHORITY", auth);
         }
         if let Some(gate) = gate {
-            cmd.env("XWLRVNC_UI_GATE", gate);
+            cmd.env("XWLBRIDGE_UI_GATE", gate);
         }
     }
 }
@@ -935,7 +935,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("xwlrvnc-uidisplay-{tag}-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("xwlbridge-uidisplay-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
         dir
@@ -997,23 +997,23 @@ mod tests {
         let get = |envs: &[(OsString, Option<OsString>)], k: &str| {
             envs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
         };
-        let hook = Path::new("/run/user/1000/xwlrvnc-uihook-0.so");
+        let hook = Path::new("/run/user/1000/xwlbridge-uihook-0.so");
         let mut cmd = Command::new("true");
-        apply(&mut cmd, hook, Some((&ui, Some(Path::new("/run/user/1000/xwlrvnc-ui-7.gate")))));
+        apply(&mut cmd, hook, Some((&ui, Some(Path::new("/run/user/1000/xwlbridge-ui-7.gate")))));
         let e = envs(&cmd);
         let preload = get(&e, "LD_PRELOAD").flatten().unwrap();
-        assert!(preload.as_bytes().starts_with(b"/run/user/1000/xwlrvnc-uihook-0.so"));
-        assert_eq!(get(&e, "XWLRVNC_UI_DISPLAY").flatten().unwrap(), ":0");
-        assert_eq!(get(&e, "XWLRVNC_UI_XAUTHORITY").flatten().unwrap(), "/run/user/1000/.mutter-Xwaylandauth.X");
-        assert_eq!(get(&e, "XWLRVNC_UI_GATE").flatten().unwrap(), "/run/user/1000/xwlrvnc-ui-7.gate");
+        assert!(preload.as_bytes().starts_with(b"/run/user/1000/xwlbridge-uihook-0.so"));
+        assert_eq!(get(&e, "XWLBRIDGE_UI_DISPLAY").flatten().unwrap(), ":0");
+        assert_eq!(get(&e, "XWLBRIDGE_UI_XAUTHORITY").flatten().unwrap(), "/run/user/1000/.mutter-Xwaylandauth.X");
+        assert_eq!(get(&e, "XWLBRIDGE_UI_GATE").flatten().unwrap(), "/run/user/1000/xwlbridge-ui-7.gate");
         // the hook restores this in the UI process
-        assert_eq!(get(&e, "XWLRVNC_UI_LD_PRELOAD").flatten().unwrap(), env::var_os("LD_PRELOAD").unwrap_or_default());
+        assert_eq!(get(&e, "XWLBRIDGE_UI_LD_PRELOAD").flatten().unwrap(), env::var_os("LD_PRELOAD").unwrap_or_default());
         // no UI display (the built-in engine's crash guard alone): the hook, and none of the inherited instructions
         let mut cmd = Command::new("true");
         apply(&mut cmd, hook, None);
         let e = envs(&cmd);
         assert!(get(&e, "LD_PRELOAD").flatten().is_some());
-        for var in ["XWLRVNC_UI_DISPLAY", "XWLRVNC_UI_XAUTHORITY", "XWLRVNC_UI_GATE"] {
+        for var in ["XWLBRIDGE_UI_DISPLAY", "XWLBRIDGE_UI_XAUTHORITY", "XWLBRIDGE_UI_GATE"] {
             assert_eq!(get(&e, var), Some(None), "{var} must be removed");
         }
     }
@@ -1082,7 +1082,7 @@ mod tests {
         assert!(g.is_on());
         assert_eq!(fs::read(g.path()).unwrap(), b"1\n");
         // a symlink at the temporary name is not written through
-        let tmp = dir.join(format!(".xwlrvnc-ui-{}.gate.tmp", std::process::id()));
+        let tmp = dir.join(format!(".xwlbridge-ui-{}.gate.tmp", std::process::id()));
         let victim = dir.join("victim");
         fs::write(&victim, b"keep").unwrap();
         symlink(&victim, &tmp).unwrap();
@@ -1380,7 +1380,7 @@ mod tests {
         assert!(fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(fs::read(&elsewhere).unwrap(), HOOK);
         // a symlink planted at the temporary name is not written through
-        let tmp = dir.join(format!(".xwlrvnc-uihook-{}.tmp", std::process::id()));
+        let tmp = dir.join(format!(".xwlbridge-uihook-{}.tmp", std::process::id()));
         let target = dir.join("victim");
         fs::write(&target, b"keep").unwrap();
         symlink(&target, &tmp).unwrap();

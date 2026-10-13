@@ -5,7 +5,7 @@
 - reads their pixels (the agent redirects every window offscreen with Composite, so GetImage of a window reads its
   own contents) when DAMAGE says they changed;
 - injects the person's keys and clicks with XTest. With the bridge's `-reverseinput` this goes through the
-  "xwlrvnc-reverse" XInput2 master (made our ClientPointer, so our core XTest uses its XTest devices; the app's
+  "xwlbridge-reverse" XInput2 master (made our ClientPointer, so our core XTest uses its XTest devices; the app's
   window gets its keyboard focus with XISetFocus): the agent never forwards that master's events to the desktop
   (no echo), and the display's own pointer/keyboard (VNC viewers) keep reaching no X window. Without it, keys go
   through the core keyboard (the bridge's per-client XTest attribution keeps them off the desktop while the app has
@@ -21,7 +21,7 @@ from Xlib import X, Xatom, display as xdisplay, error as xerror
 from Xlib.ext import xinput, xtest
 from Xlib.protocol import rq, event as xevent
 
-REVERSE_MASTER = 'xwlrvnc-reverse'
+REVERSE_MASTER = 'xwlbridge-reverse'
 
 
 # ---- XInput2 requests python-xlib does not have -------------------------------------------------------------------

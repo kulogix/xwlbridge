@@ -1,13 +1,13 @@
 #!/bin/bash
-# Installs xwlrvnc for the current user (no root needed): the bridge, xwlrvnc-ctl,
+# Installs xwlbridge for the current user (no root needed): the bridge, xwlbridge-ctl,
 # the systemd user service (started with the GNOME session) and a settings file.
 # Running it again upgrades in place; settings are kept.
 #
 #   ./install.sh [--bin PATH] [--prefix DIR] [--port N] [--engine E] [--no-enable] [--no-start]
 #
-#   --bin PATH     the xwlrvnc binary (default: ./xwlrvnc in a release bundle, else
-#                  the source tree's target/dist/xwlrvnc or target/release/xwlrvnc)
-#   --prefix DIR   where programs go (default ~/.local: ~/.local/bin, ~/.local/share/xwlrvnc)
+#   --bin PATH     the xwlbridge binary (default: ./xwlbridge in a release bundle, else
+#                  the source tree's target/dist/xwlbridge or target/release/xwlbridge)
+#   --prefix DIR   where programs go (default ~/.local: ~/.local/bin, ~/.local/share/xwlbridge)
 #   --port N       TCP port for a new settings file (default 5900, or 5901 while
 #                  RealVNC's system service holds 5900). --port realvnc: leave the
 #                  port to RealVNC's own settings (RfbPort); the default when
@@ -16,7 +16,7 @@
 #   --no-enable    do not enable the service for future sessions
 #   --no-start     do not start (or restart) it now
 #
-# Remove with: ~/.local/share/xwlrvnc/uninstall.sh
+# Remove with: ~/.local/share/xwlbridge/uninstall.sh
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
@@ -47,17 +47,17 @@ case $ENGINE in ""|auto|builtin|xvnc|xvfb) ;; *) die "--engine: '$ENGINE' is not
 [ -n "${HOME:-}" ] && [ -d "$HOME" ] || die "HOME is not set"
 
 # ------------------------------------------------------------- what to install
-if [ -f "$HERE/xwlrvnc-ctl" ] && [ -f "$HERE/xwlrvnc.service.in" ]; then
+if [ -f "$HERE/xwlbridge-ctl" ] && [ -f "$HERE/xwlbridge-realvnc.service.in" ]; then
   SRC=$HERE                                   # bundle, or the source tree's packaging/
 else
-  die "xwlrvnc-ctl / xwlrvnc.service.in not found next to install.sh"
+  die "xwlbridge-ctl / xwlbridge-realvnc.service.in not found next to install.sh"
 fi
 if [ -z "$BIN" ]; then
-  for b in "$SRC/xwlrvnc" "$SRC/../target/dist/xwlrvnc" "$SRC/../target/release/xwlrvnc"; do
+  for b in "$SRC/xwlbridge" "$SRC/../target/dist/xwlbridge" "$SRC/../target/release/xwlbridge"; do
     [ -x "$b" ] && { BIN=$b; break; }
   done
 fi
-[ -n "$BIN" ] && [ -x "$BIN" ] || die "no xwlrvnc binary (build it: cargo build --profile dist --features gnome,xvfb, or pass --bin PATH)"
+[ -n "$BIN" ] && [ -x "$BIN" ] || die "no xwlbridge binary (build it: cargo build --profile dist --features gnome,xvfb, or pass --bin PATH)"
 BIN=$(readlink -f -- "$BIN")
 
 if [ -f "$SRC/VERSION" ]; then VERSION=$(cat "$SRC/VERSION")
@@ -74,17 +74,17 @@ bver=$("$BIN" -version 2>&1 | head -1)
 
 CONF_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 BINDIR=$PREFIX/bin
-SHARE=$PREFIX/share/xwlrvnc
+SHARE=$PREFIX/share/xwlbridge
 UNITDIR=$CONF_HOME/systemd/user
-UNIT=$UNITDIR/xwlrvnc.service
-CFGDIR=$CONF_HOME/xwlrvnc
-CFG=$CFGDIR/xwlrvnc.conf
+UNIT=$UNITDIR/xwlbridge-realvnc.service
+CFGDIR=$CONF_HOME/xwlbridge
+CFG=$CFGDIR/xwlbridge.conf
 MANIFEST=$SHARE/manifest
 APPDIR=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 
 UPGRADE=0; OLD_VERSION=""
 if [ -f "$MANIFEST" ]; then UPGRADE=1; OLD_VERSION=$(sed -n 's/^version //p' "$MANIFEST" | head -1); fi
-say "$([ $UPGRADE = 1 ] && echo "Upgrading xwlrvnc ${OLD_VERSION:-?} -> $VERSION" || echo "Installing xwlrvnc $VERSION") for $(id -un) ($bver)"
+say "$([ $UPGRADE = 1 ] && echo "Upgrading xwlbridge ${OLD_VERSION:-?} -> $VERSION" || echo "Installing xwlbridge $VERSION") for $(id -un) ($bver)"
 
 # directories this install creates (uninstall.sh removes them again if empty);
 # on an upgrade the first install's list carries over
@@ -115,20 +115,20 @@ if [ $UPGRADE = 0 ]; then
 fi
 
 esc() { printf '%s' "$1" | sed 's/[\/&|]/\\&/g'; }
-put 0755 "$BIN" "$BINDIR/xwlrvnc"
-put 0755 "$SRC/xwlrvnc-ctl" "$BINDIR/xwlrvnc-ctl" "s|@VERSION@|$(esc "$VERSION")|g"
-put 0644 "$SRC/xwlrvnc.conf" "$SHARE/xwlrvnc.conf"
+put 0755 "$BIN" "$BINDIR/xwlbridge"
+put 0755 "$SRC/xwlbridge-ctl" "$BINDIR/xwlbridge-ctl" "s|@VERSION@|$(esc "$VERSION")|g"
+put 0644 "$SRC/xwlbridge.conf" "$SHARE/xwlbridge.conf"
 put 0755 "$SRC/uninstall.sh" "$SHARE/uninstall.sh"
 for f in README.md LICENSE; do
   for d in "$SRC" "$SRC/.."; do [ -f "$d/$f" ] && { put 0644 "$d/$f" "$SHARE/$f"; break; }; done
 done
-put 0644 "$SRC/xwlrvnc.service.in" "$UNIT" "s|@BINDIR@|$(esc "$BINDIR")|g"
+put 0644 "$SRC/xwlbridge-realvnc.service.in" "$UNIT" "s|@BINDIR@|$(esc "$BINDIR")|g"
 # an app-grid entry for RealVNC's status window on this desktop (RealVNC's own visible "VNC Server" entry
 # starts its service-mode server, which cannot share a Wayland desktop); RealVNC's icon when installed
 ICON=preferences-desktop-remote-desktop
 [ -f /usr/share/icons/hicolor/48x48/apps/vncserver48x48.png ] && ICON=/usr/share/icons/hicolor/48x48/apps/vncserver48x48.png
-put 0644 "$SRC/xwlrvnc-status.desktop.in" "$APPDIR/xwlrvnc-status.desktop" "s|@BINDIR@|$(esc "$BINDIR")|g; s|@ICON@|$(esc "$ICON")|g"
-say "installed $BINDIR/xwlrvnc, $BINDIR/xwlrvnc-ctl, $UNIT, $APPDIR/xwlrvnc-status.desktop"
+put 0644 "$SRC/xwlbridge-status.desktop.in" "$APPDIR/xwlbridge-status.desktop" "s|@BINDIR@|$(esc "$BINDIR")|g; s|@ICON@|$(esc "$ICON")|g"
+say "installed $BINDIR/xwlbridge, $BINDIR/xwlbridge-ctl, $UNIT, $APPDIR/xwlbridge-status.desktop"
 
 # ------------------------------------------------------------- settings
 port_taken() {  # port_taken N: RealVNC's system service (5900) or any listener
@@ -140,7 +140,7 @@ port_user() {  # who listens on port N, if visible: "name pid N"
 }
 CREATED_CFG=0
 if [ ! -f "$CFG" ]; then
-  RVPORT=$("$BINDIR/xwlrvnc-ctl" realvnc-get RfbPort 2>/dev/null || true)
+  RVPORT=$("$BINDIR/xwlbridge-ctl" realvnc-get RfbPort 2>/dev/null || true)
   if [ -z "$PORT" ] && [ -n "$RVPORT" ]; then
     PORT=realvnc
     say "RealVNC's own settings set RfbPort=$RVPORT: the port is left to them (rfb_port=realvnc)"
@@ -148,26 +148,26 @@ if [ ! -f "$CFG" ]; then
   if [ "$PORT" = realvnc ]; then
     if port_taken "${RVPORT:-5900}"; then
       who=$(port_user "${RVPORT:-5900}")
-      warn "port ${RVPORT:-5900} (RealVNC's RfbPort${RVPORT:+ setting}) is in use now${who:+ ($who)}: the service can serve it only once that has stopped; see xwlrvnc-ctl doctor"
+      warn "port ${RVPORT:-5900} (RealVNC's RfbPort${RVPORT:+ setting}) is in use now${who:+ ($who)}: the service can serve it only once that has stopped; see xwlbridge-ctl doctor"
     fi
   elif [ -z "$PORT" ]; then
     PORT=5900
     if port_taken 5900; then
       PORT=5901
       warn "port 5900 is taken (RealVNC's system service vncserver-x11-serviced?): this desktop will be served on port 5901"
-      warn "  to use 5900 instead: sudo systemctl disable --now vncserver-x11-serviced && xwlrvnc-ctl config set rfb_port 5900 && xwlrvnc-ctl restart"
+      warn "  to use 5900 instead: sudo systemctl disable --now vncserver-x11-serviced && xwlbridge-ctl config set rfb_port 5900 && xwlbridge-ctl restart"
     fi
   fi
-  ( umask 077; mkdir -p -- "$CFGDIR"; cp -- "$SRC/xwlrvnc.conf" "$CFG" )
-  "$BINDIR/xwlrvnc-ctl" config set rfb_port "$PORT" 2>/dev/null
-  [ -n "$ENGINE" ] && "$BINDIR/xwlrvnc-ctl" config set engine "$ENGINE" 2>/dev/null
+  ( umask 077; mkdir -p -- "$CFGDIR"; cp -- "$SRC/xwlbridge.conf" "$CFG" )
+  "$BINDIR/xwlbridge-ctl" config set rfb_port "$PORT" 2>/dev/null
+  [ -n "$ENGINE" ] && "$BINDIR/xwlbridge-ctl" config set engine "$ENGINE" 2>/dev/null
   CREATED_CFG=1
   say "settings: $CFG (rfb_port=$PORT${ENGINE:+, engine=$ENGINE})"
 else
-  [ -z "$PORT$ENGINE" ] || warn "keeping your settings in $CFG (--port/--engine apply to a new file only; use xwlrvnc-ctl config set)"
+  [ -z "$PORT$ENGINE" ] || warn "keeping your settings in $CFG (--port/--engine apply to a new file only; use xwlbridge-ctl config set)"
   say "settings kept: $CFG"
-  if ! "$BINDIR/xwlrvnc-ctl" config show >/dev/null 2>&1; then
-    warn "your settings have errors: xwlrvnc-ctl config show"
+  if ! "$BINDIR/xwlbridge-ctl" config show >/dev/null 2>&1; then
+    warn "your settings have errors: xwlbridge-ctl config show"
   fi
 fi
 
@@ -175,7 +175,7 @@ fi
 OLD_FILES=()
 [ $UPGRADE = 1 ] && mapfile -t OLD_FILES < <(sed -n 's/^file //p' "$MANIFEST")
 {
-  echo "# xwlrvnc install manifest: what uninstall.sh removes"
+  echo "# xwlbridge install manifest: what uninstall.sh removes"
   echo "version $VERSION"
   echo "prefix $PREFIX"
   echo "installed $(date -u +%FT%TZ)"
@@ -193,12 +193,12 @@ done
 
 # ------------------------------------------------------------- service
 if ! systemctl --user show-environment >/dev/null 2>&1; then
-  warn "no systemd user manager reachable: the service is installed but not enabled; run 'xwlrvnc-ctl enable' from your session"
+  warn "no systemd user manager reachable: the service is installed but not enabled; run 'xwlbridge-ctl enable' from your session"
   exit 0
 fi
 systemctl --user daemon-reload
 if [ $ENABLE = 1 ]; then
-  systemctl --user enable xwlrvnc.service >/dev/null 2>&1 && say "enabled: starts with your GNOME session"
+  systemctl --user enable xwlbridge-realvnc.service >/dev/null 2>&1 && say "enabled: starts with your GNOME session"
 fi
 if [ $START = 1 ]; then
   # right after login GNOME may still be bringing graphical-session.target up; the service (Requisite= on it)
@@ -214,13 +214,13 @@ if [ $START = 1 ]; then
     done
   fi
   if [ "$gs" = active ]; then
-    systemctl --user reset-failed xwlrvnc.service 2>/dev/null || true
-    if systemctl --user restart xwlrvnc.service; then
+    systemctl --user reset-failed xwlbridge-realvnc.service 2>/dev/null || true
+    if systemctl --user restart xwlbridge-realvnc.service; then
       sleep 3
-      st=$(systemctl --user is-active xwlrvnc.service || true)
+      st=$(systemctl --user is-active xwlbridge-realvnc.service || true)
       say "service: $st"
     else
-      warn "the service did not start: xwlrvnc-ctl logs"
+      warn "the service did not start: xwlbridge-ctl logs"
     fi
   else
     say "no GNOME session running now: the service starts with your next login"
@@ -228,8 +228,8 @@ if [ $START = 1 ]; then
 fi
 
 echo
-"$BINDIR/xwlrvnc-ctl" doctor || true
+"$BINDIR/xwlbridge-ctl" doctor || true
 echo
 case ":$PATH:" in *":$BINDIR:"*) ;; *) echo "Note: $BINDIR is not on your PATH yet (it is after your next login on Ubuntu)";; esac
-echo "Manage:    xwlrvnc-ctl status | logs | restart | doctor | config set KEY VALUE"
+echo "Manage:    xwlbridge-ctl status | logs | restart | doctor | config set KEY VALUE"
 echo "Uninstall: $SHARE/uninstall.sh"

@@ -1,13 +1,13 @@
-# xwlrvnc for GNOME: RealVNC Server on a Wayland desktop
+# xwlbridge for GNOME: RealVNC Server on a Wayland desktop
 
 RealVNC Server 6.x/7.x in user mode only knows X11. On a GNOME Wayland desktop
 (Ubuntu 24.04 and later, Debian 13, Fedora 41 and later) there is no X server
-for it to share. xwlrvnc gives it one: an X display backed by GNOME's own
+for it to share. xwlbridge gives it one: an X display backed by GNOME's own
 remote-desktop APIs (mutter's ScreenCast via PipeWire, RemoteDesktop/libei for
 input, the remote-desktop clipboard). RealVNC's own windows (status dialog,
 tray icon, connection notices, chat, file transfer) show up on the GNOME desktop.
 
-    VNC viewer  ->  RealVNC Server (user mode)  ->  X display (engine)  ->  xwlrvnc  ->  GNOME (mutter)
+    VNC viewer  ->  RealVNC Server (user mode)  ->  X display (engine)  ->  xwlbridge  ->  GNOME (mutter)
 
 This directory installs it as a per-user systemd service that starts with your
 GNOME session. Nothing here needs root, except the optional `apt install` and
@@ -17,8 +17,8 @@ the choice about RealVNC's system service described below.
 
 From a release bundle:
 
-    tar xzf xwlrvnc-<version>-x86_64-<distro>.tar.gz
-    cd xwlrvnc-<version>-x86_64-<distro>
+    tar xzf xwlbridge-<version>-x86_64-<distro>.tar.gz
+    cd xwlbridge-<version>-x86_64-<distro>
     ./install.sh
 
 From the source tree:
@@ -26,11 +26,11 @@ From the source tree:
     cargo build --profile dist --features gnome,xvfb
     packaging/install.sh
 
-`install.sh` puts `xwlrvnc` and `xwlrvnc-ctl` in `~/.local/bin`, the service in
-`~/.config/systemd/user/xwlrvnc.service`, the settings in
-`~/.config/xwlrvnc/xwlrvnc.conf`, an app-grid entry in
+`install.sh` puts `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`, the service in
+`~/.config/systemd/user/xwlbridge-realvnc.service`, the settings in
+`~/.config/xwlbridge/xwlbridge.conf`, an app-grid entry in
 `~/.local/share/applications/`, enables the service for your GNOME sessions,
-starts it, and runs `xwlrvnc-ctl doctor`. Running a newer `install.sh` upgrades
+starts it, and runs `xwlbridge-ctl doctor`. Running a newer `install.sh` upgrades
 in place (settings are kept; the service restarts, so connected viewers
 reconnect).
 
@@ -40,7 +40,7 @@ as the distro they were built on: use the bundle built for your distro.
 
 ## Check the setup
 
-    xwlrvnc-ctl doctor          # or: xwlrvnc-ctl doctor --json
+    xwlbridge-ctl doctor          # or: xwlbridge-ctl doctor --json
 
 It reports, without printing any key or password: the GNOME/mutter version and
 its remote-desktop APIs, PipeWire, Xwayland, the bridge binary and settings, the
@@ -59,12 +59,12 @@ this user-mode setup is what shares the desktop. Choose one:
 1. **Disable the system service** (viewers keep connecting to port 5900):
 
         sudo systemctl disable --now vncserver-x11-serviced
-        xwlrvnc-ctl config set rfb_port 5900 && xwlrvnc-ctl restart
+        xwlbridge-ctl config set rfb_port 5900 && xwlbridge-ctl restart
 
 2. **Keep it**, and serve the desktop on another port (no root needed): viewers
    connect to `host:5901` (RealVNC Viewer: `host::5901`).
 
-        xwlrvnc-ctl config set rfb_port 5901 && xwlrvnc-ctl restart
+        xwlbridge-ctl config set rfb_port 5901 && xwlbridge-ctl restart
 
 `install.sh` picks 5901 automatically while the system service holds 5900.
 
@@ -97,10 +97,10 @@ RealVNC's system service holds 5900).
 
 RealVNC runs at most one user-mode server per user: a second `vncserver-x11`
 hands over to the first ("Existing server found; exiting.") and quits. If you
-started one by hand (for example `xwlrvnc ... vncserver-x11 -RfbPort=...` in a
+started one by hand (for example `xwlbridge ... vncserver-x11 -RfbPort=...` in a
 terminal), stop it: until then the service waits (it retries with a back-off of
 up to 2 minutes and logs who is in the way) and then starts by itself.
-`xwlrvnc-ctl doctor` names the process.
+`xwlbridge-ctl doctor` names the process.
 
 To replace such a server for good, keep its RealVNC settings: copy `RfbPort`,
 `IpClientAddresses`, `Authentication`, `Encryption` and `Password` from the
@@ -108,13 +108,13 @@ To replace such a server for good, keep its RealVNC settings: copy `RfbPort`,
 `~/.vnc/config.d/vncserver-x11` (mode 0600), and its `.vnc/private.key` if
 viewers should keep seeing the same server identity; then
 `./install.sh --no-start --port realvnc`, stop the old server, and
-`xwlrvnc-ctl start`.
+`xwlbridge-ctl start`.
 
 ## Settings
 
-`~/.config/xwlrvnc/xwlrvnc.conf` (commented; `xwlrvnc-ctl config show` prints
-the effective values). Change with `xwlrvnc-ctl config set KEY VALUE`, then
-`xwlrvnc-ctl restart`.
+`~/.config/xwlbridge/xwlbridge.conf` (commented; `xwlbridge-ctl config show` prints
+the effective values). Change with `xwlbridge-ctl config set KEY VALUE`, then
+`xwlbridge-ctl restart`.
 
 | key | default | meaning |
 |---|---|---|
@@ -126,7 +126,7 @@ the effective values). Change with `xwlrvnc-ctl config set KEY VALUE`, then
 | `server_log` | `30` | RealVNC log level sent to the journal; empty = RealVNC's own logging |
 | `server_args` | | more RealVNC parameters, e.g. `-Authentication=VncAuth -Encryption=AlwaysOn` |
 | `log` | `normal` | bridge logging: `quiet`, `normal`, `verbose` |
-| `bridge_args` | | more `xwlrvnc` options (`xwlrvnc -help`) |
+| `bridge_args` | | more `xwlbridge` options (`xwlbridge -help`) |
 | `xvnc`, `xvfb` | `auto` | engine binaries; auto = found on PATH (`Xtigervnc` first) |
 
 RealVNC's own settings (authentication, encryption, permissions, ...) stay in
@@ -135,14 +135,14 @@ VNC password: `vncpasswd -user` and `server_args=-Authentication=VncAuth`.
 
 ### Leaving port, IP filter and authentication to RealVNC
 
-With `rfb_port=realvnc` and an empty `server_args`, xwlrvnc passes RealVNC
+With `rfb_port=realvnc` and an empty `server_args`, xwlbridge passes RealVNC
 none of its connection settings: the port (`RfbPort`), the IP address filter
 (`IpClientAddresses`), authentication and encryption all come from RealVNC's
 own configuration, `~/.vnc/config.d/vncserver-x11` (what its Options dialog
 writes in user mode; later lines win) and `/etc/vnc/config.d/common.custom`
 (policy files in `/etc/vnc/policy.d/` override both). For example:
 
-    xwlrvnc-ctl config set rfb_port realvnc
+    xwlbridge-ctl config set rfb_port realvnc
     vncpasswd -user                                   # sets Password=
     cat >>~/.vnc/config.d/vncserver-x11 <<'EOF'
     RfbPort=5911
@@ -151,12 +151,12 @@ writes in user mode; later lines win) and `/etc/vnc/config.d/common.custom`
     Encryption=AlwaysOn
     EOF
     chmod 600 ~/.vnc/config.d/vncserver-x11
-    xwlrvnc-ctl restart && xwlrvnc-ctl doctor
+    xwlbridge-ctl restart && xwlbridge-ctl doctor
 
 `install.sh` chooses `rfb_port=realvnc` by itself when RealVNC's settings
-already set `RfbPort`, and takes `--port realvnc`. `xwlrvnc-ctl doctor` shows
+already set `RfbPort`, and takes `--port realvnc`. `xwlbridge-ctl doctor` shows
 the effective port, the IP filter and authentication with where each comes
-from; `xwlrvnc-ctl realvnc-get NAME` prints one of RealVNC's values.
+from; `xwlbridge-ctl realvnc-get NAME` prints one of RealVNC's values.
 
 The first time RealVNC's windows appear on the desktop it asks for its "Initial
 settings": automatic update checks and anonymous usage data, both ticked.
@@ -164,7 +164,7 @@ Untick them before OK if you do not want them.
 
 ### Engines
 
-- `builtin`: xwlrvnc's own X server, implementing what VNC servers need. No
+- `builtin`: xwlbridge's own X server, implementing what VNC servers need. No
   extra packages. With `uidisplay=auto` RealVNC's clipboard, file transfer and
   connection prompts work through its UI on the GNOME desktop. RealVNC's own
   windows crash on the built-in X server itself, so with `builtin` the service
@@ -180,11 +180,11 @@ Untick them before OK if you do not want them.
 - `xvfb`: Xorg's Xvfb, complete but a fixed screen size.
 
 **Never RealVNC's Xvnc.** The RealVNC package installs its own `/usr/bin/Xvnc`
-(a set-uid root launcher for its virtual-mode server). `xwlrvnc-ctl` only
+(a set-uid root launcher for its virtual-mode server). `xwlbridge-ctl` only
 accepts a TigerVNC binary (`Xtigervnc`, or an `Xvnc` that is not set-uid/set-gid,
 not owned by a RealVNC package and carries TigerVNC's identification), never
 executes a candidate while checking it, and hands the bridge a private PATH
-directory (`$XDG_RUNTIME_DIR/xwlrvnc/bin`) whose `Xvnc` is exactly that binary.
+directory (`$XDG_RUNTIME_DIR/xwlbridge/bin`) whose `Xvnc` is exactly that binary.
 Installing TigerVNC next to RealVNC is safe: dpkg keeps RealVNC's real
 `/usr/bin/Xvnc` file and TigerVNC's server stays at `/usr/bin/Xtigervnc`.
 
@@ -196,27 +196,27 @@ extension, enabled by default on Ubuntu) and the app-grid entry **VNC Server
 own visible "VNC Server" entry starts its service-mode server, which cannot
 share a Wayland desktop.)
 
-    xwlrvnc-ctl status | logs [-f] | start | stop | restart | enable | disable
-    xwlrvnc-ctl show            # RealVNC's status window on the desktop (starts the service if needed)
-    xwlrvnc-ctl command         # the exact command the service runs
+    xwlbridge-ctl status | logs [-f] | start | stop | restart | enable | disable
+    xwlbridge-ctl show            # RealVNC's status window on the desktop (starts the service if needed)
+    xwlbridge-ctl command         # the exact command the service runs
 
-Logs go to the journal (`journalctl --user -u xwlrvnc`), RealVNC's included.
+Logs go to the journal (`journalctl --user -u xwlbridge`), RealVNC's included.
 
 ## The service
 
-`xwlrvnc.service` is a systemd *user* unit, wanted by and part of
+`xwlbridge-realvnc.service` is a systemd *user* unit, wanted by and part of
 `graphical-session.target`: it starts after you log in to GNOME and stops when
 you log out. It restarts on failure with a back-off (2 s growing to 2 min) and
 does not restart on a settings error (exit 78: fix the settings, then
-`xwlrvnc-ctl restart`). If you stop RealVNC from its own menu, it stays stopped
-until `xwlrvnc-ctl start` or your next login.
+`xwlbridge-ctl restart`). If you stop RealVNC from its own menu, it stays stopped
+until `xwlbridge-ctl start` or your next login.
 
-A stop is not a failure: on `xwlrvnc-ctl stop` and on logging out xwlrvnc
+A stop is not a failure: on `xwlbridge-ctl stop` and on logging out xwlbridge
 passes the SIGTERM on to RealVNC, stops its X server and exits 0, also while a
 viewer is connected. Where your user manager outlives the session (an ssh
-login, lingering), `systemctl --user status xwlrvnc` then says `inactive
+login, lingering), `systemctl --user status xwlbridge` then says `inactive
 (dead)`, and `systemctl --user --failed` does not list it. A unit that is
-`failed` after a logout failed for a reason of its own: `xwlrvnc-ctl logs`.
+`failed` after a logout failed for a reason of its own: `xwlbridge-ctl logs`.
 So the unit has no `SuccessExitStatus=`: any other non-zero status is a
 failure, restarted as above (128 + n: RealVNC was killed by signal n). RealVNC
 itself exits 0 on a SIGTERM from anywhere, so a SIGTERM that is not a stop of
@@ -245,7 +245,7 @@ RealVNC's root helper: system authentication works for your own account only,
 and adding the viewer's printer needs membership in `lpadmin`. To restore the
 root helper (other local accounts, no `lpadmin`), install TigerVNC, set
 `engine=xvnc` and `uidisplay=none`, and remove the hardening with a drop-in
-(`systemctl --user edit xwlrvnc`):
+(`systemctl --user edit xwlbridge`):
 
     [Service]
     NoNewPrivileges=no
@@ -262,27 +262,27 @@ go for the set-uid launcher to work.)
 
 ## Uninstall
 
-    ~/.local/share/xwlrvnc/uninstall.sh            # everything it installed, settings included
-    ~/.local/share/xwlrvnc/uninstall.sh --keep-config
-    ~/.local/share/xwlrvnc/uninstall.sh --purge    # also RealVNC's per-user files created since the install
+    ~/.local/share/xwlbridge/uninstall.sh            # everything it installed, settings included
+    ~/.local/share/xwlbridge/uninstall.sh --keep-config
+    ~/.local/share/xwlbridge/uninstall.sh --purge    # also RealVNC's per-user files created since the install
 
 RealVNC Server itself and the settings it had before are never touched. Past
 log lines stay in the journal until it rotates them. `--purge` tells RealVNC's
 new files from yours by the listing of `~/.vnc` the first install made
-(`~/.local/share/xwlrvnc/vnc-before.list`); if that listing is gone it keeps
+(`~/.local/share/xwlbridge/vnc-before.list`); if that listing is gone it keeps
 `~/.vnc` entirely. Settings you add to `~/.vnc` after installing (for example
 with `vncpasswd -user`) count as new: leave out `--purge` to keep them.
 
 ## Debian package (optional)
 
     cargo install cargo-deb
-    packaging/build-deb.sh            # target/debian/xwlrvnc_<version>_amd64.deb
-    sudo apt install ./target/debian/xwlrvnc_*.deb
-    systemctl --user enable --now xwlrvnc   # per user
+    packaging/build-deb.sh            # target/debian/xwlbridge_<version>_amd64.deb
+    sudo apt install ./target/debian/xwlbridge_*.deb
+    systemctl --user enable --now xwlbridge-realvnc   # per user
 
-The package installs `/usr/bin/xwlrvnc`, `/usr/bin/xwlrvnc-ctl`, the user unit
+The package installs `/usr/bin/xwlbridge`, `/usr/bin/xwlbridge-ctl`, the user unit
 in `/usr/lib/systemd/user/`, the app-grid entry and the default settings in
-`/usr/share/xwlrvnc/` (copied to `~/.config/xwlrvnc/` by `xwlrvnc-ctl config
+`/usr/share/xwlbridge/` (copied to `~/.config/xwlbridge/` by `xwlbridge-ctl config
 set`). It enables nothing by itself. Before removing it, each user who enabled
-it runs `systemctl --user disable --now xwlrvnc` (and may delete
-`~/.config/xwlrvnc`); dpkg cannot reach per-user files.
+it runs `systemctl --user disable --now xwlbridge` (and may delete
+`~/.config/xwlbridge`); dpkg cannot reach per-user files.

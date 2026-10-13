@@ -6,12 +6,12 @@
 /// once at startup from `-quiet`/`-verbose`.
 pub(crate) static LOG_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
 
-/// Emits one `xwlrvnc:`-prefixed line to stderr if the current level is at least
+/// Emits one `xwlbridge:`-prefixed line to stderr if the current level is at least
 /// `$min`. Same args as `format!`.
 macro_rules! logat {
     ($min:expr, $($arg:tt)*) => {
         if $crate::LOG_LEVEL.load(::std::sync::atomic::Ordering::Relaxed) >= $min {
-            eprintln!("xwlrvnc: {}", format_args!($($arg)*));
+            eprintln!("xwlbridge: {}", format_args!($($arg)*));
         }
     };
 }
@@ -19,11 +19,11 @@ macro_rules! logat {
 macro_rules! log { ($($arg:tt)*) => { $crate::logat!(1, $($arg)*) }; }
 /// Warning/error log (always shown).
 macro_rules! warning {
-    ($($arg:tt)*) => { eprintln!("xwlrvnc: {}", format_args!($($arg)*)) };
+    ($($arg:tt)*) => { eprintln!("xwlbridge: {}", format_args!($($arg)*)) };
 }
 /// Unimplemented (and not explicitly stubbed) request/feature (always shown).
 macro_rules! fixme {
-    ($($arg:tt)*) => { eprintln!("xwlrvnc: fixme: {}", format_args!($($arg)*)) };
+    ($($arg:tt)*) => { eprintln!("xwlbridge: fixme: {}", format_args!($($arg)*)) };
 }
 /// Verbose log (shown only with `-verbose`).
 macro_rules! vlog { ($($arg:tt)*) => { $crate::logat!(2, $($arg)*) }; }
@@ -41,7 +41,7 @@ pub(crate) static CLIP_TRACE: std::sync::atomic::AtomicBool =
 macro_rules! cliplog {
     ($($arg:tt)*) => {
         if $crate::CLIP_TRACE.load(::std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("xwlrvnc: clip: {}", format_args!($($arg)*));
+            eprintln!("xwlbridge: clip: {}", format_args!($($arg)*));
         }
     };
 }
@@ -373,8 +373,8 @@ fn install_signal_handlers() {
 }
 
 fn main() {
-    // `xwlrvnc run [...] CMD`: a tool on a running bridge's display (a program
-    // that is itself called "run" is wrapped with `xwlrvnc -- run`)
+    // `xwlbridge run [...] CMD`: a tool on a running bridge's display (a program
+    // that is itself called "run" is wrapped with `xwlbridge -- run`)
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|a| a == "run") {
         childenv::run_main(args.collect());
@@ -416,7 +416,7 @@ fn main() {
     let xvfb_engine = config.engine != config::EngineType::Builtin;
     #[cfg(not(feature = "xvfb"))]
     if xvfb_engine {
-        crate::warning!("-engine xvfb/xvnc/xwayland needs xwlrvnc built with the \"xvfb\" feature");
+        crate::warning!("-engine xvfb/xvnc/xwayland needs xwlbridge built with the \"xvfb\" feature");
         process::exit(2);
     }
     if config.xserver.is_some() && !xvfb_engine {
@@ -536,7 +536,7 @@ fn main() {
         }
     }
 
-    // for `xwlrvnc run` (with the cookie, when the engine couldn't let our
+    // for `xwlbridge run` (with the cookie, when the engine couldn't let our
     // own user in by uid)
     #[cfg(feature = "xvfb")]
     childenv::announce(display, engine_xauthority.as_deref());
@@ -707,7 +707,7 @@ fn setup_ui(
         && uidisplay::same_display(u, display)
     {
         crate::warning!(
-            "-uidisplay: {} is xwlrvnc's own display; RealVNC's UI stays on it, out of sight",
+            "-uidisplay: {} is xwlbridge's own display; RealVNC's UI stays on it, out of sight",
             u.display.to_string_lossy()
         );
         ui = None;
@@ -735,7 +735,7 @@ fn setup_ui(
             .inspect_err(|e| {
                 crate::warning!(
                     "-uidisplay: can't use X display {name} for RealVNC's UI yet ({e}); it starts on the engine display \
-                     (out of sight) and moves to {name} once that answers. Check DISPLAY/XAUTHORITY, or start xwlrvnc \
+                     (out of sight) and moves to {name} once that answers. Check DISPLAY/XAUTHORITY, or start xwlbridge \
                      in the desktop session"
                 )
             })

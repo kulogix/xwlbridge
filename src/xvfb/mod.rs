@@ -347,7 +347,7 @@ fn engine_running() -> bool {
 /// A new directory only this user can enter (mkdtemp, so 0700 and a name no
 /// one could have taken first), in the user's runtime directory, or else (if
 /// there is none, or it can't be written) the temp dir. Its name carries our
-/// pid (`xwlrvnc-<pid>-XXXXXX`), so that a later start can tell one a bridge
+/// pid (`xwlbridge-<pid>-XXXXXX`), so that a later start can tell one a bridge
 /// that was killed outright left behind (see [`remove_stale_private_dirs`]).
 fn private_dir() -> io::Result<PrivateDir> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
@@ -357,7 +357,7 @@ fn private_dir() -> io::Result<PrivateDir> {
     for base in runtime.into_iter().chain([std::env::temp_dir()]) {
         remove_stale_rfb_sockets(&base);
         remove_stale_private_dirs(&base);
-        match mkdtemp(&base.join(format!("xwlrvnc-{}-XXXXXX", std::process::id()))) {
+        match mkdtemp(&base.join(format!("xwlbridge-{}-XXXXXX", std::process::id()))) {
             Ok(d) => return Ok(PrivateDir(d)),
             Err(e) => {
                 err = Some(io::Error::new(e.kind(), format!("can't make a private directory in {}: {e}", base.display())))
@@ -427,11 +427,11 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
         // handles XTest itself).
         let (w, h) = (w.max(320), h.max(200));
         cmd.args(["-geometry", &format!("{w}x{h}"), "-shm"]).env_remove("LIBEI_SOCKET");
-        match std::env::var("XWLRVNC_XWAYLAND_COMPOSITOR") {
+        match std::env::var("XWLBRIDGE_XWAYLAND_COMPOSITOR") {
             // For measurements only: an existing private compositor (e.g. a
             // weston --backend=headless) instead of ours; fixed size then
             Ok(other) if !other.is_empty() => {
-                crate::warning!("xwayland: on the compositor {other:?} (XWLRVNC_XWAYLAND_COMPOSITOR); the screen keeps its size");
+                crate::warning!("xwayland: on the compositor {other:?} (XWLBRIDGE_XWAYLAND_COMPOSITOR); the screen keeps its size");
                 cmd.env("WAYLAND_DISPLAY", other).env_remove("WAYLAND_SOCKET");
             }
             _ => {
@@ -549,7 +549,7 @@ fn remove_stale_private_dirs(dir: &Path) {
         let name = entry.file_name();
         let Some(pid) = name
             .to_str()
-            .and_then(|n| n.strip_prefix("xwlrvnc-"))
+            .and_then(|n| n.strip_prefix("xwlbridge-"))
             .and_then(|n| n.rsplit_once('-'))
             .filter(|(_, rand)| rand.len() == 6)
             .and_then(|(pid, _)| pid.parse::<libc::pid_t>().ok())
@@ -591,7 +591,7 @@ fn remove_stale_rfb_sockets(dir: &std::path::Path) {
         let name = entry.file_name();
         let Some(pid) = name
             .to_str()
-            .and_then(|n| n.strip_prefix("xwlrvnc-xvnc-"))
+            .and_then(|n| n.strip_prefix("xwlbridge-xvnc-"))
             .and_then(|n| n.strip_suffix(".sock"))
             .and_then(|n| n.parse::<libc::pid_t>().ok())
         else {
@@ -1077,7 +1077,7 @@ struct Agent {
     /// thread), and what is known about where input goes now.
     ledger: Arc<attrib::Ledger>,
     target: Target,
-    /// XWLRVNC_XVFB_DEBUG: log every event and where the pointer is sent.
+    /// XWLBRIDGE_XVFB_DEBUG: log every event and where the pointer is sent.
     debug: bool,
     /// What departed clients left held to release at once, from the RECORD
     /// thread.
@@ -1446,7 +1446,7 @@ impl Agent {
                 focus_ours,
                 ..Target::default()
             },
-            debug: std::env::var_os("XWLRVNC_XVFB_DEBUG").is_some_and(|v| !v.is_empty()),
+            debug: std::env::var_os("XWLBRIDGE_XVFB_DEBUG").is_some_and(|v| !v.is_empty()),
             releases,
             holds,
             recording,
@@ -1541,9 +1541,9 @@ impl Agent {
     /// SubstructureRedirect on the root for the window manager: so become one
     /// for as long as it takes to set the property, then stop. Present still
     /// paces its clients (at 60 Hz, by timer, when no frame is pending).
-    /// `XWLRVNC_XWAYLAND_COMMITS=1` keeps the commits (for measurements).
+    /// `XWLBRIDGE_XWAYLAND_COMMITS=1` keeps the commits (for measurements).
     fn stop_xwayland_commits(conn: &RustConnection, root: Window) {
-        if std::env::var_os("XWLRVNC_XWAYLAND_COMMITS").is_some_and(|v| v == "1") {
+        if std::env::var_os("XWLBRIDGE_XWAYLAND_COMMITS").is_some_and(|v| v == "1") {
             return;
         }
         use x11rb::protocol::xproto::{AtomEnum, ChangeWindowAttributesAux, PropMode};
@@ -1798,7 +1798,7 @@ impl Agent {
             };
             if let Some(d) = from
                 && devs.owns(d)
-                && std::env::var_os("XWLRVNC_REVERSE_ECHO").is_none_or(|v| v.is_empty())
+                && std::env::var_os("XWLBRIDGE_REVERSE_ECHO").is_none_or(|v| v.is_empty())
             {
                 // the desktop's own input on a window here: never back to it
                 self.reverse_ignored += 1;
@@ -2553,7 +2553,7 @@ impl Agent {
                 continue;
             }
             if let Ok(r) = res::query_client_resources(&self.conn, c.resource_base)?.reply() {
-                if std::env::var_os("XWLRVNC_XRES_DEBUG").is_some_and(|v| !v.is_empty()) {
+                if std::env::var_os("XWLBRIDGE_XRES_DEBUG").is_some_and(|v| !v.is_empty()) {
                     let names: Vec<String> = r
                         .types
                         .iter()
@@ -2904,7 +2904,7 @@ mod tests {
 
     #[test]
     fn authority_file_is_private_and_well_formed() {
-        let dir = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlrvnc-test-XXXXXX")).unwrap());
+        let dir = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlbridge-test-XXXXXX")).unwrap());
         assert_eq!(std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
         let a = Auth::create(&dir.0).unwrap();
         let b = Auth::create(&mkdtemp(&dir.0.join("b-XXXXXX")).unwrap()).unwrap();
@@ -2929,7 +2929,7 @@ mod tests {
     fn only_dead_bridges_private_dirs_are_removed() {
         use std::os::unix::net::UnixListener;
         use std::process::Command;
-        let base = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlrvnc-test-sweep-XXXXXX")).unwrap());
+        let base = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlbridge-test-sweep-XXXXXX")).unwrap());
         let mut done = Command::new("true").spawn().unwrap();
         let dead = done.id();
         done.wait().unwrap();
@@ -2941,20 +2941,20 @@ mod tests {
             d
         };
         // a dead bridge's (Xvfb: no socket; Xvnc: a socket nothing listens on)
-        let gone = mk(format!("xwlrvnc-{dead}-abcdef"));
-        let gone_xvnc = mk(format!("xwlrvnc-{}-abcdef", dead + 1_000_000));
+        let gone = mk(format!("xwlbridge-{dead}-abcdef"));
+        let gone_xvnc = mk(format!("xwlbridge-{}-abcdef", dead + 1_000_000));
         drop(UnixListener::bind(gone_xvnc.join(XVNC_SOCKET)).unwrap());
         // a live bridge's, ours, and a dead pid's whose socket answers
-        let alive = mk(format!("xwlrvnc-{}-abcdef", live.id()));
-        let own = mk(format!("xwlrvnc-{}-abcdef", std::process::id()));
-        let answering = mk(format!("xwlrvnc-{}-abcdef", dead + 2_000_000));
+        let alive = mk(format!("xwlbridge-{}-abcdef", live.id()));
+        let own = mk(format!("xwlbridge-{}-abcdef", std::process::id()));
+        let answering = mk(format!("xwlbridge-{}-abcdef", dead + 2_000_000));
         let _listening = UnixListener::bind(answering.join(XVNC_SOCKET)).unwrap();
         // not ours: another name, a plain file, a link to a directory
-        let other = mk("xwlrvnc-ui-abcdef".into());
-        let plain = base.0.join(format!("xwlrvnc-{}-zzzzzz", dead + 3_000_000));
+        let other = mk("xwlbridge-ui-abcdef".into());
+        let plain = base.0.join(format!("xwlbridge-{}-zzzzzz", dead + 3_000_000));
         std::fs::write(&plain, b"").unwrap();
         let target = mk("elsewhere".into());
-        let link = base.0.join(format!("xwlrvnc-{}-yyyyyy", dead + 4_000_000));
+        let link = base.0.join(format!("xwlbridge-{}-yyyyyy", dead + 4_000_000));
         std::os::unix::fs::symlink(&target, &link).unwrap();
         remove_stale_private_dirs(&base.0);
         assert!(!gone.exists());
@@ -2971,14 +2971,14 @@ mod tests {
     fn only_dead_bridges_rfb_sockets_are_removed() {
         use std::os::unix::net::UnixListener;
         use std::process::Command;
-        let dir = std::env::temp_dir().join(format!("xwlrvnc-test-stale-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xwlbridge-test-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let mut done = Command::new("true").spawn().unwrap();
         let dead = done.id();
         done.wait().unwrap();
         let mut live = Command::new("sleep").arg("30").spawn().unwrap();
-        let sock = |pid: u32| dir.join(format!("xwlrvnc-xvnc-{pid}.sock"));
+        let sock = |pid: u32| dir.join(format!("xwlbridge-xvnc-{pid}.sock"));
         // left by a dead bridge: a socket nothing listens on
         drop(UnixListener::bind(sock(dead)).unwrap());
         // a live bridge's (its Xvnc may not listen yet)
@@ -2986,11 +2986,11 @@ mod tests {
         // ours
         drop(UnixListener::bind(sock(std::process::id())).unwrap());
         // a dead pid, but something answers on it
-        let other = dir.join(format!("xwlrvnc-xvnc-{}.sock", dead + 1_000_000));
+        let other = dir.join(format!("xwlbridge-xvnc-{}.sock", dead + 1_000_000));
         let _listening = UnixListener::bind(&other).unwrap();
         // not a socket, or not our name
-        std::fs::write(dir.join(format!("xwlrvnc-xvnc-{}.sock.bak", dead)), b"").unwrap();
-        let plain = dir.join("xwlrvnc-xvnc-1999999999.sock");
+        std::fs::write(dir.join(format!("xwlbridge-xvnc-{}.sock.bak", dead)), b"").unwrap();
+        let plain = dir.join("xwlbridge-xvnc-1999999999.sock");
         std::fs::write(&plain, b"").unwrap();
         remove_stale_rfb_sockets(&dir);
         assert!(!sock(dead).exists());

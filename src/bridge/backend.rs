@@ -119,8 +119,8 @@ fn spawn_gnome(server: Arc<Server>) {
 fn spawn_gnome(server: Arc<Server>) {
     let _ = (server.config.reclaim, server.config.recordmonitor); // gnome-backend options
     crate::warning!(
-        "-backend gnome needs xwlrvnc built with the \"gnome\" feature \
-         (cargo install xwlrvnc --features gnome); falling back to the wayland backend"
+        "-backend gnome needs xwlbridge built with the \"gnome\" feature \
+         (cargo install xwlbridge --features gnome); falling back to the wayland backend"
     );
     crate::bridge::wayland::spawn(server)
 }

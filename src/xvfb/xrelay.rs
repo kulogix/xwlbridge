@@ -114,7 +114,7 @@ impl Side {
         }
         let mut ring = Vec::new();
         for i in 0..RING {
-            ring.push(intern(&format!("_XWLRVNC_RELAY_{i}"))?);
+            ring.push(intern(&format!("_XWLBRIDGE_RELAY_{i}"))?);
         }
         let (targets, timestamp, multiple, incr) =
             (intern("TARGETS")?, intern("TIMESTAMP")?, intern("MULTIPLE")?, intern("INCR")?);

@@ -306,7 +306,7 @@ impl Capture {
     ) -> Result<Capture, pw::Error> {
         let stream = pw::stream::StreamRc::new(
             pw.core.clone(),
-            "xwlrvnc",
+            "xwlbridge",
             pw::properties::properties! {
                 *pw::keys::MEDIA_TYPE => "Video",
                 *pw::keys::MEDIA_CATEGORY => "Capture",

@@ -41,9 +41,9 @@ use wayland_protocols::xdg::shell::client::__interfaces::XDG_WM_BASE_INTERFACE;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 /// The frame-callback interval: [`FRAME_INTERVAL`], or for measurements
-/// `XWLRVNC_XWAYLAND_FRAME_MS` (0 = never answer them).
+/// `XWLBRIDGE_XWAYLAND_FRAME_MS` (0 = never answer them).
 fn frame_interval() -> Option<Duration> {
-    match std::env::var("XWLRVNC_XWAYLAND_FRAME_MS").ok().and_then(|v| v.parse::<f64>().ok()) {
+    match std::env::var("XWLBRIDGE_XWAYLAND_FRAME_MS").ok().and_then(|v| v.parse::<f64>().ok()) {
         Some(ms) if ms <= 0.0 => None,
         Some(ms) => Some(Duration::from_secs_f64(ms / 1000.0)),
         None => Some(FRAME_INTERVAL),

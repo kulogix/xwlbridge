@@ -7,20 +7,20 @@
 //! over stdin/stdout, with `DISPLAY` set to the display it remotes — the
 //! engine's, where nobody can see it. No RealVNC parameter separates the two.
 //!
-//! xwlrvnc preloads this into the core, whose children inherit it. In a
+//! xwlbridge preloads this into the core, whose children inherit it. In a
 //! process running `vncserverui` it, before `main`:
 //!
-//! - points `DISPLAY` and `XAUTHORITY` at `XWLRVNC_UI_DISPLAY` /
-//!   `XWLRVNC_UI_XAUTHORITY` (an empty value unsets it) — if `XWLRVNC_UI_GATE`
-//!   names a file, only while that file starts with `1` (xwlrvnc keeps it at
+//! - points `DISPLAY` and `XAUTHORITY` at `XWLBRIDGE_UI_DISPLAY` /
+//!   `XWLBRIDGE_UI_XAUTHORITY` (an empty value unsets it) — if `XWLBRIDGE_UI_GATE`
+//!   names a file, only while that file starts with `1` (xwlbridge keeps it at
 //!   `0` while the UI display can't be used, so the UI stays where it works);
-//! - puts `LD_PRELOAD` back to `XWLRVNC_UI_LD_PRELOAD` (what it was before
-//!   xwlrvnc added this hook) and drops its own variables, so what the UI
+//! - puts `LD_PRELOAD` back to `XWLBRIDGE_UI_LD_PRELOAD` (what it was before
+//!   xwlbridge added this hook) and drops its own variables, so what the UI
 //!   launches (its tray icon helper, a browser for a help link) inherits a
 //!   plain environment for the display the UI is on.
 //!
 //! It also stands in for libX11's `XkbGetNames` in `vncserverui`: on an X
-//! server without the XKEYBOARD extension (xwlrvnc's built-in engine) the UI
+//! server without the XKEYBOARD extension (xwlbridge's built-in engine) the UI
 //! asks for the keyboard's symbols name, gets none, and builds a C++ string
 //! from the NULL — a segfault on every start, which RealVNC answers by
 //! starting it again every 2 s. There the hook names the symbols "unknown",
@@ -28,7 +28,7 @@
 //! nothing.
 //!
 //! Built by build.rs with rustc directly (one file, no dependencies, libc only)
-//! and embedded in xwlrvnc, which writes it out when it runs RealVNC.
+//! and embedded in xwlbridge, which writes it out when it runs RealVNC.
 
 #![no_std]
 
@@ -71,20 +71,20 @@ extern "C" fn init() {
     // SAFETY: getenv/setenv/unsetenv in a constructor, before any other thread
     // of this process exists; the strings are NUL-terminated
     unsafe {
-        let display = getenv(c"XWLRVNC_UI_DISPLAY".as_ptr());
-        let gate = getenv(c"XWLRVNC_UI_GATE".as_ptr());
+        let display = getenv(c"XWLBRIDGE_UI_DISPLAY".as_ptr());
+        let gate = getenv(c"XWLBRIDGE_UI_GATE".as_ptr());
         let set_gate = !gate.is_null() && *gate != 0;
         if !display.is_null() && *display != 0 && (!set_gate || gate_open(gate)) {
             set(c"DISPLAY", display);
-            set(c"XAUTHORITY", getenv(c"XWLRVNC_UI_XAUTHORITY".as_ptr()));
+            set(c"XAUTHORITY", getenv(c"XWLBRIDGE_UI_XAUTHORITY".as_ptr()));
         }
-        let preload = getenv(c"XWLRVNC_UI_LD_PRELOAD".as_ptr());
+        let preload = getenv(c"XWLBRIDGE_UI_LD_PRELOAD".as_ptr());
         if preload.is_null() || *preload == 0 {
             unsetenv(c"LD_PRELOAD".as_ptr());
         } else {
             setenv(c"LD_PRELOAD".as_ptr(), preload, 1);
         }
-        for var in [c"XWLRVNC_UI_DISPLAY", c"XWLRVNC_UI_XAUTHORITY", c"XWLRVNC_UI_LD_PRELOAD", c"XWLRVNC_UI_GATE"] {
+        for var in [c"XWLBRIDGE_UI_DISPLAY", c"XWLBRIDGE_UI_XAUTHORITY", c"XWLBRIDGE_UI_LD_PRELOAD", c"XWLBRIDGE_UI_GATE"] {
             unsetenv(var.as_ptr());
         }
     }

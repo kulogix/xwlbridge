@@ -29,12 +29,12 @@ The engine's core pointer and keyboard carry the display's clients' input (VNC v
 and must reach no X window there. Without this flag the agent keeps an input-only window over the whole screen for
 that, which also swallows any other device's clicks. With it:
 
-- the agent creates an XInput2 master device `xwlrvnc-reverse` (pointer + keyboard, each with an XTest slave);
+- the agent creates an XInput2 master device `xwlbridge-reverse` (pointer + keyboard, each with an XTest slave);
 - the input shield stays down; instead the agent holds an XInput2 grab of the core pointer and focuses the core
   keyboard on an input-only window of its own (re-asserted every 500 ms), so the core devices still reach no X
   window;
 - raw events from the reverse master are never forwarded to the desktop (they are the desktop's own input, coming
-  back); `XWLRVNC_REVERSE_ECHO=1` turns that off for testing.
+  back); `XWLBRIDGE_REVERSE_ECHO=1` turns that off for testing.
 
 A client drives it by making the reverse master its ClientPointer (XISetClientPointer with window None) and using
 core XTest, and focuses an app's window with XISetFocus on the reverse keyboard. Needs Composite on the engine

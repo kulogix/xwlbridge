@@ -16,7 +16,7 @@ packages should work.
 - Probe apps (`tests/apps/`): `python3-tk python3-pyqt5 python3-pyqt6 gir1.2-gtk-3.0 openjdk-25-jdk-headless
   libmotif-dev` (build `apps/motif_probe.c` to `/opt/a11y/motif_probe` with `cc -O2 -o /opt/a11y/motif_probe
   motif_probe.c -lXm -lXt -lX11`). Electron is optional and goes in `/opt/electron`.
-- The bridge binary: build it with `cargo build --release --features gnome,xvfb` and pass `BIN=/w/target/release/xwlrvnc`
+- The bridge binary: build it with `cargo build --release --features gnome,xvfb` and pass `BIN=/w/target/release/xwlbridge`
   (the default), or mount a binary somewhere else and set `BIN`.
 
 The helpers in this directory:

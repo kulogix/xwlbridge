@@ -182,7 +182,7 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Option<String> {
 pub fn keymap_fd(text: &str) -> Option<(OwnedFd, u32)> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
-    let raw = unsafe { libc::memfd_create(c"xwlrvnc-keymap".as_ptr(), libc::MFD_CLOEXEC) };
+    let raw = unsafe { libc::memfd_create(c"xwlbridge-keymap".as_ptr(), libc::MFD_CLOEXEC) };
     if raw < 0 {
         return None;
     }

@@ -113,7 +113,7 @@ impl Clip {
         let mut sides = vec![Side {
             sel: Sel::Clipboard,
             atom: intern(conn, "CLIPBOARD")?,
-            prop: intern(conn, "_XWLRVNC_CLIPBOARD")?,
+            prop: intern(conn, "_XWLBRIDGE_CLIPBOARD")?,
             seen: u64::MAX,
             ours_since: None,
             fetch: None,
@@ -122,7 +122,7 @@ impl Clip {
             sides.push(Side {
                 sel: Sel::Primary,
                 atom: AtomEnum::PRIMARY.into(),
-                prop: intern(conn, "_XWLRVNC_PRIMARY")?,
+                prop: intern(conn, "_XWLBRIDGE_PRIMARY")?,
                 seen: u64::MAX,
                 ours_since: None,
                 fetch: None,

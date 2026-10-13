@@ -1481,7 +1481,7 @@ impl Backend {
             ),
             None => crate::log!(
                 "gnome: the screen locked and GNOME closed remote access; resuming after it is \
-                 unlocked (the xwlrvnc lock-screen extension lets viewers see and unlock it)"
+                 unlocked (the xwlbridge lock-screen extension lets viewers see and unlock it)"
             ),
         }
         self.show_locked_placeholder();
@@ -1622,10 +1622,10 @@ impl Backend {
             if let Some(w) = self.dynres_wait.take() {
                 self.server
                     .dynres
-                    .complete(w.id, Err("xwlrvnc is exiting".into()));
+                    .complete(w.id, Err("xwlbridge is exiting".into()));
             }
-            self.revert_dynres("xwlrvnc is exiting");
-            self.restore_power_save("xwlrvnc is exiting");
+            self.revert_dynres("xwlbridge is exiting");
+            self.restore_power_save("xwlbridge is exiting");
             // whatever happens until the process is gone (our own power save
             // coming back as a signal, a watcher still connected) changes
             // nothing any more

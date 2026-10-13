@@ -2073,7 +2073,7 @@ impl Connection {
             Sel::Primary => "PRIMARY",
         };
         self.fetch_seq = self.fetch_seq.wrapping_add(1) % FETCH_PROPERTIES;
-        let name = format!("XWLRVNC_FETCH_{which}_{}", self.fetch_seq);
+        let name = format!("XWLBRIDGE_FETCH_{which}_{}", self.fetch_seq);
         let property = self.intern(name.as_bytes());
         // whatever a late answer to the fetch that last had this property left
         // on it is not this owner's, and must not be read as its answer
@@ -2186,7 +2186,7 @@ impl Connection {
     /// atoms are global).
     fn is_fetch_property(&self, atom: u32) -> bool {
         self.atom_name(atom)
-            .is_some_and(|name| name.starts_with(b"XWLRVNC_FETCH_"))
+            .is_some_and(|name| name.starts_with(b"XWLBRIDGE_FETCH_"))
     }
 
     /// Gives up on every fetch whose owner has run out of time to answer, as
@@ -2771,7 +2771,7 @@ pub fn setup(geom: Geometry, resource_id_base: u32) -> Vec<u8> {
         bitmap_format_scanline_pad: 32,
         min_keycode: 8,
         max_keycode: 255,
-        vendor: b"xwlrvnc".to_vec(),
+        vendor: b"xwlbridge".to_vec(),
         pixmap_formats: vec![
             Format {
                 depth: 1,

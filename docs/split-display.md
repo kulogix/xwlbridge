@@ -1,24 +1,24 @@
 # Programs with their own windows: the split display
 
-xwlrvnc's X display is for the parts of a program that need the whole desktop: reading the screen, injecting
+xwlbridge's X display is for the parts of a program that need the whole desktop: reading the screen, injecting
 input, the global clipboard. Nobody sees the windows that are opened *on* it (on the stock engines the bridge's
 agent holds Composite redirection, so client windows never reach the screen it mirrors; the built-in engine draws
 none). So there are two kinds of programs:
 
 | kind | examples | how to start it |
 |---|---|---|
-| **tools without a window of their own** | xdotool, xte, scrot, xwd, maim, import, ffmpeg x11grab, GStreamer ximagesrc, x11vnc, x0vncserver, xclip, PyAutoGUI and Java Robot scripts | on the bridge: `xwlrvnc run -- TOOL ...` (or as the bridge's own command) |
+| **tools without a window of their own** | xdotool, xte, scrot, xwd, maim, import, ffmpeg x11grab, GStreamer ximagesrc, x11vnc, x0vncserver, xclip, PyAutoGUI and Java Robot scripts | on the bridge: `xwlbridge run -- TOOL ...` (or as the bridge's own command) |
 | **programs whose windows you use** | OBS, SimpleScreenRecorder, a VNC *viewer*, RealVNC Server's status window | on the desktop as usual; only their capture is pointed at the bridge's display (the recipes below) |
 
-`xwlrvnc run` and the bridge's own command put **every** window of the program on the bridge's display: they set
+`xwlbridge run` and the bridge's own command put **every** window of the program on the bridge's display: they set
 `DISPLAY` to it, remove `WAYLAND_DISPLAY` and pin GTK, Qt, SDL, Electron, Firefox, Clutter and winit to X11
-(`xwlrvnc run -print` shows the exact environment). That is what a tool needs: a GTK or Qt program that still sees
+(`xwlbridge run -print` shows the exact environment). That is what a tool needs: a GTK or Qt program that still sees
 the desktop's Wayland socket would otherwise open there (GTK even with `WAYLAND_DISPLAY` unset, since libwayland
 then uses `wayland-0`) and capture through Wayland instead of the bridge. It is wrong for a program whose windows
 you want to see. Never export the bridge's `DISPLAY` for your whole session either: every X app you start would
 disappear onto it.
 
-In the recipes, `:20` stands for the bridge's display (`xwlrvnc run -print` prints it).
+In the recipes, `:20` stands for the bridge's display (`xwlbridge run -print` prints it).
 
 ## Recipes
 
@@ -43,7 +43,7 @@ OBS runs on GNOME's Xwayland (its XSHM source only exists when OBS runs on X11).
 *Screen Capture (XSHM)* → **Advanced Settings** → **X Server** = `:20`. Minimise or crop OBS's own window, which
 is part of the desktop it records. Needs the xvnc or xvfb engine (the built-in one reports no RandR monitors).
 
-**x11vnc** has no window; run it on the bridge with `xwlrvnc run -- x11vnc ...`. Started by hand from a desktop
+**x11vnc** has no window; run it on the bridge with `xwlbridge run -- x11vnc ...`. Started by hand from a desktop
 terminal it needs `env -u WAYLAND_DISPLAY x11vnc -display :20 ...`: x11vnc 0.9.17 exits ("Wayland display server
 detected") whenever `WAYLAND_DISPLAY` is set, even with `-display`. Its
 optional Tk control panel can go to the desktop with `-gui :0` (from `x11vnc -help`; not measured).

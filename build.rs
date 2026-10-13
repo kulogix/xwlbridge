@@ -1,5 +1,5 @@
 //! Builds `-uidisplay`'s preload hook (uihook/uihook.rs) for the target, as a
-//! shared object xwlrvnc embeds and writes out at run time. One file, no
+//! shared object xwlbridge embeds and writes out at run time. One file, no
 //! dependencies: rustc is called directly, with the linker cargo would use.
 
 use std::env;
@@ -14,7 +14,7 @@ fn main() {
     let mut cmd = Command::new(rustc);
     cmd.args([
         "--crate-type=cdylib",
-        "--crate-name=xwlrvnc_uihook",
+        "--crate-name=xwlbridge_uihook",
         "--edition=2024",
         "-Copt-level=s",
         "-Cpanic=abort",
@@ -23,7 +23,7 @@ fn main() {
         &target,
         "-o",
     ])
-    .arg(out.join("libxwlrvnc_uihook.so"))
+    .arg(out.join("libxwlbridge_uihook.so"))
     .arg("uihook/uihook.rs");
     let linker_var = format!("CARGO_TARGET_{}_LINKER", target.to_uppercase().replace(['-', '.'], "_"));
     println!("cargo:rerun-if-env-changed={linker_var}");

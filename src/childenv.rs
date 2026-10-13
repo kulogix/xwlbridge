@@ -1,5 +1,5 @@
 //! The environment of the programs that use our X display: the command we
-//! wrap, the stock X server and the tools started with `xwlrvnc run`. They
+//! wrap, the stock X server and the tools started with `xwlbridge run`. They
 //! belong on our display, and a toolkit that can also speak Wayland would
 //! otherwise go to the desktop's compositor instead: GTK 3 and 4 open
 //! `wayland-0` even with `WAYLAND_DISPLAY` unset (libwayland's default name),
@@ -45,13 +45,13 @@ pub const X11_ONLY: &[(&str, &str)] = &[
     ("WINIT_UNIX_BACKEND", "x11"), // winit < 0.29, which tries wayland-0 first (newer: WAYLAND_DISPLAY unset = X11)
 ];
 
-/// What `xwlrvnc run` adds for Java: AWT's Robot reads our screen with X11
+/// What `xwlbridge run` adds for Java: AWT's Robot reads our screen with X11
 /// requests, never the desktop portal.
 pub const JAVA_SCREENSHOT: &str = "-Dawt.robot.screenshotMethod=x11";
 
 /// The variable that tells a program which display the bridge serves (set for
-/// the wrapped command and by `xwlrvnc run`, read by `xwlrvnc run`).
-pub const DISPLAY_VAR: &str = "XWLRVNC_DISPLAY";
+/// the wrapped command and by `xwlbridge run`, read by `xwlbridge run`).
+pub const DISPLAY_VAR: &str = "XWLBRIDGE_DISPLAY";
 
 /// Keeps `cmd` (and what it starts) off the Wayland compositor.
 pub fn pin_x11(cmd: &mut Command) -> &mut Command {
@@ -92,7 +92,7 @@ pub fn parse_display(s: &str) -> Option<u32> {
     s.parse().ok()
 }
 
-// --- the running bridges, so `xwlrvnc run` can find "the" display ---
+// --- the running bridges, so `xwlbridge run` can find "the" display ---
 
 /// Where running bridges list their displays: one file per display, named by
 /// its number. Private to the user (the runtime directory); no list without
@@ -100,7 +100,7 @@ pub fn parse_display(s: &str) -> Option<u32> {
 fn registry_dir() -> Option<PathBuf> {
     env::var_os("XDG_RUNTIME_DIR")
         .filter(|d| Path::new(d).is_absolute())
-        .map(|d| PathBuf::from(d).join("xwlrvnc-displays"))
+        .map(|d| PathBuf::from(d).join("xwlbridge-displays"))
 }
 
 /// Our entry, a leaked C string so a signal handler can remove it.
@@ -157,7 +157,7 @@ fn parse_entry(text: &[u8]) -> Option<(i32, Option<u64>, Option<PathBuf>)> {
 }
 
 /// Lists `display` as served by this process (best effort: without a runtime
-/// directory, `xwlrvnc run` needs `-display`), with the cookie file a client
+/// directory, `xwlbridge run` needs `-display`), with the cookie file a client
 /// needs for it, if any.
 pub fn announce(display: u32, xauthority: Option<&Path>) {
     let Some(dir) = registry_dir() else { return };
@@ -254,10 +254,10 @@ fn has_socket(n: u32) -> bool {
     Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
 }
 
-/// Which display `xwlrvnc run` uses, and the cookie file it needs if any:
-/// `-display`, else `$XWLRVNC_DISPLAY` (set under a bridge), else the only
-/// running bridge. A `$XWLRVNC_DISPLAY` that names no running bridge and no X
-/// display at all (left over from an `eval "$(xwlrvnc run -print)"` in a
+/// Which display `xwlbridge run` uses, and the cookie file it needs if any:
+/// `-display`, else `$XWLBRIDGE_DISPLAY` (set under a bridge), else the only
+/// running bridge. A `$XWLBRIDGE_DISPLAY` that names no running bridge and no X
+/// display at all (left over from an `eval "$(xwlbridge run -print)"` in a
 /// shell that outlived its bridge) is refused rather than run against.
 fn resolve(
     explicit: Option<u32>,
@@ -291,8 +291,8 @@ fn resolve(
 }
 
 const RUN_HELP: &str = "\
-use: xwlrvnc run [-display N] [--] command [args ...]
-     xwlrvnc run [-display N] -print
+use: xwlbridge run [-display N] [--] command [args ...]
+     xwlbridge run [-display N] -print
 
 Runs an X tool on a running bridge's display, with the environment of the
 programs the bridge starts itself: DISPLAY set to the bridge, WAYLAND_DISPLAY
@@ -305,16 +305,16 @@ Not for programs whose own windows belong on the desktop (OBS, SimpleScreen-
 Recorder, VNC viewers): run those normally and point their capture at the
 bridge's display (docs/split-display.md).
 
--display N    the bridge's display (default: $XWLRVNC_DISPLAY, or else the only
+-display N    the bridge's display (default: $XWLBRIDGE_DISPLAY, or else the only
               running bridge)
 -print        print the environment as shell commands instead of running
               anything (for a shell that only runs bridge tools)
 ";
 
-/// `xwlrvnc run ...` (`args` without the program and `run`). Never returns.
+/// `xwlbridge run ...` (`args` without the program and `run`). Never returns.
 pub fn run_main(args: Vec<OsString>) -> ! {
     fn fail(msg: &str, code: i32) -> ! {
-        eprintln!("xwlrvnc run: {msg}");
+        eprintln!("xwlbridge run: {msg}");
         process::exit(code);
     }
     let mut explicit = None;
@@ -348,13 +348,13 @@ pub fn run_main(args: Vec<OsString>) -> ! {
                 explicit =
                     Some(parse_display(&v).unwrap_or_else(|| fail(&format!("-display {v:?} is not an X display"), 2)));
             }
-            other => fail(&format!("unknown option -{other} (try: xwlrvnc run -help)"), 2),
+            other => fail(&format!("unknown option -{other} (try: xwlbridge run -help)"), 2),
         }
         i += 1;
     }
     let command = &args[i..];
     if command.is_empty() && !print {
-        fail("no command given (try: xwlrvnc run -help)", 2);
+        fail("no command given (try: xwlbridge run -help)", 2);
     }
     let dir = registry_dir();
     let (display, xauthority) =
@@ -380,7 +380,7 @@ pub fn run_main(args: Vec<OsString>) -> ! {
 
     if !has_socket(display) {
         // only a hint: the abstract socket may still be there
-        eprintln!("xwlrvnc run: warning: display :{display} has no socket /tmp/.X11-unix/X{display}");
+        eprintln!("xwlbridge run: warning: display :{display} has no socket /tmp/.X11-unix/X{display}");
     }
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -423,7 +423,7 @@ mod tests {
         on_display(&mut cmd, 21);
         let e = envs(&cmd);
         assert_eq!(get(&e, "DISPLAY"), Some(Some(":21".into())));
-        assert_eq!(get(&e, "XWLRVNC_DISPLAY"), Some(Some(":21".into())));
+        assert_eq!(get(&e, "XWLBRIDGE_DISPLAY"), Some(Some(":21".into())));
         // removed (x11vnc quits when it is set at all); the toolkit switches
         // below keep libwayland's wayland-0 default from mattering
         assert_eq!(get(&e, "WAYLAND_DISPLAY"), Some(None));
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn which_display_run_uses() {
-        let dir = env::temp_dir().join(format!("xwlrvnc-childenv-test-{}", process::id()));
+        let dir = env::temp_dir().join(format!("xwlbridge-childenv-test-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let me = process::id() as i32;
@@ -483,11 +483,11 @@ mod tests {
         fs::write(dir.join("notes"), "x").unwrap();
         assert_eq!(resolve(None, None, Some(&dir), no_socket), Ok((23, None)));
         assert!(!dir.join("24").exists(), "a dead bridge's entry is removed");
-        // -display and $XWLRVNC_DISPLAY come first
+        // -display and $XWLBRIDGE_DISPLAY come first
         assert_eq!(resolve(Some(5), Some(OsStr::new(":6")), Some(&dir), no_socket), Ok((5, None)));
         assert_eq!(resolve(None, Some(OsStr::new(":6")), Some(&dir), |n| n == 6), Ok((6, None)));
         assert!(resolve(None, Some(OsStr::new("nope")), Some(&dir), no_socket).is_err());
-        // a leftover $XWLRVNC_DISPLAY (no bridge, no X display) is refused
+        // a leftover $XWLBRIDGE_DISPLAY (no bridge, no X display) is refused
         let e = resolve(None, Some(OsStr::new(":6")), Some(&dir), no_socket).unwrap_err();
         assert!(e.contains("no running bridge") && e.contains(":23"), "{e}");
         assert_eq!(resolve(None, Some(OsStr::new(":23")), Some(&dir), no_socket), Ok((23, None)));
@@ -509,10 +509,10 @@ mod tests {
 
     #[test]
     fn entries_round_trip() {
-        let t = entry_text(42, Some(7), Some(Path::new("/run/user/1000/xwlrvnc-1-x/auth")));
+        let t = entry_text(42, Some(7), Some(Path::new("/run/user/1000/xwlbridge-1-x/auth")));
         assert_eq!(
             parse_entry(&t),
-            Some((42, Some(7), Some(PathBuf::from("/run/user/1000/xwlrvnc-1-x/auth"))))
+            Some((42, Some(7), Some(PathBuf::from("/run/user/1000/xwlbridge-1-x/auth"))))
         );
         // an entry written by an older bridge: the pid alone
         assert_eq!(parse_entry(b"42\n"), Some((42, None, None)));
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn withdraw_removes_only_our_own_entry() {
-        let dir = env::temp_dir().join(format!("xwlrvnc-childenv-withdraw-{}", process::id()));
+        let dir = env::temp_dir().join(format!("xwlbridge-childenv-withdraw-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("31");

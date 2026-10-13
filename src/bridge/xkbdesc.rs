@@ -513,7 +513,7 @@ fn type_for(types: &mut Vec<KeyType>, sig: &(u8, Vec<(u8, u8)>)) -> Option<usize
 fn synthesized_type(index: usize, sig: &(u8, Vec<(u8, u8)>)) -> KeyType {
     let (levels, entries) = sig;
     KeyType {
-        name: format!("XWLRVNC_TYPE{index}"),
+        name: format!("XWLBRIDGE_TYPE{index}"),
         mods: entries.iter().fold(0, |m, e| m | e.0),
         real: entries.iter().fold(0, |m, e| m | e.0),
         vmods: 0,
@@ -984,7 +984,7 @@ pub(crate) mod tests {
         assert_eq!(d.key(kc(&d, "FK01")).syms[4], 0x1008fe01); // XF86Switch_VT_1
         assert_eq!(type_of(&d, "KP7").name, "KEYPAD");
         // nothing had to be made up for this keymap
-        assert!(!d.types.iter().any(|t| t.name.starts_with("XWLRVNC")));
+        assert!(!d.types.iter().any(|t| t.name.starts_with("XWLBRIDGE")));
     }
 
     #[test]

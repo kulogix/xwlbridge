@@ -950,7 +950,7 @@ pub fn get_kbd_by_name() -> Vec<u8> {
 }
 
 pub fn get_device_info(first_button: u8, n_buttons: u8) -> Vec<u8> {
-    const NAME: &[u8] = b"xwlrvnc keyboard";
+    const NAME: &[u8] = b"xwlbridge keyboard";
     let mut w = Wire::reply(DEVICE_ID);
     w.u16(0) // present
         .u16(0) // supported
@@ -1378,7 +1378,7 @@ mod tests {
         let r: xkb::ListComponentsReply = parse_reply(list_components());
         assert!(r.keymaps.is_empty());
         let r: xkb::GetDeviceInfoReply = parse_reply(get_device_info(0, 0));
-        assert_eq!(r.name, b"xwlrvnc keyboard");
+        assert_eq!(r.name, b"xwlbridge keyboard");
         let r: xkb::SetDebuggingFlagsReply = parse_reply(set_debugging_flags());
         assert_eq!(r.supported_flags, 0);
         let r: xkb::GetKbdByNameReply = parse_reply(get_kbd_by_name());

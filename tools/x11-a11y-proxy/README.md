@@ -1,6 +1,6 @@
 # x11-a11y-proxy — accessible GNOME windows for X apps that live on the bridge's display
 
-An X app can run *entirely* under X on the xwlrvnc bridge's engine display (`-engine xvnc|xvfb`, e.g. `:20`) — no
+An X app can run *entirely* under X on the xwlbridge bridge's engine display (`-engine xvnc|xvfb`, e.g. `:20`) — no
 split display, every X feature it needs — and still be a first-class, accessible window on GNOME:
 
 - **one GNOME window per X top-level window**, showing its live pixels (DAMAGE-driven), with the X title, transient
@@ -10,7 +10,7 @@ split display, every X feature it needs — and still be a first-class, accessib
   (AT-SPI Value via GtkAccessibleRange), text with caret and selection (GtkAccessibleText), actions (Orca's
   "perform default action" runs the app's), relations, announcements. Orca, the magnifier and every AT-SPI client
   see the mirrors; the engine's own tree stays off the desktop's bus;
-- **the person's keyboard and pointer forwarded** with XTest through the bridge's `xwlrvnc-reverse` XInput2 master
+- **the person's keyboard and pointer forwarded** with XTest through the bridge's `xwlbridge-reverse` XInput2 master
   (`-reverseinput`): never echoed back to GNOME, never mixed with VNC viewers' input. Modifier and lock states are
   synchronised (sticky keys; Caps Lock and Num Lock toggled in another window: tests/keyboard.sh);
 - **focus**: activating the GNOME window gives the app the X focus (as a window manager would: `WM_TAKE_FOCUS`, the
@@ -64,7 +64,7 @@ Measurements, parity results per toolkit and what differs from native X: docs/ac
 
 ```sh
 # the bridge with a private accessibility bus and the reverse master
-xwlrvnc -engine xvnc -display 20 -a11ybus -reverseinput -nowrap &
+xwlbridge -engine xvnc -display 20 -a11ybus -reverseinput -nowrap &
 # an app on the engine, mirrored on GNOME (the proxy starts it with the right environment)
 tools/x11-a11y-proxy/x11-a11y-proxy --display :20 -- xcalc
 # or mirror whatever maps on :20 (apps started elsewhere need DISPLAY=:20 and AT_SPI_BUS_ADDRESS from the

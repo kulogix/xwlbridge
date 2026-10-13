@@ -1,0 +1,9 @@
+{
+  "uuid": "xwlbridge-lockscreen@xwlbridge",
+  "name": "Remote desktop on the lock screen (xwlbridge)",
+  "description": "Keeps remote desktop sessions open while the screen is locked, so a remote user (RealVNC Server through the xwlbridge bridge, or any other mutter RemoteDesktop/ScreenCast client) sees the lock screen and can unlock it with the account password, as on Xorg. Without it GNOME closes every remote desktop session when the screen locks and refuses new ones until someone unlocks at the computer. Only the lock screen is affected; the login screen only when an administrator installs the extension system-wide and enables it for GDM (see README).",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "session-modes": ["user", "unlock-dialog", "gdm"],
+  "url": "https://github.com/kulogix/xwlbridge",
+  "version-name": "1.0"
+}

@@ -14,77 +14,77 @@ If you're using a Smithay-based compositor and compositor keybindings don't work
 
 If your compositor does not implement a supported virtual input protocol, you can use [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) for that too. 
 
-By default, the virtual input devices go on the first seat (or the one named by `-seat`). With `-seat transient`, xwlrvnc asks the compositor for a seat of its own using `ext_transient_seat_v1`, so remote input has its own cursor and keyboard focus (the clipboard stays on the first real seat, since selections are per-seat). If the compositor doesn't support it or denies it, xwlrvnc logs a warning and uses the first seat instead. This does not apply with wl-uinput-proxy, since uinput devices always go to the compositor's own seat.
+By default, the virtual input devices go on the first seat (or the one named by `-seat`). With `-seat transient`, xwlbridge asks the compositor for a seat of its own using `ext_transient_seat_v1`, so remote input has its own cursor and keyboard focus (the clipboard stays on the first real seat, since selections are per-seat). If the compositor doesn't support it or denies it, xwlbridge logs a warning and uses the first seat instead. This does not apply with wl-uinput-proxy, since uinput devices always go to the compositor's own seat.
 
-If the local display is asleep (e.g., swayidle turned it off), the compositor can't capture it, and clients see a frozen screen. If the compositor supports `zwlr_output_power_manager_v1` (selected with `-pwrmgr`, default `auto`), xwlrvnc turns an output back on when a client starts watching the screen, and again if it goes off while one is watching. It never turns outputs off.
+If the local display is asleep (e.g., swayidle turned it off), the compositor can't capture it, and clients see a frozen screen. If the compositor supports `zwlr_output_power_manager_v1` (selected with `-pwrmgr`, default `auto`), xwlbridge turns an output back on when a client starts watching the screen, and again if it goes off while one is watching. It never turns outputs off.
 
-With `-backend gnome`, the same is done through mutter's `org.gnome.Mutter.DisplayConfig` `PowerSaveMode` (`-pwrmgr auto` or `gnome`, the default, so this is on unless `-pwrmgr none` is given): the screen is turned on when a remote desktop session starts and when it goes into power save while one runs. When the viewers have gone (and when xwlrvnc exits or is stopped by a signal) and mutter saw no input at all since then (no local user, no remote input), the power save mode it was in is set again; otherwise it is left on for the idle policy (gsd-power) to handle. Note that on a real gnome-shell an idle session also raises the screen shield, which blocks remote access until it is dismissed, so this mostly matters where the shield is not involved.
+With `-backend gnome`, the same is done through mutter's `org.gnome.Mutter.DisplayConfig` `PowerSaveMode` (`-pwrmgr auto` or `gnome`, the default, so this is on unless `-pwrmgr none` is given): the screen is turned on when a remote desktop session starts and when it goes into power save while one runs. When the viewers have gone (and when xwlbridge exits or is stopped by a signal) and mutter saw no input at all since then (no local user, no remote input), the power save mode it was in is set again; otherwise it is left on for the idle policy (gsd-power) to handle. Note that on a real gnome-shell an idle session also raises the screen shield, which blocks remote access until it is dismissed, so this mostly matters where the shield is not involved.
 
 KDE and GNOME are not currently supported since they prefer to use [`org.freedesktop.portal.RemoteDesktop`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) via [xdg-desktop-protocol](https://flatpak.github.io/xdg-desktop-portal/), which uses [PipeWire](https://pipewire.org/) for screen capture and [libei](https://libinput.pages.freedesktop.org/libei/) for virtual input.
 
 ### Ensuring the X server works with Xlib
 
-This is the second thing you should check if you have issues. You can add `-verbose -xtrace` after `xwlrvnc` for debug output.
+This is the second thing you should check if you have issues. You can add `-verbose -xtrace` after `xwlbridge` for debug output.
 
 ```bash
 # test handshake, extensions, props
-xwlrvnc xdpyinfo
+xwlbridge xdpyinfo
 
 # test display layout
 # note: compare this to your real display layout
-xwlrvnc xrandr --query
+xwlbridge xrandr --query
 
 # test basic keyboard stuff
 # note: you can run wev to see events
-xwlrvnc xte 'sleep 1' 'str test' 'sleep 1'
+xwlbridge xte 'sleep 1' 'str test' 'sleep 1'
 
 # test the keymap as XKB clients see it (rules names, components, a full dump)
-xwlrvnc setxkbmap -query
-xwlrvnc setxkbmap -print
-xwlrvnc sh -c 'xkbcomp -xkb "$DISPLAY" - | head'
+xwlbridge setxkbmap -query
+xwlbridge setxkbmap -print
+xwlbridge sh -c 'xkbcomp -xkb "$DISPLAY" - | head'
 
 # test typing through XKB (xdotool needs it)
-xwlrvnc xdotool sleep 1 type 'Hello World!'
+xwlbridge xdotool sleep 1 type 'Hello World!'
 
 # test shifted keys
 # note: you can run wev to see events
-xwlrvnc xte 'sleep 1' 'str TeSt' 'sleep 1'
+xwlbridge xte 'sleep 1' 'str TeSt' 'sleep 1'
 
 # test non-compositor keyboard shortcut
 # note: change this to something harmless but visible
 # note: you can run wev to see events
-xwlrvnc xte 'sleep 1' 'keydown Control_L' 'key Tab' 'keyup Control_L' 'sleep 1'
+xwlbridge xte 'sleep 1' 'keydown Control_L' 'key Tab' 'keyup Control_L' 'sleep 1'
 
 # test compositor keyboard shortcut
 # note: change this to something harmless but visible
 # note: you may need to prefix it with wl-uinput-proxy
-xwlrvnc xte 'sleep 1' 'keydown Super_L' 'key d' 'keyup Super_L' 'sleep 1'
+xwlbridge xte 'sleep 1' 'keydown Super_L' 'key d' 'keyup Super_L' 'sleep 1'
 
 # test shifted compositor keyboard shortcut
 # note: change this to something harmless but visible
 # note: you may need to prefix it with wl-uinput-proxy
-xwlrvnc xte 'sleep 1' 'keydown Super_L' 'keydown Shift_L' 'key d' 'keyup Shift_L' 'keyup Super_L' 'sleep 1'
+xwlbridge xte 'sleep 1' 'keydown Super_L' 'keydown Shift_L' 'key d' 'keyup Shift_L' 'keyup Super_L' 'sleep 1'
 
 # test shifted compositor keyboard shortcut with pre-shifted character
 # note: change this to something harmless but visible
 # note: you may need to prefix it with wl-uinput-proxy
-xwlrvnc xte 'sleep 1' 'keydown Super_L' 'keydown Shift_L' 'key D' 'keyup Shift_L' 'keyup Super_L' 'sleep 1'
+xwlbridge xte 'sleep 1' 'keydown Super_L' 'keydown Shift_L' 'key D' 'keyup Shift_L' 'keyup Super_L' 'sleep 1'
 
 # test x-to-wayland clipboard (i.e., ctrl+c/ctrl+v)
-xwlrvnc sh -c "echo '> copy'; date | tee /dev/stderr | xclip -selection clipboard; echo '> paste'; WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-paste"
+xwlbridge sh -c "echo '> copy'; date | tee /dev/stderr | xclip -selection clipboard; echo '> paste'; WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-paste"
 
 # test x-to-wayland primary clipboard (i.e., middle-click)
-xwlrvnc sh -c "echo '> copy'; date | tee /dev/stderr | xclip -selection primary; echo '> paste'; WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-paste --primary"
+xwlbridge sh -c "echo '> copy'; date | tee /dev/stderr | xclip -selection primary; echo '> paste'; WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-paste --primary"
 
 # test wayland-to-x clipboard (i.e., ctrl+c/ctrl+v)
-xwlrvnc sh -c "echo '> copy'; date | tee /dev/stderr | WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-copy; echo '> paste'; xclip -selection clipboard -out"
+xwlbridge sh -c "echo '> copy'; date | tee /dev/stderr | WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-copy; echo '> paste'; xclip -selection clipboard -out"
 
 # test wayland-to-x primary clipboard (i.e., middle-click)
-xwlrvnc sh -c "echo '> copy'; date | tee /dev/stderr | WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-copy --primary; echo '> paste'; xclip -selection primary -out"
+xwlbridge sh -c "echo '> copy'; date | tee /dev/stderr | WAYLAND_DISPLAY=$WAYLAND_DISPLAY wl-copy --primary; echo '> paste'; xclip -selection primary -out"
 
 # test screen capture
 # note: if you see "screen capture started" after "capture", increase the sleep time
-xwlrvnc -verbose -profile sh -c "for x in 1 2 3; do echo \$x; xwd -root -silent >/dev/null; sleep 1; done; echo capture; xwd -root -silent | magick xwd:- png:/tmp/screen.png"
+xwlbridge -verbose -profile sh -c "for x in 1 2 3; do echo \$x; xwd -root -silent >/dev/null; sleep 1; done; echo capture; xwd -root -silent | magick xwd:- png:/tmp/screen.png"
 
 # TODO: test clipboard events both ways
 # TODO: test commands for xfixes, xdamage, etc?
@@ -92,7 +92,7 @@ xwlrvnc -verbose -profile sh -c "for x in 1 2 3; do echo \$x; xwd -root -silent 
 
 ### Log messages
 
-#### xwlrvnc
+#### xwlbridge
 
 If you're using `ext_image_copy_capture_v1` and see a mesage like `ext capture frame failed (buffer-constraints)` after changing outputs, it's fine as long as it also doesn't stop working.
 
@@ -149,13 +149,13 @@ With `-backend gnome` and the stock engines (`-engine xvnc`/`xvfb`):
 <!-- TODO: I should add a lot more logging, especially around wayland protocol selection -->
 
 Exit status, for a service manager (use `Restart=on-failure`): the wrapped command's own status normally; **69** when
-what xwlrvnc mirrors is gone for good: the stock X server of `-engine xvfb|xvnc` died (also when the wrapped
-command, an X client, exited first because its display went), or (GNOME) the session bus closed xwlrvnc's
+what xwlbridge mirrors is gone for good: the stock X server of `-engine xvfb|xvnc` died (also when the wrapped
+command, an X client, exited first because its display went), or (GNOME) the session bus closed xwlbridge's
 connection (the connection broke, or its signal stream ended) and no stop request followed within 10 s. A D-Bus
 call that only took longer than its 5 s timeout (a stalled gnome-shell) does not count: the bridge retries and
 serves once gnome-shell answers. The command is stopped first in both cases. **70**: the GNOME backend failed.
 
-On GNOME, `the screen locked and GNOME closed remote access: xwlrvnc-lockscreen@xwlrvnc is installed but not active`
+On GNOME, `the screen locked and GNOME closed remote access: xwlbridge-lockscreen@xwlbridge is installed but not active`
 means viewers get a padlock instead of the lock screen. GNOME turns all user extensions off after gnome-shell fails
 soon after starting; check `gsettings get org.gnome.shell disable-user-extensions` (see
 [contrib/gnome-shell](../contrib/gnome-shell/README.md)).
@@ -168,7 +168,7 @@ without listening until it is restarted. Find the other listener (`ss -ltnp 'spo
 
 On a machine with RealVNC Server, `sudo apt install tigervnc-standalone-server` (for `-engine xvnc`) also repoints
 `/usr/bin/vncserver` (RealVNC's link to its virtual-mode `vncserver-virtual`) to TigerVNC's `vncserver` through
-update-alternatives; RealVNC's `/usr/bin/Xvnc`, `vncserver-x11` and its service mode are not touched, and xwlrvnc
+update-alternatives; RealVNC's `/usr/bin/Xvnc`, `vncserver-x11` and its service mode are not touched, and xwlbridge
 never runs RealVNC's Xvnc. If you use RealVNC's virtual mode, put it back with `sudo update-alternatives --remove
 vncserver /usr/bin/tigervncserver && sudo ln -sfn vncserver-virtual /usr/bin/vncserver`, or use `-engine xvfb`
 (`sudo apt install xvfb`, no alternatives involved; a fixed screen size) instead.
@@ -177,7 +177,7 @@ To get more verbose logs, add the `-Log *:stderr:100` RealVNC parameter. You can
 
 ### Exit status (for service managers)
 
-xwlrvnc's exit status tells a service manager (systemd's `Restart=on-failure`, docker's `--restart
+xwlbridge's exit status tells a service manager (systemd's `Restart=on-failure`, docker's `--restart
 on-failure`) whether to start it again:
 
 | status | when |
@@ -191,7 +191,7 @@ on-failure`) whether to start it again:
 A command that reports a failure of its own while stopping still exits with it. During a stop, 69 and 70 are not
 reported (the stop wins).
 
-So a systemd unit running xwlrvnc (the packaged `xwlrvnc.service`, or your own `-nowrap` unit `PartOf=` and
+So a systemd unit running xwlbridge (the packaged `xwlbridge-realvnc.service`, or your own `-nowrap` unit `PartOf=` and
 `WantedBy=graphical-session.target`) ends `inactive`, not `failed`, after `systemctl stop` and after a logout,
 and needs no `SuccessExitStatus=`. Older builds could exit non-zero when stopped (143 = 128 + SIGTERM with
 `-nowrap`), which left such a unit `failed` after every logout; adding `SuccessExitStatus=143` is not the cure, since
@@ -203,16 +203,16 @@ script that exits 0 then.
 
 Dynamic resolution needs `-dynres`, a compositor which supports `zwlr_output_manager_v1` (selected with `-outmgr`, default `auto`), and for RealVNC, the [hook](../dynres/README.md). It is meant for a headless or nested compositor (e.g., `WLR_BACKENDS=headless sway`), where the output supports arbitrary modes.
 
-When X client (vncagent-x11, or `xrandr`) sets the CRTC to a new mode, xwlrvnc attempts to change the output's mode and waits for it before replying to the X request.
+When X client (vncagent-x11, or `xrandr`) sets the CRTC to a new mode, xwlbridge attempts to change the output's mode and waits for it before replying to the X request.
 
 To test it without RealVNC:
 
 ```bash
-# note: replace HEADLESS-1 with the output name from `xwlrvnc xrandr --query`
-xwlrvnc -dynres -verbose sh -c 'xrandr --newmode 1024x640 0 1024 0 0 0 640 0 0 0; xrandr --addmode HEADLESS-1 1024x640; xrandr --output HEADLESS-1 --mode 1024x640; xrandr --query'
+# note: replace HEADLESS-1 with the output name from `xwlbridge xrandr --query`
+xwlbridge -dynres -verbose sh -c 'xrandr --newmode 1024x640 0 1024 0 0 0 640 0 0 0; xrandr --addmode HEADLESS-1 1024x640; xrandr --output HEADLESS-1 --mode 1024x640; xrandr --query'
 ```
 
-If it says `Configure crtc 0 failed`, check the xwlrvnc log for:
+If it says `Configure crtc 0 failed`, check the xwlbridge log for:
 
 - `dynamic resolution is off (see -dynres)`: run with `-dynres`.
 - `output configuration is off (see -outmgr)`: `-outmgr none` was given.
@@ -225,17 +225,17 @@ Note that RealVNC will set all CRTCs to the requested size, but will not update 
 
 On a rotated output, the mode is set in the native panel orientation, and on a scaled output the size is in physical pixels, as everything else in RandR.
 
-RealVNC disables the CRTC and resizes the screen before it asks for the new mode, and does not undo either if that fails. As a workaround, xwlrvnc restores the original output configuration if that happens (and logs `restored the screen to the compositor's outputs`).
+RealVNC disables the CRTC and resizes the screen before it asks for the new mode, and does not undo either if that fails. As a workaround, xwlbridge restores the original output configuration if that happens (and logs `restored the screen to the compositor's outputs`).
 
 #### GNOME
 
 With `-backend gnome`, `-dynres` uses `org.gnome.Mutter.DisplayConfig` (`-outmgr auto` or `gnome`): the monitor is switched to one of its **own** modes of exactly the requested size with `ApplyMonitorsConfig` method 1 (temporary: not saved, no "Keep changes?" prompt), and monitors to its right or below move with its edge so the layout stays valid. Every monitor keeps its underscanning, colour mode (HDR) and RGB range, and a fixed-rate mode stays fixed-rate (VRR modes are only picked for a monitor already running one). mutter has no way to add a mode over D-Bus, so a size the monitor does not list is refused (`monitor Meta-0 has no 1366x768 mode (it has ...)`). A headless `--virtual-monitor` has exactly one mode; a `ScreenCast.RecordVirtual` monitor created with a `modes` list has those.
 
-The layout the change replaced is put back once someone has watched since it was made and nobody watches any more (after the usual 10 s linger), and when xwlrvnc exits — normally, or on SIGTERM/SIGINT/SIGHUP, also with `-nowrap` (not on SIGKILL: then the temporary layout stays until the next monitor change or login). It is left alone if the monitors were reconfigured some other way in the meantime (the local user, a hotplug, a changed colour mode). `-dynreskeep` keeps the new resolution instead. Without `-dynres` nothing is ever changed: the X client's request fails. A monitor is never turned off: every enabled monitor is part of each configuration, and a layout whose monitors or modes are gone is not put back.
+The layout the change replaced is put back once someone has watched since it was made and nobody watches any more (after the usual 10 s linger), and when xwlbridge exits — normally, or on SIGTERM/SIGINT/SIGHUP, also with `-nowrap` (not on SIGKILL: then the temporary layout stays until the next monitor change or login). It is left alone if the monitors were reconfigured some other way in the meantime (the local user, a hotplug, a changed colour mode). `-dynreskeep` keeps the new resolution instead. Without `-dynres` nothing is ever changed: the X client's request fails. A monitor is never turned off: every enabled monitor is part of each configuration, and a layout whose monitors or modes are gone is not put back.
 
 With `-engine xvnc`, RandR requests go to Xvnc itself, which grants them; once a client's new screen size has stood for 200 ms (xrandr passes through an intermediate size), the agent carries it to the desktop's monitor (single-monitor desktops only; one request at a time, the newest size wins), and about a second after the client's last change puts the X screen back to the desktop's size if the desktop can't follow, or without `-dynres`. An output a client turned off (RealVNC does so first in a resize; `xrandr --off`) is turned back on then. Xvfb has a fixed size: a client may shrink it with RandR, and the agent puts it back the same way. On the built-in engine, a request that reaches the desktop and fails is rolled back at once (see above), and outputs an X client left off, moved or at another size without asking the desktop are put back after a second.
 
-Which viewers ask for a new size (measured with RealVNC Server 6.11 in user mode on xwlrvnc, on headless mutter 50.1):
+Which viewers ask for a new size (measured with RealVNC Server 6.11 in user mode on xwlbridge, on headless mutter 50.1):
 
 | viewer | server | resize request reaches X |
 |---|---|---|
@@ -247,7 +247,7 @@ Which viewers ask for a new size (measured with RealVNC Server 6.11 in user mode
 
 Server 6.11's own display-mode support is that `RandR` list (its `-geometry` is refused in user mode); its virtual mode runs RealVNC's own X server instead of showing the desktop, so it is no option here.
 
-Also, note that different compositor implementations validate the refresh rate for a custom mode differently (wlroots' nested backends reject any but 0, but niri ignores 0), so xwlrvnc tries both.
+Also, note that different compositor implementations validate the refresh rate for a custom mode differently (wlroots' nested backends reject any but 0, but niri ignores 0), so xwlbridge tries both.
 
 ### Performance issues
 
@@ -318,7 +318,7 @@ that describes it but can't change it (`-noxkb` hides the extension; clients the
 The X server does not implement stuff needed for displaying real windows, so some things don't work:
 
 - Window properties are per connection. Properties set by one client are not visible to other clients. Tools that pass data between clients through root-window properties (cut buffers, `RESOURCE_MANAGER`) will not work. Atoms are global.
-- `CLIPBOARD` and `PRIMARY` are the only fully functional selection types, and are always fetched by xwlrvnc (as a `UTF8_STRING`) immediately after taken by a client, and published as a wayland selection. Changes to the selection after ownership is taken are not handled. There is a timeout of 10 seconds for fetches to stop misbehaving applications from stalling it. This works fine for RealVNC and most other VNC servers.
+- `CLIPBOARD` and `PRIMARY` are the only fully functional selection types, and are always fetched by xwlbridge (as a `UTF8_STRING`) immediately after taken by a client, and published as a wayland selection. Changes to the selection after ownership is taken are not handled. There is a timeout of 10 seconds for fetches to stop misbehaving applications from stalling it. This works fine for RealVNC and most other VNC servers.
 - At most 254 X clients can be connected at once, as with Xorg (X resource ids have 29 bits, and each client gets 2^21 of them). The next one is refused with `Maximum number of clients reached` and the log says `refusing an X client: all 254 client slots are in use`; a slot is free again as soon as any client disconnects, so hitting this usually means a script leaks connections.
 
 ### Generic X tools on the built-in server
@@ -360,13 +360,13 @@ point only their capture here (docs/split-display.md).
   Maybe. It has worked with x11vnc 0.9.17. I don't know why you'd want to, though, when [w0vncserver](https://tigervnc.org/doc/w0vncserver.html) exists. The point of this project was to get the closed-source RealVNC and its proprietary extensions working on Wayland.
 
 - **Can I increase reduce latency / increase the FPS?** \
-  Yes, as long as your network and compositor are fast enough, at the cost of higher CPU usage. Try `xwlrvnc -fps 60 -nodamage vncserver-x11 -CaptureMethod=1 -PollInterval=10 -PollCursorTime=150 -CompareFB=TRUE`, which makes RealVNC do the screen diffing, sends frames at a higher rate, and increases the update interval for client-rendered cursors. Do not set `PollCursorTime` too short or it may drop cursor input randomly.
+  Yes, as long as your network and compositor are fast enough, at the cost of higher CPU usage. Try `xwlbridge -fps 60 -nodamage vncserver-x11 -CaptureMethod=1 -PollInterval=10 -PollCursorTime=150 -CompareFB=TRUE`, which makes RealVNC do the screen diffing, sends frames at a higher rate, and increases the update interval for client-rendered cursors. Do not set `PollCursorTime` too short or it may drop cursor input randomly.
 
 - **Can I completely disable the unsupported VNC Server features?** \
   Yes, as long as you have a RealVNC subscription which lets you control the required [parameters](https://help.realvnc.com/hc/en-us/articles/360002251297-RealVNC-Server-Parameter-Reference#permissions-0-80). Try adding `-ConnNotifyTimeout=0 -DisableTrayIcon=2 -EnableChat=FALSE -QueryConnect=FALSE -RecordQuery=FALSE` to the `vncserver-x11` arguments. This isn't really necessary though, those features will just do nothing if enabled since the GUI stuff is stubbed out.
 
 - **Can I show a single monitor only?** \
-  Yes, use the `-Monitor` RealVNC parameter. The XRandR output names match Wayland (you can check them with your compositor, or using `xwlrvnc xrandr --query`).
+  Yes, use the `-Monitor` RealVNC parameter. The XRandR output names match Wayland (you can check them with your compositor, or using `xwlbridge xrandr --query`).
 
 - **Can I run multiple instances of RealVNC?** \
   Yes, use the `-RfbPort` parameter to change the listen port, and also add `-newinstance` to the end of the `vncserver-x11` command.
@@ -390,6 +390,6 @@ point only their capture here (docs/split-display.md).
   - input that arrives while no session runs waits for it (sessions come up in a fraction of a second; a client's input is dropped whole once any of it has waited 5 s, never typed without its beginning).
 
 - **How does the clipboard work on GNOME with a stock engine?** \
-  With `-engine xvfb`/`xvnc` and the desktop's Xwayland reachable (xwlrvnc started from the session, with its `DISPLAY`), `-clipboard auto` relays selections X to X between the bridge display and GNOME's Xwayland, which mutter keeps in step with the Wayland clipboard: every type the owner offers (text, images, HTML, ...), CLIPBOARD and PRIMARY, large values in steps (INCR, up to 64 MiB), and no screen-sharing session or indicator needed. Every client of the bridge display can read and set the desktop's clipboard at any time, as any Xwayland client can; the bridge display lets in only the desktop user (by uid, or its cookie). `-clipboard session` uses mutter's remote-desktop clipboard instead (text only, CLIPBOARD only, only while a session runs), as the built-in engine does. The relay stays connected to the desktop's Xwayland, so where mutter closes Xwayland when no X client is left (`autoclose-xwayland`) it keeps it running (about 60 MB). Values in transit are capped at 128 MiB; an owner that doesn't answer a conversion is asked again every 0.4 s for up to 10 s (xclip, for one, ignores other requests while a clipboard manager reads a large value from it).
+  With `-engine xvfb`/`xvnc` and the desktop's Xwayland reachable (xwlbridge started from the session, with its `DISPLAY`), `-clipboard auto` relays selections X to X between the bridge display and GNOME's Xwayland, which mutter keeps in step with the Wayland clipboard: every type the owner offers (text, images, HTML, ...), CLIPBOARD and PRIMARY, large values in steps (INCR, up to 64 MiB), and no screen-sharing session or indicator needed. Every client of the bridge display can read and set the desktop's clipboard at any time, as any Xwayland client can; the bridge display lets in only the desktop user (by uid, or its cookie). `-clipboard session` uses mutter's remote-desktop clipboard instead (text only, CLIPBOARD only, only while a session runs), as the built-in engine does. The relay stays connected to the desktop's Xwayland, so where mutter closes Xwayland when no X client is left (`autoclose-xwayland`) it keeps it running (about 60 MB). Values in transit are capped at 128 MiB; an owner that doesn't answer a conversion is asked again every 0.4 s for up to 10 s (xclip, for one, ignores other requests while a clipboard manager reads a large value from it).
 
 - TODO: more

@@ -91,7 +91,7 @@ pub(crate) fn create_shm_buffer(
     }
     // SAFETY: the standard memfd_create + ftruncate + mmap dance
     let fd = unsafe {
-        let fd = libc::memfd_create(c"xwlrvnc-capture".as_ptr(), 0);
+        let fd = libc::memfd_create(c"xwlbridge-capture".as_ptr(), 0);
         if fd < 0 {
             return None;
         }

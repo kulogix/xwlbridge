@@ -1,26 +1,26 @@
 #!/bin/bash
-# xwlrvnc-ctl: run, check and configure RealVNC Server on the GNOME (Wayland)
-# desktop through the xwlrvnc X11 bridge.
+# xwlbridge-ctl: run, check and configure RealVNC Server on the GNOME (Wayland)
+# desktop through the xwlbridge X11 bridge.
 #
-#   xwlrvnc-ctl run                  start the bridge + RealVNC (what the service runs)
-#   xwlrvnc-ctl command              print the command `run` would start
-#   xwlrvnc-ctl doctor [--json]      check prerequisites and the running service
-#   xwlrvnc-ctl config [show|path|get KEY|set KEY VALUE|unset KEY|edit]
-#   xwlrvnc-ctl status|logs [-f]|start|stop|restart|enable|disable
-#   xwlrvnc-ctl show                 bring up RealVNC's status window on the desktop
-#   xwlrvnc-ctl realvnc-get NAME     RealVNC's own value of a parameter (its config files)
-#   xwlrvnc-ctl version
+#   xwlbridge-ctl run                  start the bridge + RealVNC (what the service runs)
+#   xwlbridge-ctl command              print the command `run` would start
+#   xwlbridge-ctl doctor [--json]      check prerequisites and the running service
+#   xwlbridge-ctl config [show|path|get KEY|set KEY VALUE|unset KEY|edit]
+#   xwlbridge-ctl status|logs [-f]|start|stop|restart|enable|disable
+#   xwlbridge-ctl show                 bring up RealVNC's status window on the desktop
+#   xwlbridge-ctl realvnc-get NAME     RealVNC's own value of a parameter (its config files)
+#   xwlbridge-ctl version
 #
-# Settings: ~/.config/xwlrvnc/xwlrvnc.conf (else /etc/xwlrvnc/xwlrvnc.conf, else
+# Settings: ~/.config/xwlbridge/xwlbridge.conf (else /etc/xwlbridge/xwlbridge.conf, else
 # built-in defaults). Exit status of `run`: 78 on a configuration error (not
 # retried), 75 while something it needs is not there yet (retried).
 #
 # SPDX-License-Identifier: MIT
 set -u
 
-PROG=xwlrvnc-ctl
+PROG=xwlbridge-ctl
 CTL_VERSION="@VERSION@"
-UNIT=xwlrvnc.service
+UNIT=xwlbridge-realvnc.service
 EX_CONFIG=78
 EX_TEMPFAIL=75
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
@@ -40,7 +40,7 @@ declare -A CFG=(
 CFG_FILE=""
 CFG_ERRORS=()
 
-user_config_path() { printf '%s\n' "${XWLRVNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/xwlrvnc/xwlrvnc.conf}"; }
+user_config_path() { printf '%s\n' "${XWLBRIDGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/xwlbridge/xwlbridge.conf}"; }
 
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
 
@@ -55,7 +55,7 @@ cfg_load() {
   local f n=0 line key val
   f=$(user_config_path)
   if [ -f "$f" ]; then CFG_FILE=$f
-  elif [ -z "${XWLRVNC_CONFIG:-}" ] && [ -f /etc/xwlrvnc/xwlrvnc.conf ]; then CFG_FILE=/etc/xwlrvnc/xwlrvnc.conf
+  elif [ -z "${XWLBRIDGE_CONFIG:-}" ] && [ -f /etc/xwlbridge/xwlbridge.conf ]; then CFG_FILE=/etc/xwlbridge/xwlbridge.conf
   else CFG_FILE=""; return 0
   fi
   [ -r "$CFG_FILE" ] || { CFG_ERRORS+=("$CFG_FILE: not readable"); return 0; }
@@ -188,7 +188,7 @@ find_xvfb() {
 find_bridge() {
   local b=${CFG[bridge]}
   if [ "$b" = auto ]; then
-    for b in "$SELF_DIR/xwlrvnc" "$(command -v xwlrvnc 2>/dev/null)"; do
+    for b in "$SELF_DIR/xwlbridge" "$(command -v xwlbridge 2>/dev/null)"; do
       [ -n "$b" ] && [ -x "$b" ] && { printf '%s\n' "$b"; return 0; }
     done
     return 1
@@ -200,7 +200,7 @@ no_new_privs() { grep -qE '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/n
 
 # The X display socket for a local display name like :0, :0.0 or unix:0; fails
 # for a display on another host (nothing to check here).
-X11_UNIX_DIR=${XWLRVNC_X11_UNIX_DIR:-/tmp/.X11-unix}   # override for tests only
+X11_UNIX_DIR=${XWLBRIDGE_X11_UNIX_DIR:-/tmp/.X11-unix}   # override for tests only
 display_socket() {
   local h=${1%%:*} d=${1#*:}
   [ "$1" != "$d" ] || return 1
@@ -221,7 +221,7 @@ build_command() {
   CMD=(); NOTES=(); ERR=""; ENGINE=""; ENGINE_BIN=""
   if [ ${#CFG_ERRORS[@]} -gt 0 ]; then ERR="configuration errors: ${CFG_ERRORS[*]}"; return $EX_CONFIG; fi
   local bridge server refusals engine=${CFG[engine]}
-  bridge=$(find_bridge) || { ERR="xwlrvnc not found (bridge=${CFG[bridge]}; looked next to $SELF and on PATH)"; return $EX_CONFIG; }
+  bridge=$(find_bridge) || { ERR="xwlbridge not found (bridge=${CFG[bridge]}; looked next to $SELF and on PATH)"; return $EX_CONFIG; }
   case $engine in
     auto)
       if ENGINE_BIN=$(find_xvnc 3>/dev/null); then engine=xvnc; else engine=builtin
@@ -329,7 +329,7 @@ describe_pids() {
   done
 }
 
-runtime_dir() { printf '%s/xwlrvnc\n' "${XDG_RUNTIME_DIR:-/tmp/xwlrvnc-$(id -u)}"; }
+runtime_dir() { printf '%s/xwlbridge\n' "${XDG_RUNTIME_DIR:-/tmp/xwlbridge-$(id -u)}"; }
 
 # A private PATH directory whose Xvnc/Xvfb are exactly the verified engine
 # binaries, so the bridge (which starts "Xvnc"/"Xvfb" from PATH) can never pick
@@ -430,7 +430,7 @@ cmd_config() {
 # The commented default settings file shipped with the package.
 config_template() {
   local t
-  for t in "$SELF_DIR/../share/xwlrvnc/xwlrvnc.conf" /usr/share/xwlrvnc/xwlrvnc.conf "$SELF_DIR/xwlrvnc.conf"; do
+  for t in "$SELF_DIR/../share/xwlbridge/xwlbridge.conf" /usr/share/xwlbridge/xwlbridge.conf "$SELF_DIR/xwlbridge.conf"; do
     [ -f "$t" ] && { printf '%s\n' "$t"; return 0; }
   done
   return 1
@@ -566,7 +566,7 @@ cmd_doctor() {
   cfg_load
   # judge the command with the environment the service gets (the user manager's), e.g. from ssh
   local sdisp; sdisp=$(session_env DISPLAY); local DISPLAY=$sdisp
-  [ $D_JSON -eq 1 ] || printf 'xwlrvnc doctor (%s, %s)\n' "$(ctl_version)" "$(date '+%F %T')"
+  [ $D_JSON -eq 1 ] || printf 'xwlbridge doctor (%s, %s)\n' "$(ctl_version)" "$(date '+%F %T')"
 
   # -------------------------------------------------------------- session
   section "GNOME session"
@@ -634,7 +634,7 @@ cmd_doctor() {
       report ok bridge.binary "$bridge (${bver:-version unknown}; ${feats[*]:-no optional features})"
     fi
   else
-    report fail bridge.binary "xwlrvnc binary not found (next to $SELF or on PATH)"
+    report fail bridge.binary "xwlbridge binary not found (next to $SELF or on PATH)"
   fi
   if [ ${#CFG_ERRORS[@]} -gt 0 ]; then
     report fail bridge.config "${CFG_FILE}: ${#CFG_ERRORS[@]} error(s)" "${CFG_ERRORS[@]}"
@@ -730,8 +730,8 @@ cmd_doctor() {
   others=$(other_usermode_servers)
   [ "$others" = "?" ] && [ "$(t5 systemctl --user is-active "$UNIT" 2>/dev/null)" = active ] && others=""
   for o in $others; do
-    # under a bridge started by hand (xwlrvnc-ctl run / xwlrvnc ... in a terminal), or something else
-    if [ "$o" != "?" ] && [ "$(cat "/proc/$(awk '{print $4}' "/proc/$o/stat" 2>/dev/null)/comm" 2>/dev/null)" = xwlrvnc ]; then byhand+="$o "; else foreign+="$o "; fi
+    # under a bridge started by hand (xwlbridge-ctl run / xwlbridge ... in a terminal), or something else
+    if [ "$o" != "?" ] && [ "$(cat "/proc/$(awk '{print $4}' "/proc/$o/stat" 2>/dev/null)/comm" 2>/dev/null)" = xwlbridge ]; then byhand+="$o "; else foreign+="$o "; fi
   done
   if [ -n "$foreign" ]; then
     report fail realvnc.other_server "another RealVNC Server in user mode runs for $(id -un), outside $UNIT; RealVNC allows one per user" \
@@ -895,7 +895,7 @@ cmd_doctor() {
 ctl_version() {
   local v=$CTL_VERSION
   [[ $v == @*@ ]] && v=dev
-  printf 'xwlrvnc-ctl %s' "$v"
+  printf 'xwlbridge-ctl %s' "$v"
 }
 
 cmd_show() {
@@ -907,13 +907,13 @@ cmd_show() {
   cfg_load
   case ${CFG[server]} in */*) srv=${CFG[server]};; *) srv=$(command -v -- "${CFG[server]}" 2>/dev/null);; esac
   [ -n "$srv" ] || die 1 "RealVNC Server not found"
-  [ "${CFG[uidisplay]}" = none ] && say "uidisplay=none: RealVNC's windows are hidden (xwlrvnc-ctl config set uidisplay auto)"
+  [ "${CFG[uidisplay]}" = none ] && say "uidisplay=none: RealVNC's windows are hidden (xwlbridge-ctl config set uidisplay auto)"
   if [ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" != active ]; then
-    systemctl --user start "$UNIT" || die 1 "cannot start $UNIT (xwlrvnc-ctl logs)"
+    systemctl --user start "$UNIT" || die 1 "cannot start $UNIT (xwlbridge-ctl logs)"
   fi
   sock=/tmp/.vnc-$(id -u)/vncserver-x11.CtrlComms
   for i in $(seq 50); do [ -S "$sock" ] && break; sleep 0.2; done
-  [ -S "$sock" ] || die 1 "RealVNC Server is not answering (no $sock): xwlrvnc-ctl logs"
+  [ -S "$sock" ] || die 1 "RealVNC Server is not answering (no $sock): xwlbridge-ctl logs"
   "$srv" -showstatus >/dev/null 2>&1; rc=$?
   # 5: "Existing server found; exiting." after handing the request over
   [ $rc -eq 0 ] || [ $rc -eq 5 ] || die "$rc" "$srv -showstatus failed ($rc)"

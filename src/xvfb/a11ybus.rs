@@ -117,7 +117,7 @@ mod tests {
         if Command::new("dbus-daemon").arg("--version").output().is_err() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("xwlrvnc-a11ybus-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xwlbridge-a11ybus-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         {
             let bus = start(&dir, 99).unwrap();

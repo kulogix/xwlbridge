@@ -164,7 +164,7 @@ mod tests {
         }
     }
     fn dir(tag: &str) -> Dir {
-        let d = std::env::temp_dir().join(format!("xwlrvnc-xserver-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("xwlbridge-xserver-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         Dir(d)

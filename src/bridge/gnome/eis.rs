@@ -286,7 +286,7 @@ impl Eis {
         let ctx = ei::Context::new(UnixStream::from(fd))?;
         Ok(Eis {
             handshaker: Some(EiHandshaker::new(
-                "xwlrvnc",
+                "xwlbridge",
                 ei::handshake::ContextType::Sender,
             )),
             conv: None,

@@ -522,7 +522,7 @@ mod tests {
 
     fn test_memfd() -> OwnedFd {
         use std::os::fd::FromRawFd;
-        let fd = unsafe { libc::memfd_create(c"xwlrvnc-test".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe { libc::memfd_create(c"xwlbridge-test".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0, "memfd_create");
         unsafe { OwnedFd::from_raw_fd(fd) }
     }

@@ -13,7 +13,7 @@ define_config! {
         displayfd: Option<u32> = value("fd"),
         /// compositor backend: "auto" picks gnome for mutter (its remote-desktop API on the bus, or a desktop named GNOME whose compositor lacks the wlroots capture protocols) and wlr otherwise; gnome needs the "gnome" build feature
         backend: BackendType = choice("auto"),
-        /// X server: the built-in one, or a stock Xvfb (fixed size), Xvnc (TigerVNC; resizes) or rootful Xwayland on a private headless compositor (resizes) mirroring the desktop (complete X11; "xvfb" build feature; if that server dies, the command is stopped and xwlrvnc exits 69)
+        /// X server: the built-in one, or a stock Xvfb (fixed size), Xvnc (TigerVNC; resizes) or rootful Xwayland on a private headless compositor (resizes) mirroring the desktop (complete X11; "xvfb" build feature; if that server dies, the command is stopped and xwlbridge exits 69)
         engine: EngineType = choice("builtin"),
         /// the X server program for -engine xvfb/xvnc/xwayland (default: Xvfb; for xvnc TigerVNC's Xtigervnc, or an Xvnc that is TigerVNC's: RealVNC's Xvnc and set-user-ID programs are refused; for xwayland, Xwayland)
         xserver: Option<String> = value("path"),
@@ -59,7 +59,7 @@ define_config! {
         xtestdrivers: Option<String> = value("names"),
         /// xvfb/xvnc engines: give the display a private accessibility (AT-SPI) bus, so its apps' trees stay off the desktop's screen reader and reach a proxy (tools/x11-a11y-proxy) instead; the wrapped command gets AT_SPI_BUS_ADDRESS, and the root window the AT_SPI_BUS property
         a11ybus: bool = flag,
-        /// xvfb/xvnc engines with Composite: a second XInput2 master device ("xwlrvnc-reverse") through which a desktop-side proxy (tools/x11-a11y-proxy) types and clicks into windows on this display without echoing to the desktop; the display's own pointer and keyboard then reach no X window (a grab and a focus instead of the input shield)
+        /// xvfb/xvnc engines with Composite: a second XInput2 master device ("xwlbridge-reverse") through which a desktop-side proxy (tools/x11-a11y-proxy) types and clicks into windows on this display without echoing to the desktop; the display's own pointer and keyboard then reach no X window (a grab and a focus instead of the input shield)
         reverseinput: bool = flag,
         /// recreate the remote desktop session even after it was stopped from GNOME's panel
         reclaim: bool = flag,
@@ -73,13 +73,13 @@ define_config! {
         coldconnect: Option<ColdConnect> = value("none|start"),
         /// GNOME backend, built-in engine: milliseconds a client's screen read may wait while the session starts, so a one-shot reader gets the current desktop (default 2000; 0: never)
         coldwait: Option<u32> = value("ms"),
-        /// GNOME backend, xvfb/xvnc engines: the desktop's Xwayland display that -clipboard xwayland relays selections through ("auto": the DISPLAY xwlrvnc was started with)
+        /// GNOME backend, xvfb/xvnc engines: the desktop's Xwayland display that -clipboard xwayland relays selections through ("auto": the DISPLAY xwlbridge was started with)
         xwayland: Option<String> = value("display|auto"),
         /// capture GNOME monitors with RecordMonitor (damage metadata) instead of RecordArea; only safe on mutter >= 51, where disabling a recorded monitor no longer crashes the session (mutter#2718)
         recordmonitor: bool = flag,
         /// don't bridge the PRIMARY selection (middle-click paste of selected text)
         noprimary: bool = flag,
-        /// where RealVNC's own UI process goes (vncserverui: tray icon, status, Options and Information Center dialogs, connection notices and prompts, chat, file transfer, and its clipboard): an X display such as the desktop's Xwayland, "auto" (the DISPLAY xwlrvnc was started with; the default for vncserver-x11 started with a local DISPLAY) or "none" (our display, out of sight); runs vncserver-x11-core directly, without RealVNC's root helper (always with the builtin engine, on whose display RealVNC's UI would otherwise crash); until the display answers the UI waits on ours
+        /// where RealVNC's own UI process goes (vncserverui: tray icon, status, Options and Information Center dialogs, connection notices and prompts, chat, file transfer, and its clipboard): an X display such as the desktop's Xwayland, "auto" (the DISPLAY xwlbridge was started with; the default for vncserver-x11 started with a local DISPLAY) or "none" (our display, out of sight); runs vncserver-x11-core directly, without RealVNC's root helper (always with the builtin engine, on whose display RealVNC's UI would otherwise crash); until the display answers the UI waits on ours
         uidisplay: Option<String> = value("display|auto|none"),
         /// run until stopped without launching a command
         nowrap: bool = flag,
@@ -225,7 +225,7 @@ impl std::str::FromStr for ColdConnect {
     }
 }
 
-/// Which X server clients talk to: xwlrvnc's own (lean, implements what VNC
+/// Which X server clients talk to: xwlbridge's own (lean, implements what VNC
 /// servers need) or a stock Xorg-based server that an agent keeps in sync with
 /// the desktop (every X extension, for any X client): Xvfb, which is everywhere
 /// but has a fixed screen size, TigerVNC's Xvnc (its RFB listener confined

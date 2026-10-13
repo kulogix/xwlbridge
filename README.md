@@ -1,4 +1,4 @@
-# xwlrvnc
+# xwlbridge
 
 Fake X server backed by a Wayland display, implementing just enough for RealVNC to work on it.
 
@@ -13,15 +13,15 @@ You may also be interested in my [remote desktop app](https://pgaskin.net/vento/
 ### Usage
 
 ```bash
-cargo install xwlrvnc
-xwlrvnc vncserver-x11
+cargo install xwlbridge
+xwlbridge vncserver-x11
 
 # usage info
-xwlrvnc -help
+xwlbridge -help
 
 # on compositors with broken virtual keyboard/pointer (e.g., smithay, niri)
 cargo install wl-uinput-proxy
-wl-uinput-proxy xwlrvnc vncserver-x11
+wl-uinput-proxy xwlbridge vncserver-x11
 ```
 
 To configure RealVNC, just run it directly under Xwayland, use the cli options, or use a config file.
@@ -50,9 +50,9 @@ switch and relies on `WAYLAND_DISPLAY` being absent). To start a tool by hand on
 same environment:
 
 ```bash
-xwlrvnc run -- xdotool getmouselocation
-xwlrvnc run -display 20 -- scrot shot.png   # when several bridges run
-eval "$(xwlrvnc run -print)"                # a shell for bridge tools only
+xwlbridge run -- xdotool getmouselocation
+xwlbridge run -display 20 -- scrot shot.png   # when several bridges run
+eval "$(xwlbridge run -print)"                # a shell for bridge tools only
 ```
 
 Programs whose own windows you want to see (OBS, SimpleScreenRecorder, viewers) stay on the desktop and point
@@ -109,7 +109,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
 Some things are out-of scope:
 
 - I do not plan to implement any UI features.
-  - Status/connection/cloud windows (to configure RealVNC, just temporarily start vncserver-x11 under Xwayland or use the config files/flags; started from the desktop session, xwlrvnc puts RealVNC's own UI, tray icon included, on the desktop's Xwayland (`-uidisplay`, on by default for `vncserver-x11`): see [docs/realvnc-gnome.md](./docs/realvnc-gnome.md)).
+  - Status/connection/cloud windows (to configure RealVNC, just temporarily start vncserver-x11 under Xwayland or use the config files/flags; started from the desktop session, xwlbridge puts RealVNC's own UI, tray icon included, on the desktop's Xwayland (`-uidisplay`, on by default for `vncserver-x11`): see [docs/realvnc-gnome.md](./docs/realvnc-gnome.md)).
   - Protocol extensions:
     - Chat.
     - Tray icon.
@@ -161,7 +161,7 @@ The following wayland protocols are used. At least one in each category is requi
 - Transient seat (optional, only with `-seat transient`, clipboard is always on the first seat)
   - [`ext_transient_seat_v1`](https://wayland.app/protocols/ext-transient-seat-v1)
 
-If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xwlrvnc with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
+If your compositor is has a broken/missing virtual keyboard/pointer implementation (e.g., Smithay-based ones like niri), you'll need to wrap xwlbridge with [wl-uinput-proxy](https://github.com/pgaskin/wl-uinput-proxy) to work around it using uinput.
 
 I'll probably add support for other capture/input protocols later, and maybe also xdg-desktop-portal.
 
