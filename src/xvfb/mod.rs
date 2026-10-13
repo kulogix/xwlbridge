@@ -219,7 +219,7 @@ fn connect(display: u32, auth: &Auth) -> Result<(RustConnection, usize), AnyErro
     Ok((conn, 0))
 }
 /// What the agent selects on the root window: windows mapped or restacked
-/// (to stay on top) and the focus (U3 judges a key by it, and sees the
+/// (to stay on top) and the focus (input attribution judges a key by it, and sees the
 /// keyboard grabbed through it). A client has one event mask per window, so
 /// anything that selects on the root again must keep these.
 fn root_events() -> EventMask {
@@ -1692,7 +1692,7 @@ impl Agent {
                 .atom;
             // an event mask replaces this client's whole selection on the
             // root: keep the agent's own (`root_events`: its focus events are
-            // what U3 judges keys by) around the redirect, and put it back
+            // what input attribution judges keys by) around the redirect, and put it back
             conn.change_window_attributes(
                 root,
                 &ChangeWindowAttributesAux::new()
@@ -1741,7 +1741,7 @@ impl Agent {
             0,
             WindowClass::INPUT_ONLY,
             0,
-            // its focus events tell U3's judging that the focus is ours
+            // its focus events tell input attribution that the focus is ours
             &CreateWindowAux::new()
                 .override_redirect(1)
                 .event_mask(EventMask::FOCUS_CHANGE),
@@ -3111,7 +3111,7 @@ mod tests {
     #[test]
     fn the_root_selection_keeps_the_focus_events() {
         // -engine xwayland's stop_xwayland_commits selects on the root again;
-        // without FocusChange U3 sends every key to the desktop (echo)
+        // without FocusChange input attribution sends every key to the desktop (echo)
         use x11rb::protocol::xproto::EventMask;
         let m = u32::from(super::root_events());
         assert_ne!(m & u32::from(EventMask::FOCUS_CHANGE), 0);

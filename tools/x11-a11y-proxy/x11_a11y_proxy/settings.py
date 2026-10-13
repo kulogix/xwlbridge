@@ -1,4 +1,4 @@
-"""GNOME's appearance and accessibility settings mirrored into the engine display (gap U13).
+"""GNOME's appearance and accessibility settings mirrored into the engine display.
 
 On GNOME's own Xwayland, gnome-settings-daemon's xsettings plugin owns `_XSETTINGS_S0` and writes `Xft.dpi` and
 friends into the root's RESOURCE_MANAGER; the engine display has neither, so X apps there ignore high contrast,

@@ -86,7 +86,8 @@ Python ≥ 3.9, PyGObject with GTK ≥ 4.14 (AccessibleText; 4.22 for caret/sele
 (at-spi2-core), python-xlib, dbus-daemon. Nothing is compiled; nothing mutter-specific is used (the proxy is an
 ordinary GTK 4 Wayland client), so it runs on GNOME, on labwc (Raspberry Pi OS) and other wlroots compositors,
 and on x86-64 and aarch64 alike. Packages: Debian/Ubuntu/Raspberry Pi OS `python3-gi gir1.2-gtk-4.0
-gir1.2-atspi-2.0 python3-xlib dbus`; RHEL 10/AlmaLinux 10 `python3-gobject gtk4 at-spi2-core python3-xlib`
+gir1.2-atspi-2.0 python3-xlib dbus`; RHEL 10/AlmaLinux 10 `python3-gobject gtk4 at-spi2-core` plus
+`pip install --user python-xlib` (no repository packages python-xlib there).
 Optional: the uidet sidecar (container or local Python with
 onnxruntime + rapidocr) for pixel fallback.
 

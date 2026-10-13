@@ -57,9 +57,9 @@ define_config! {
         xtesthelpers: Option<String> = value("names"),
         /// programs whose XTest always reaches the desktop, even while a window on this display has the X focus or a grab, comma-separated ("default": the VNC servers and KVM clients; "none"; "all": everyone's; xvfb/xvnc engines)
         xtestdrivers: Option<String> = value("names"),
-        /// xvfb/xvnc engines: give the display a private accessibility (AT-SPI) bus, so its apps' trees stay off the desktop's screen reader and reach a proxy (tools/x11-a11y-proxy) instead; the wrapped command gets AT_SPI_BUS_ADDRESS, and the root window the AT_SPI_BUS property
+        /// stock engines (xvfb, xvnc, xwayland): give the display a private accessibility (AT-SPI) bus, so its apps' trees stay off the desktop's screen reader and reach a proxy (tools/x11-a11y-proxy) instead; the wrapped command gets AT_SPI_BUS_ADDRESS, and the root window the AT_SPI_BUS property
         a11ybus: bool = flag,
-        /// xvfb/xvnc engines with Composite: a second XInput2 master device ("xwlbridge-reverse") through which a desktop-side proxy (tools/x11-a11y-proxy) types and clicks into windows on this display without echoing to the desktop; the display's own pointer and keyboard then reach no X window (a grab and a focus instead of the input shield)
+        /// stock engines (xvfb, xvnc, xwayland) with Composite: a second XInput2 master device ("xwlbridge-reverse") through which a desktop-side proxy (tools/x11-a11y-proxy) types and clicks into windows on this display without echoing to the desktop; the display's own pointer and keyboard then reach no X window (a grab and a focus instead of the input shield)
         reverseinput: bool = flag,
         /// recreate the remote desktop session even after it was stopped from GNOME's panel
         reclaim: bool = flag,

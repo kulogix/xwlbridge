@@ -1,5 +1,5 @@
 #!/bin/bash
-# Settings carry-over (gap U13): which of GNOME's high contrast, text scaling, cursor size and reduced motion reach
+# Settings carry-over: which of GNOME's high contrast, text scaling, cursor size and reduced motion reach
 # each toolkit (a) on GNOME's Xwayland with gsd-xsettings (reference, G), (b) on the engine before the mirror (E0),
 # (c) on the engine with x11-a11y-proxy's settings mirror (XSETTINGS + RESOURCE_MANAGER; E). Phase 0 = defaults,
 # phase 1 = high-contrast, text-scaling-factor 1.5, cursor-size 48, reduced-motion 'reduce' (GNOME 50's switch).

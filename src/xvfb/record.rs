@@ -342,7 +342,7 @@ impl Classifier {
 /// connection is shut down (the agent stopping), or once nobody receives on
 /// `tx` any more. Each injected event's request goes into `attrib`'s ledger.
 // (one more argument than clippy likes since held_keys' shared `holds` met
-// U3's `attrib`: each is a different party's state)
+// `attrib`'s input attribution: each is a different party's state)
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     conn: RustConnection,
