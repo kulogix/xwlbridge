@@ -119,6 +119,16 @@ for d in "$rt"/xwlbridge-[0-9]*-??????; do
   case $pid in ''|*[!0-9]*) continue;; esac
   kill -0 "$pid" 2>/dev/null || rm -rf -- "$d"
 done
+# the display registry `xwlbridge run` reads: dead bridges' entries, and the directory once empty
+if [ -d "$rt/xwlbridge-displays" ] && [ ! -L "$rt/xwlbridge-displays" ]; then
+  for e in "$rt"/xwlbridge-displays/*; do
+    [ -f "$e" ] || continue
+    read -r pid _ <"$e" 2>/dev/null || pid=""
+    case $pid in ''|*[!0-9]*) continue;; esac
+    kill -0 "$pid" 2>/dev/null || rm -f -- "$e"
+  done
+  rmdir -- "$rt/xwlbridge-displays" 2>/dev/null || true
+fi
 
 if systemctl --user show-environment >/dev/null 2>&1; then systemctl --user daemon-reload; fi
 say "xwlbridge is uninstalled. RealVNC Server itself and its settings (~/.vnc) are unchanged$([ $PURGE = 1 ] && echo ' apart from the purged files')."

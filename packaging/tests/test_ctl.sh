@@ -304,11 +304,13 @@ check "uninstall --purge: a link in ~/.vnc plus a crafted name keeps the file ou
 H9=$T/home9; RT9=$T/rt9; mkdir -p "$H9" "$RT9" "$T/procs"; cp "$(command -v bash)" "$T/procs/xwlbridge"
 HOME=$H9 XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_RUNTIME_DIR=$RT9 FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start >/dev/null 2>&1
 : >"$RT9/xwlbridge-uihook-0123456789abcdef.so"
+mkdir -p "$RT9/xwlbridge-displays"; echo "999999999 1" >"$RT9/xwlbridge-displays/20"   # a dead bridge's entry
 "$T/procs/xwlbridge" -c 'sleep 30; :' & HANDMADE=$!
 sleep 30 & LIVE=$!; ( exit 0 ) & DEADP=$!; wait $DEADP
 mkdir -p "$RT9/xwlbridge-$DEADP-abcdef" "$RT9/xwlbridge-$LIVE-ghijkl"; : >"$RT9/xwlbridge-$DEADP-abcdef/Xauthority"
 out=$(HOME=$H9 XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_RUNTIME_DIR=$RT9 FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H9/.local/share/xwlbridge/uninstall.sh" 2>&1)
 check "uninstall keeps the hook while a hand-started bridge runs" bash -c '[ -f "$1/xwlbridge-uihook-0123456789abcdef.so" ] && grep -q "kept the -uidisplay hook" <<<"$2"' _ "$RT9" "$out"
+check "  ...removes the empty display registry and dead bridges' entries" bash -c '[ ! -e "$1/xwlbridge-displays" ]' _ "$RT9"
 check "  ...and removes a dead bridge's engine directory, not a live one's" bash -c '[ ! -e "$1/xwlbridge-$2-abcdef" ] && [ -d "$1/xwlbridge-$3-ghijkl" ]' _ "$RT9" "$DEADP" "$LIVE"
 kill $HANDMADE $LIVE 2>/dev/null; wait $HANDMADE $LIVE 2>/dev/null
 out=$(HOME=$T/home4 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash -c 'mkdir -p "$HOME"; bash "$1" --bin "$2" --port realvnc --no-start' _ "$T/pkg/bin/install.sh" "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
