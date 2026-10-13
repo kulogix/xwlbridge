@@ -247,6 +247,16 @@ esac
 exit 0
 EOS
 chmod 755 "$T/fakebin/systemctl"
+# rpm as Debian/Ubuntu's rpm package behaves without a system database: it creates ~/.rpmdb. The HOME-as-before checks
+# below fail if any script calls rpm on such a system (CI runners have rpm installed).
+cat >"$T/fakebin/rpm" <<'EOS'
+#!/bin/bash
+for f in /usr/lib/sysimage/rpm/rpmdb.sqlite /usr/lib/sysimage/rpm/Packages.db /var/lib/rpm/rpmdb.sqlite /var/lib/rpm/Packages /var/lib/rpm/Packages.db; do
+  [ -e "$f" ] && exit 1
+done
+mkdir -p "$HOME/.rpmdb" && : >"$HOME/.rpmdb/rpmdb.sqlite"; exit 1
+EOS
+chmod 755 "$T/fakebin/rpm"
 # RealVNC Server "installed" for install.sh's service choice (realvnc when vncserver-x11 is on PATH)
 printf '#!/bin/sh\nexit 0\n' >"$T/fakebin/vncserver-x11"; chmod 755 "$T/fakebin/vncserver-x11"
 cp "$HERE/../install.sh" "$HERE/../uninstall.sh" "$HERE/../xwlbridge-realvnc.service.in" "$HERE/../xwlbridge.service.in" "$HERE/../xwlbridge-status.desktop.in" "$HERE/../xwlbridge.conf" "$T/pkg/bin/"

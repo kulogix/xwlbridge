@@ -159,6 +159,17 @@ xvfb_refusal() {
   [ "${p##*/}" = Xvfb ] || echo "not named Xvfb"
 }
 
+# rpm only where a system rpm database exists (Fedora/RHEL/openSUSE): on Debian/Ubuntu with the rpm tool installed, rpm
+# without a system database creates a private one in ~/.rpmdb.
+have_rpmdb() {
+  command -v rpm >/dev/null 2>&1 || return 1
+  local f
+  for f in /usr/lib/sysimage/rpm/rpmdb.sqlite /usr/lib/sysimage/rpm/Packages.db /var/lib/rpm/rpmdb.sqlite /var/lib/rpm/Packages /var/lib/rpm/Packages.db; do
+    [ -e "$f" ] && return 0
+  done
+  return 1
+}
+
 owner_package() {
   local p=$1 out
   if command -v dpkg-query >/dev/null 2>&1; then
@@ -166,7 +177,7 @@ owner_package() {
     # usrmerge: dpkg may know the file under /bin rather than /usr/bin
     case $p in /usr/bin/*) out=$(dpkg-query -S -- "/bin/${p#/usr/bin/}" 2>/dev/null | head -1) && [ -n "$out" ] && { printf '%s' "${out%%:*}"; return; };; esac
   fi
-  if command -v rpm >/dev/null 2>&1; then
+  if have_rpmdb; then
     out=$(rpm -qf --qf '%{NAME}\n' -- "$p" 2>/dev/null | head -1) && [[ $out != *"not owned"* ]] && printf '%s' "$out"
   fi
 }
@@ -543,7 +554,7 @@ mutter_version() {
   if [ -z "$v" ] && command -v dpkg-query >/dev/null 2>&1; then
     v=$(dpkg-query -W -f '${Version}' mutter-common 2>/dev/null | sed -E 's/^[0-9]+://; s/[-+~].*//')
   fi
-  if [ -z "$v" ] && command -v rpm >/dev/null 2>&1; then v=$(rpm -q --qf '%{VERSION}' mutter 2>/dev/null | grep -E '^[0-9]'); fi
+  if [ -z "$v" ] && have_rpmdb; then v=$(rpm -q --qf '%{VERSION}' mutter 2>/dev/null | grep -E '^[0-9]'); fi
   printf '%s' "$v"
 }
 
