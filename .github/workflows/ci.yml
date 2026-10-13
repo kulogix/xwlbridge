@@ -6,46 +6,37 @@ on:
       - '**'
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-          - armv7-unknown-linux-gnueabihf
+  rust:
+    name: fmt, clippy, test, build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - run: mkdir -p .cargo && printf '%s\n' >> .cargo/config.toml
-          'target.x86_64-unknown-linux-gnu.linker = "x86_64-linux-gnu-gcc"'
-          'target.aarch64-unknown-linux-gnu.linker = "aarch64-linux-gnu-gcc"'
-          'target.armv7-unknown-linux-gnueabihf.linker = "arm-linux-gnueabihf-gcc"'
-          'target.aarch64-unknown-linux-gnu.runner = ["qemu-aarch64-static", "-L", "/usr/aarch64-linux-gnu"]' 
-          'target.armv7-unknown-linux-gnueabihf.runner = ["qemu-arm-static", "-L", "/usr/arm-linux-gnueabihf"]'
-      - run: sudo apt-get install -y
-          ${{case(startsWith(matrix.target, 'x86_64-'),'','qemu-user-static')}}
-          ${{case(startsWith(matrix.target, 'x86_64-'),'gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu','')}}
-          ${{case(startsWith(matrix.target, 'aarch64-'),'gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu','')}}
-          ${{case(startsWith(matrix.target, 'armv7-'),'gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf','')}}
+      # the GNOME backend (feature "gnome") links libpipewire through bindgen
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          pkg-config clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev
+      # the toolchain pinned in rust-toolchain.toml, with clippy and rustfmt
       - run: rustup toolchain install
-      - run: cargo check --verbose --target=${{matrix.target}}
-      - run: cargo build --verbose --target=${{matrix.target}}
-      - run: cargo test --verbose --target=${{matrix.target}}
-      - run: cargo clippy --verbose --target=${{matrix.target}}
-      - run: file target/${{matrix.target}}/debug/xwlrvnc
-      - run:
-          ${{case(
-            startsWith(matrix.target, 'x86_64-'),'x86_64-linux-gnu-',
-            startsWith(matrix.target, 'aarch64-'),'aarch64-linux-gnu-',
-            startsWith(matrix.target, 'armv7-'),'arm-linux-gnueabihf-',
-          '')}}nm -D target/${{matrix.target}}/debug/xwlrvnc
-      - uses: actions/upload-artifact@v7
-        with:
-          name: xwlrvnc-${{matrix.target}}
-          path: target/${{matrix.target}}/debug/xwlrvnc
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features gnome,xvfb -- -D warnings
+      - run: cargo test
+      - run: cargo test --features gnome,xvfb
+      - run: cargo build --release --features gnome,xvfb
+      - run: target/release/xwlbridge -version
+
+  scripts:
+    name: packaging and x11-a11y-proxy unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          python3-gi gir1.2-gtk-4.0 gir1.2-atspi-2.0 python3-xlib
+      - run: bash packaging/tests/test_ctl.sh
+      - run: python3 -m unittest discover -s tools/x11-a11y-proxy/tests -p test_unit.py -v
