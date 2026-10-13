@@ -1064,7 +1064,9 @@ cmd_migrate() {
       die 1 "$UNIT_REALVNC is not installed: run xwlbridge's install.sh (or install the package) first, then $PROG migrate"
     fi
   fi
-  if [ "$old_enabled" = enabled ] || [ "$old_active" = active ] || [ "$old_load" != loaded ]; then
+  if [ "$(systemctl --user is-enabled "$UNIT_REALVNC" 2>/dev/null)" = enabled ]; then
+    say "$UNIT_REALVNC is enabled"
+  elif [ "$old_enabled" = enabled ] || [ "$old_active" = active ] || [ "$old_load" != loaded ]; then
     run systemctl --user enable "$UNIT_REALVNC" >/dev/null 2>&1 && say "enabled $UNIT_REALVNC"
   else
     say "$old_unit was not enabled: $UNIT_REALVNC left disabled ($PROG enable)"
