@@ -340,24 +340,24 @@ Programs the bridge starts are pinned to X11 (`GDK_BACKEND=x11`, `QT_QPA_PLATFOR
 built-in server that changes where GTK 4 and Qt 6 children go: they used to open the desktop's Wayland and now open
 this server, which lacks XInput2 and (without XKB) XKEYBOARD, so they abort (`Gdk-ERROR: XInput2 support not found on
 display`, `qt.qpa.xcb: XKeyboard extension not present`). Run GUI programs on a stock engine, or on the desktop and
-point only their capture here (docs/split-display.md).
+point only their capture here (docs/no-split.md).
 
 ### FAQ
 
 - **How is this different than Xwayland?** \
-  It's not based on the xserver source code (it's entirely from scratch), and its only purpose is to bridge the outputs/screen/clipboard/keyboard/keymap/pointer/cursor to Wayland, and only what's needed by RealVNC. It does not support any window-management or drawing features.
+  The built-in engine (from upstream xwlrvnc) is not based on the xserver source code (it's entirely from scratch), and its only purpose is to bridge the outputs/screen/clipboard/keyboard/keymap/pointer/cursor to Wayland. It does not support any window-management or drawing features. The stock engines (`-engine xvnc`, `xvfb`, `xwayland`) are complete X servers kept in step with the desktop by an agent. Unlike GNOME's own Xwayland, either way the root window is the whole desktop and injected input reaches every window.
 
 - **How do I configure RealVNC?** \
-  Either use the config file, CLI parameters, or start vncserver under Xwayland temporarily to access the GUI.
+  In `~/.vnc/config.d/vncserver-x11`, or with its Options dialog, which `-uidisplay` puts on your desktop. Command-line parameters are forgotten when RealVNC reloads its settings ([realvnc-server-6.md](realvnc-server-6.md)).
 
 - **How do I stop my selection from constantly getting copied?** \
   RealVNC merges the two clipboards. You can inhibit the primary (i.e., selection) clipboard by adding the `-noprimary` option.
 
 - **Why doesn't *\<RealVNC feature\>* work?** \
-  Check the comprehensive list of supported features in the [README](../README.md#features). Also, ensure your RealVNC license supports the feature you're trying to use.
+  See what was tested in [realvnc-server-6.md](realvnc-server-6.md). Also, ensure your RealVNC license supports the feature you're trying to use.
 
 - **Can I use this with other VNC servers?** \
-  Maybe. It has worked with x11vnc 0.9.17. I don't know why you'd want to, though, when [w0vncserver](https://tigervnc.org/doc/w0vncserver.html) exists. The point of this project was to get the closed-source RealVNC and its proprietary extensions working on Wayland.
+  Yes: x11vnc 0.9.17 and TigerVNC's x0vncserver were tested on the bridge (see the README). For a VNC server that speaks Wayland itself, there is also [w0vncserver](https://tigervnc.org/doc/w0vncserver.html).
 
 - **Can I increase reduce latency / increase the FPS?** \
   Yes, as long as your network and compositor are fast enough, at the cost of higher CPU usage. Try `xwlbridge -fps 60 -nodamage vncserver-x11 -CaptureMethod=1 -PollInterval=10 -PollCursorTime=150 -CompareFB=TRUE`, which makes RealVNC do the screen diffing, sends frames at a higher rate, and increases the update interval for client-rendered cursors. Do not set `PollCursorTime` too short or it may drop cursor input randomly.

@@ -26,11 +26,22 @@ From the source tree:
     cargo build --profile dist --features gnome,xvfb
     packaging/install.sh
 
-`install.sh` puts `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`, the service in
-`~/.config/systemd/user/xwlbridge-realvnc.service`, the settings in
+`install.sh` puts `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`, two user
+units in `~/.config/systemd/user/` (`xwlbridge-realvnc.service`: RealVNC Server
+on the bridge; `xwlbridge.service`: the bridge's X display alone, see
+[below](#the-bridge-display-alone-xwlbridgeservice)), the settings in
 `~/.config/xwlbridge/xwlbridge.conf`, an app-grid entry in
-`~/.local/share/applications/`, enables the service for your GNOME sessions,
-starts it, and runs `xwlbridge-ctl doctor`. Running a newer `install.sh` upgrades
+`~/.local/share/applications/`, enables one of the units for your GNOME
+sessions (`xwlbridge-realvnc.service` when RealVNC Server's `vncserver-x11` is
+installed, else `xwlbridge.service`; `--service realvnc|display` chooses; an
+upgrade keeps the one you had), starts it, and runs `xwlbridge-ctl doctor`
+(`~/.local/bin/xwlbridge-ctl` until `~/.local/bin` is on your PATH, on Ubuntu
+after your next login). It also takes over an xwlrvnc install, once
+([below](#coming-from-xwlrvnc)).
+
+Other options: `--bin PATH`, `--prefix DIR`, `--port N|realvnc`, `--engine
+auto|builtin|xvnc|xvfb|xwayland` (for a new settings file), `--no-enable`,
+`--no-start`. Running a newer `install.sh` upgrades
 in place (settings are kept; the service restarts, so connected viewers
 reconnect).
 
@@ -118,7 +129,7 @@ the effective values). Change with `xwlbridge-ctl config set KEY VALUE`, then
 
 | key | default | meaning |
 |---|---|---|
-| `engine` | `auto` | X server for RealVNC: `builtin` (no extra packages), `xvnc` (TigerVNC's Xvnc: every X extension, follows monitor changes), `xvfb`; `auto` = xvnc if TigerVNC is installed, else builtin |
+| `engine` | `auto` | X server: `builtin` (no extra packages), `xvnc` (TigerVNC's Xvnc: every X extension, follows monitor changes), `xvfb`, `xwayland` (a rootful Xwayland on a private compositor: every X extension; the complete engine on RHEL 10); `auto` = xvnc if TigerVNC is installed, else builtin |
 | `capture` | `area` | `area` (RecordArea, safe everywhere) or `monitor` (RecordMonitor; mutter >= 51 only, older mutter crashes when a recorded monitor is disabled: mutter#2718) |
 | `uidisplay` | `auto` | where RealVNC's windows appear: `auto` = the GNOME desktop (Xwayland), `none` = hidden (engine `xvnc`/`xvfb` only), or an X display |
 | `rfb_port` | `5900` | TCP port (`-RfbPort`); `realvnc` or empty = RealVNC's own `RfbPort` setting |
@@ -128,10 +139,20 @@ the effective values). Change with `xwlbridge-ctl config set KEY VALUE`, then
 | `log` | `normal` | bridge logging: `quiet`, `normal`, `verbose` |
 | `bridge_args` | | more `xwlbridge` options (`xwlbridge -help`) |
 | `xvnc`, `xvfb` | `auto` | engine binaries; auto = found on PATH (`Xtigervnc` first) |
+| `backend` | `gnome` | `gnome`, `wlr` or `auto` |
+| `bridge` | `auto` | the `xwlbridge` binary; auto = next to `xwlbridge-ctl`, else on PATH |
+| `display` | `auto` | `xwlbridge.service` only: the display number (e.g. `20`); auto = the bridge picks one |
 
 RealVNC's own settings (authentication, encryption, permissions, ...) stay in
 RealVNC's files and its Options dialog (status window > menu > Options), e.g. a
-VNC password: `vncpasswd -user` and `server_args=-Authentication=VncAuth`.
+VNC password: `vncpasswd -user` and `Authentication=VncAuth` in
+`~/.vnc/config.d/vncserver-x11`.
+
+**`rfb_port` and `server_args` go on RealVNC's command line, and RealVNC forgets
+its command line when it reloads its settings** (Options > Apply,
+`vncserver-x11 -reload`): measured, `rfb_port=5901` went back to the file's 5900
+after a reload. Prefer `rfb_port=realvnc`, an empty `server_args`, and RealVNC's
+parameters in its file (next section). This is not changed in this release.
 
 ### Leaving port, IP filter and authentication to RealVNC
 
@@ -188,6 +209,38 @@ directory (`$XDG_RUNTIME_DIR/xwlbridge/bin`) whose `Xvnc` is exactly that binary
 Installing TigerVNC next to RealVNC is safe: dpkg keeps RealVNC's real
 `/usr/bin/Xvnc` file and TigerVNC's server stays at `/usr/bin/Xtigervnc`.
 
+## The bridge display alone (`xwlbridge.service`)
+
+For X11 tools (screen recorders, automation, x11vnc, a remote-access server)
+that need a stable X display mirroring the desktop, without RealVNC:
+
+    xwlbridge-ctl config set display 20          # optional: a fixed number
+    xwlbridge-ctl --display enable               # start with every GNOME login
+    xwlbridge-ctl --display restart              # start (or restart) it now
+    xwlbridge-ctl --display show                 # DISPLAY=:20   (xwlbridge.service)
+    xwlbridge run -- xdotool getmouselocation    # an X11 tool on it
+
+`--display` before a command acts on `xwlbridge.service` (`run`, `command`,
+`doctor` without the RealVNC checks, `status`, `logs`, `start`, `stop`,
+`restart`, `enable`, `disable`, `show`). It runs `xwlbridge -nowrap` with the
+same `engine`, `capture`, `backend`, `log` and `bridge_args` settings. Both units
+can run at the same time (each starts its own bridge).
+
+## Coming from xwlrvnc
+
+`xwlbridge-ctl migrate` takes over a per-user install of xwlrvnc (this
+project's name before 0.1.0): it stops and disables `xwlrvnc.service`, copies
+`~/.config/xwlrvnc/xwlrvnc.conf` to `~/.config/xwlbridge/xwlbridge.conf` (a
+`bridge=` path to the old binary becomes `auto`; an existing new file is kept),
+installs and enables `xwlbridge-realvnc.service`, and starts it when the old
+service was running inside a graphical session. `--dry-run` shows what it
+would do, `--no-start` does not start anything. It can be run again.
+`install.sh` runs it once when it finds an xwlrvnc install. xwlrvnc's own
+files stay until `~/.local/share/xwlrvnc/uninstall.sh --keep-config`. Tested
+with a real systemd user manager (systemd 259) in a container: the old service
+running and enabled before, stopped and disabled after, the settings carried,
+the new service enabled; again idempotent; then both uninstallers.
+
 ## Manage
 
 From GNOME: RealVNC's tray icon in the top bar (needs the AppIndicator
@@ -200,7 +253,7 @@ share a Wayland desktop.)
     xwlbridge-ctl show            # RealVNC's status window on the desktop (starts the service if needed)
     xwlbridge-ctl command         # the exact command the service runs
 
-Logs go to the journal (`journalctl --user -u xwlbridge`), RealVNC's included.
+Logs go to the journal (`xwlbridge-ctl logs`, or `journalctl --user -u xwlbridge-realvnc`), RealVNC's included.
 
 ## The service
 

@@ -16,7 +16,7 @@
 //!
 //! Programs whose UI is meant for the desktop (OBS, SimpleScreenRecorder, a VNC
 //! viewer) must not get this environment: they run on the desktop and are only
-//! pointed at our display for capture (docs/split-display.md).
+//! pointed at our display for capture (docs/no-split.md).
 
 use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -341,7 +341,7 @@ CLUTTER_BACKEND=x11 XDG_SESSION_TYPE=x11 ...), and Java's Robot on X11
 
 Not for programs whose own windows belong on the desktop (OBS, SimpleScreen-
 Recorder, VNC viewers): run those normally and point their capture at the
-bridge's display (docs/split-display.md).
+bridge's display (docs/no-split.md).
 
 -display N    the bridge's display (default: $XWLBRIDGE_DISPLAY, or else the only
               running bridge)
