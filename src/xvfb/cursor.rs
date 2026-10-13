@@ -74,7 +74,16 @@ impl CursorSync {
         conn.create_pixmap(1, pix, root, 1, 1)?;
         let gc = conn.generate_id()?;
         conn.create_gc(gc, pix, &CreateGCAux::new().foreground(0))?;
-        conn.poly_fill_rectangle(pix, gc, &[Rectangle { x: 0, y: 0, width: 1, height: 1 }])?;
+        conn.poly_fill_rectangle(
+            pix,
+            gc,
+            &[Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        )?;
         let invisible = conn.generate_id()?;
         conn.create_cursor(invisible, pix, pix, 0, 0, 0, 0, 0, 0, 0, 0)?;
         conn.free_gc(gc)?;
@@ -118,7 +127,10 @@ impl CursorSync {
         let gc = conn.generate_id()?;
         conn.create_gc(gc, pix, &CreateGCAux::new())?;
         conn.free_pixmap(pix)?;
-        Ok(Some(Argb { format: format.id, gc }))
+        Ok(Some(Argb {
+            format: format.id,
+            gc,
+        }))
     }
 
     /// Makes the desktop's current sprite the X server's cursor, if it changed
@@ -150,15 +162,19 @@ impl CursorSync {
         let started = std::time::Instant::now();
         let cursor = match &shape {
             Shape::Hidden => None,
-            Shape::Sprite { width, height, xhot, yhot, image } => {
-                match self.make(conn, *width, *height, *xhot, *yhot, image) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        crate::warning!("xvfb: can't make a {width}x{height} cursor: {e}");
-                        return Ok(());
-                    }
+            Shape::Sprite {
+                width,
+                height,
+                xhot,
+                yhot,
+                image,
+            } => match self.make(conn, *width, *height, *xhot, *yhot, image) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    crate::warning!("xvfb: can't make a {width}x{height} cursor: {e}");
+                    return Ok(());
                 }
-            }
+            },
         };
         let aux = ChangeWindowAttributesAux::new().cursor(cursor.unwrap_or(self.invisible));
         for &w in &self.windows {
@@ -172,7 +188,13 @@ impl CursorSync {
         let us = started.elapsed().as_micros();
         match &shape {
             Shape::Hidden => crate::vlog!("xvfb: cursor hidden ({us} µs)"),
-            Shape::Sprite { width, height, xhot, yhot, .. } => {
+            Shape::Sprite {
+                width,
+                height,
+                xhot,
+                yhot,
+                ..
+            } => {
                 crate::vlog!("xvfb: cursor {width}x{height}, hotspot {xhot},{yhot} ({us} µs)")
             }
         }
@@ -198,8 +220,12 @@ impl CursorSync {
         conn.create_pixmap(32, pix, self.root, width, height)?;
         // in rows, each request within the X server's limit
         let row = usize::from(width) * 4;
-        let rows = ((conn.maximum_request_bytes().saturating_sub(64)) / row).clamp(1, usize::from(height));
-        let data = argb_bytes(&image[..usize::from(width) * usize::from(height)], self.big_endian);
+        let rows =
+            ((conn.maximum_request_bytes().saturating_sub(64)) / row).clamp(1, usize::from(height));
+        let data = argb_bytes(
+            &image[..usize::from(width) * usize::from(height)],
+            self.big_endian,
+        );
         for (i, chunk) in data.chunks(rows * row).enumerate() {
             conn.put_image(
                 ImageFormat::Z_PIXMAP,
@@ -234,14 +260,23 @@ fn is_hidden(image: &[u32]) -> bool {
 
 /// The hotspot within the image, as RENDER requires.
 fn clamp_hotspot(width: u16, height: u16, xhot: u16, yhot: u16) -> (u16, u16) {
-    (xhot.min(width.saturating_sub(1)), yhot.min(height.saturating_sub(1)))
+    (
+        xhot.min(width.saturating_sub(1)),
+        yhot.min(height.saturating_sub(1)),
+    )
 }
 
 /// 32-bit Z-pixmap data in the X server's byte order.
 fn argb_bytes(image: &[u32], big_endian: bool) -> Vec<u8> {
     image
         .iter()
-        .flat_map(|&p| if big_endian { p.to_be_bytes() } else { p.to_le_bytes() })
+        .flat_map(|&p| {
+            if big_endian {
+                p.to_be_bytes()
+            } else {
+                p.to_le_bytes()
+            }
+        })
         .collect()
 }
 
@@ -266,7 +301,13 @@ mod tests {
 
     #[test]
     fn pixels_in_server_byte_order() {
-        assert_eq!(argb_bytes(&[0x8040_2010], false), vec![0x10, 0x20, 0x40, 0x80]);
-        assert_eq!(argb_bytes(&[0x8040_2010], true), vec![0x80, 0x40, 0x20, 0x10]);
+        assert_eq!(
+            argb_bytes(&[0x8040_2010], false),
+            vec![0x10, 0x20, 0x40, 0x80]
+        );
+        assert_eq!(
+            argb_bytes(&[0x8040_2010], true),
+            vec![0x80, 0x40, 0x20, 0x10]
+        );
     }
 }

@@ -891,12 +891,9 @@ impl Connection {
             // --- bell and screen saver (the desktop's to do) ---
             Request::Bell(_) => crate::bridge::bell::ring(),
             Request::SetScreenSaver(r) => {
-                if let Err(value) = super::saver::set(
-                    r.timeout,
-                    r.interval,
-                    r.prefer_blanking,
-                    r.allow_exposures,
-                ) {
+                if let Err(value) =
+                    super::saver::set(r.timeout, r.interval, r.prefer_blanking, r.allow_exposures)
+                {
                     return self.send_error_value(xproto::VALUE_ERROR, value, major, 0);
                 }
             }
@@ -1674,9 +1671,17 @@ impl Connection {
     fn await_fresh(&mut self) {
         use crate::bridge::fresh::Wait;
         self.active = true;
-        match self.server.framebuffer.await_fresh(self.server.config.coldwait()) {
+        match self
+            .server
+            .framebuffer
+            .await_fresh(self.server.config.coldwait())
+        {
             Wait::NotNeeded => {}
-            Wait::Fresh(d) => crate::vlog!("[c{}] screen read held {} ms until capture was live", self.id, d.as_millis()),
+            Wait::Fresh(d) => crate::vlog!(
+                "[c{}] screen read held {} ms until capture was live",
+                self.id,
+                d.as_millis()
+            ),
             Wait::TimedOut => crate::warning!(
                 "[c{}] capture didn't start within {} ms; answering a screen read with the last frame",
                 self.id,
@@ -1723,7 +1728,11 @@ impl Connection {
             drop(keymap);
             if let Some(events) = events {
                 for (down, kc) in events {
-                    let type_ = if down { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT };
+                    let type_ = if down {
+                        xproto::KEY_PRESS_EVENT
+                    } else {
+                        xproto::KEY_RELEASE_EVENT
+                    };
                     input.fake_input(self.id, type_, kc, 0, 0);
                 }
                 return;

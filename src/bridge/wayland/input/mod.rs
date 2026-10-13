@@ -55,18 +55,16 @@ impl State {
         };
         let pointer = pb.create_pointer(seat, qh);
         let keyboard = kb.create_keyboard(seat, qh);
-        self.server
-            .input
-            .set_devices(
-                Box::new({
-                    let conn = conn.clone();
-                    move || {
-                        let _ = conn.flush();
-                    }
-                }),
-                pointer,
-                keyboard,
-            );
+        self.server.input.set_devices(
+            Box::new({
+                let conn = conn.clone();
+                move || {
+                    let _ = conn.flush();
+                }
+            }),
+            pointer,
+            keyboard,
+        );
         if let Some((format, fd, size)) = &self.vkbd_keymap {
             self.server.input.set_keymap(*format, fd.as_fd(), *size);
         }

@@ -18,7 +18,7 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _, SelectionEventMask};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
-    SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass, SELECTION_NOTIFY_EVENT,
+    SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -30,7 +30,13 @@ use crate::bridge::clipboard::{MAX_SELECTION_BYTES, OWNER_WINDOW, Sel, Value};
 use crate::bridge::clipjobs::{Job, PendingConversion};
 
 /// What we ask the compositor for, best first, among what its owner offers.
-const MIME_PREFERENCE: &[&str] = &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
+const MIME_PREFERENCE: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+    "TEXT",
+];
 
 struct Atoms {
     targets: Atom,
@@ -167,7 +173,10 @@ impl Clip {
             s.seen = generation;
             match server.clipboard.owner_window(s.sel) {
                 Some(OWNER_WINDOW) => {
-                    crate::cliplog!("xvfb: {:?}: a wayland app owns it; taking the X selection", s.sel);
+                    crate::cliplog!(
+                        "xvfb: {:?}: a wayland app owns it; taking the X selection",
+                        s.sel
+                    );
                     conn.set_selection_owner(self.win, s.atom, CURRENT_TIME)?;
                 }
                 None if s.ours_since.is_some() => {
@@ -186,12 +195,19 @@ impl Clip {
     }
 
     /// Handles `ev` if it is clipboard business; returns whether it was.
-    pub fn handle(&mut self, conn: &RustConnection, server: &Arc<Server>, ev: &x11rb::protocol::Event) -> Result<bool, AnyError> {
+    pub fn handle(
+        &mut self,
+        conn: &RustConnection,
+        server: &Arc<Server>,
+        ev: &x11rb::protocol::Event,
+    ) -> Result<bool, AnyError> {
         use x11rb::protocol::Event as E;
         match ev {
             E::XfixesSelectionNotify(e) => {
                 let win = self.win;
-                let Some(s) = self.side(e.selection) else { return Ok(true) };
+                let Some(s) = self.side(e.selection) else {
+                    return Ok(true);
+                };
                 if e.owner == win {
                     s.ours_since = Some(e.selection_timestamp);
                     return Ok(true);
@@ -218,7 +234,9 @@ impl Clip {
                 conn.convert_selection(win, s.atom, utf8, s.prop, e.selection_timestamp)?;
             }
             E::SelectionNotify(e) if e.requestor == self.win => {
-                let Some(s) = self.side(e.selection) else { return Ok(true) };
+                let Some(s) = self.side(e.selection) else {
+                    return Ok(true);
+                };
                 let Some(f) = &s.fetch else { return Ok(true) };
                 let (sel, window, time, prop) = (s.sel, f.window, f.time, s.prop);
                 if e.property == NONE {
@@ -230,7 +248,14 @@ impl Clip {
                     return Ok(true);
                 }
                 let r = conn
-                    .get_property(true, self.win, prop, AtomEnum::ANY, 0, (MAX_SELECTION_BYTES / 4) as u32)?
+                    .get_property(
+                        true,
+                        self.win,
+                        prop,
+                        AtomEnum::ANY,
+                        0,
+                        (MAX_SELECTION_BYTES / 4) as u32,
+                    )?
                     .reply()?;
                 let incr = self.atoms.incr;
                 let s = self.side(e.selection).expect("looked up above");
@@ -249,9 +274,18 @@ impl Clip {
                 let Some(s) = self.sides.iter_mut().find(|s| s.prop == e.atom) else {
                     return Ok(false);
                 };
-                let Some(Fetch { incr: Some(_), .. }) = &s.fetch else { return Ok(true) };
+                let Some(Fetch { incr: Some(_), .. }) = &s.fetch else {
+                    return Ok(true);
+                };
                 let r = conn
-                    .get_property(true, self.win, s.prop, AtomEnum::ANY, 0, (MAX_SELECTION_BYTES / 4) as u32)?
+                    .get_property(
+                        true,
+                        self.win,
+                        s.prop,
+                        AtomEnum::ANY,
+                        0,
+                        (MAX_SELECTION_BYTES / 4) as u32,
+                    )?
                     .reply()?;
                 let f = s.fetch.as_mut().expect("checked above");
                 let buf = f.incr.as_mut().expect("checked above");
@@ -264,7 +298,9 @@ impl Clip {
                 if r.value.is_empty() {
                     self.fetched(server, sel, f.window, f.time, f.incr.unwrap_or_default());
                 } else if let Some(fx) = server.clipboard.x_fetch_failed(sel, f.window, f.time) {
-                    crate::warning!("xvfb: {sel:?} is over {MAX_SELECTION_BYTES} bytes; not bridged");
+                    crate::warning!(
+                        "xvfb: {sel:?} is over {MAX_SELECTION_BYTES} bytes; not bridged"
+                    );
                     fx.apply(server, sel);
                 }
             }
@@ -287,24 +323,59 @@ impl Clip {
     }
 
     /// An X client converts a selection we own.
-    fn request(&mut self, conn: &RustConnection, server: &Arc<Server>, e: &SelectionRequestEvent) -> Result<(), AnyError> {
+    fn request(
+        &mut self,
+        conn: &RustConnection,
+        server: &Arc<Server>,
+        e: &SelectionRequestEvent,
+    ) -> Result<(), AnyError> {
         let a = &self.atoms;
         let Some(s) = self.sides.iter().find(|s| s.atom == e.selection) else {
             return refuse(conn, e);
         };
         let (sel, since) = (s.sel, s.ours_since.unwrap_or(e.time));
         // obsolete clients name no property: the target doubles as one
-        let prop = if e.property == NONE { e.target } else { e.property };
+        let prop = if e.property == NONE {
+            e.target
+        } else {
+            e.property
+        };
         if e.target == a.targets {
-            let targets = [a.targets, a.timestamp, a.utf8, AtomEnum::STRING.into(), a.text, a.plain_utf8, a.plain];
-            conn.change_property32(PropMode::REPLACE, e.requestor, prop, AtomEnum::ATOM, &targets)?;
+            let targets = [
+                a.targets,
+                a.timestamp,
+                a.utf8,
+                AtomEnum::STRING.into(),
+                a.text,
+                a.plain_utf8,
+                a.plain,
+            ];
+            conn.change_property32(
+                PropMode::REPLACE,
+                e.requestor,
+                prop,
+                AtomEnum::ATOM,
+                &targets,
+            )?;
             return notify(conn, e, prop);
         }
         if e.target == a.timestamp {
-            conn.change_property32(PropMode::REPLACE, e.requestor, prop, AtomEnum::INTEGER, &[since])?;
+            conn.change_property32(
+                PropMode::REPLACE,
+                e.requestor,
+                prop,
+                AtomEnum::INTEGER,
+                &[since],
+            )?;
             return notify(conn, e, prop);
         }
-        let text = [a.utf8, a.text, a.plain_utf8, a.plain, AtomEnum::STRING.into()];
+        let text = [
+            a.utf8,
+            a.text,
+            a.plain_utf8,
+            a.plain,
+            AtomEnum::STRING.into(),
+        ];
         if !text.contains(&e.target) {
             return refuse(conn, e);
         }
@@ -313,7 +384,10 @@ impl Clip {
             Value::Here(data) => self.answer(conn, e, Some(data)),
             Value::FromWayland => {
                 let (mimes, generation) = server.clipboard.convertible(sel);
-                let Some(mime) = MIME_PREFERENCE.iter().find(|m| mimes.iter().any(|x| x == *m)) else {
+                let Some(mime) = MIME_PREFERENCE
+                    .iter()
+                    .find(|m| mimes.iter().any(|x| x == *m))
+                else {
                     return refuse(conn, e);
                 };
                 let id = self.next_id;
@@ -340,12 +414,26 @@ impl Clip {
     }
 
     /// Stores `data` for the requestor and tells it, or refuses with `None`.
-    fn answer(&self, conn: &RustConnection, e: &SelectionRequestEvent, data: Option<Vec<u8>>) -> Result<(), AnyError> {
-        let Some(mut data) = data else { return refuse(conn, e) };
-        let prop = if e.property == NONE { e.target } else { e.property };
+    fn answer(
+        &self,
+        conn: &RustConnection,
+        e: &SelectionRequestEvent,
+        data: Option<Vec<u8>>,
+    ) -> Result<(), AnyError> {
+        let Some(mut data) = data else {
+            return refuse(conn, e);
+        };
+        let prop = if e.property == NONE {
+            e.target
+        } else {
+            e.property
+        };
         // leave room for the request header
         if data.len() + 64 > conn.maximum_request_bytes() {
-            crate::warning!("xvfb: a {}-byte selection is too big to hand over in one piece; refused", data.len());
+            crate::warning!(
+                "xvfb: a {}-byte selection is too big to hand over in one piece; refused",
+                data.len()
+            );
             return refuse(conn, e);
         }
         let type_: Atom = if e.target == Atom::from(AtomEnum::STRING) {
@@ -363,7 +451,11 @@ impl Clip {
     }
 }
 
-fn notify(conn: &RustConnection, e: &SelectionRequestEvent, property: Atom) -> Result<(), AnyError> {
+fn notify(
+    conn: &RustConnection,
+    e: &SelectionRequestEvent,
+    property: Atom,
+) -> Result<(), AnyError> {
     let ev = SelectionNotifyEvent {
         response_type: SELECTION_NOTIFY_EVENT,
         sequence: 0,

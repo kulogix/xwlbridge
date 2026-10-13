@@ -24,19 +24,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::Event;
 use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
-    Property, SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass, SELECTION_NOTIFY_EVENT,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux, EventMask,
+    PropMode, Property, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent,
+    Window, WindowClass,
 };
-use x11rb::protocol::Event;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
 use super::AnyError;
-use crate::bridge::clipboard::MAX_SELECTION_BYTES;
 use crate::bridge::Server;
+use crate::bridge::clipboard::MAX_SELECTION_BYTES;
 use crate::uidisplay::UiDisplay;
 
 const ENGINE: usize = 0;
@@ -107,7 +108,9 @@ impl Side {
             0,
             &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )?;
-        let intern = |n: &str| -> Result<Atom, AnyError> { Ok(conn.intern_atom(false, n.as_bytes())?.reply()?.atom) };
+        let intern = |n: &str| -> Result<Atom, AnyError> {
+            Ok(conn.intern_atom(false, n.as_bytes())?.reply()?.atom)
+        };
         let mut sel_atoms = Vec::new();
         for s in sels {
             sel_atoms.push(intern(s)?);
@@ -116,8 +119,12 @@ impl Side {
         for i in 0..RING {
             ring.push(intern(&format!("_XWLBRIDGE_RELAY_{i}"))?);
         }
-        let (targets, timestamp, multiple, incr) =
-            (intern("TARGETS")?, intern("TIMESTAMP")?, intern("MULTIPLE")?, intern("INCR")?);
+        let (targets, timestamp, multiple, incr) = (
+            intern("TARGETS")?,
+            intern("TIMESTAMP")?,
+            intern("MULTIPLE")?,
+            intern("INCR")?,
+        );
         for &a in &sel_atoms {
             conn.xfixes_select_selection_input(
                 win,
@@ -336,7 +343,10 @@ fn connect(d: &UiDisplay) -> Result<(RustConnection, usize), AnyError> {
         match DefaultStream::connect(&addr) {
             Ok((stream, _)) => {
                 let (n, c) = cookie.clone().unwrap_or_default();
-                return Ok((RustConnection::connect_to_stream_with_auth_info(stream, screen, n, c)?, screen));
+                return Ok((
+                    RustConnection::connect_to_stream_with_auth_info(stream, screen, n, c)?,
+                    screen,
+                ));
             }
             Err(e) => last = Some(e),
         }
@@ -394,12 +404,20 @@ impl Relay {
                         // a reply error names the display it came from; any
                         // other failure is a lost connection: tell them apart
                         // by which connection still answers
-                        let bad = if self.sides[DESK].conn.get_input_focus().is_ok_and(|c| c.reply().is_ok()) {
+                        let bad = if self.sides[DESK]
+                            .conn
+                            .get_input_focus()
+                            .is_ok_and(|c| c.reply().is_ok())
+                        {
                             ENGINE
                         } else {
                             DESK
                         };
-                        if self.sides[bad].conn.get_input_focus().is_ok_and(|c| c.reply().is_ok()) {
+                        if self.sides[bad]
+                            .conn
+                            .get_input_focus()
+                            .is_ok_and(|c| c.reply().is_ok())
+                        {
                             crate::cliplog!("relay: {e} (continuing)");
                             continue;
                         }
@@ -414,15 +432,28 @@ impl Relay {
                 }
             }
             let mut pfds = [
-                libc::pollfd { fd: self.sides[ENGINE].conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: self.sides[DESK].conn.stream().as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd: self.sides[ENGINE].conn.stream().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.sides[DESK].conn.stream().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             // while a conversion waits for its owner, wake often enough to ask
             // it again (see RETRY_AFTER)
-            let timeout = if self.forwards.iter().any(|f| f.incr.is_none()) { 50 } else { 1000 };
+            let timeout = if self.forwards.iter().any(|f| f.incr.is_none()) {
+                50
+            } else {
+                1000
+            };
             unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) };
             for (side, p) in pfds.iter().enumerate() {
-                if p.revents & (libc::POLLHUP | libc::POLLERR) != 0 && p.revents & libc::POLLIN == 0 {
+                if p.revents & (libc::POLLHUP | libc::POLLERR) != 0 && p.revents & libc::POLLIN == 0
+                {
                     return fail(side, "connection closed".into());
                 }
             }
@@ -448,13 +479,19 @@ impl Relay {
     fn handle(&mut self, side: usize, ev: Event) -> Result<(), AnyError> {
         match ev {
             Event::XfixesSelectionNotify(e) => {
-                let Some(i) = self.sides[side].sel_index(e.selection) else { return Ok(()) };
+                let Some(i) = self.sides[side].sel_index(e.selection) else {
+                    return Ok(());
+                };
                 if e.owner == self.sides[side].win {
                     // our own proxy ownership coming back
                     self.sels[i].since[side] = Some(e.selection_timestamp);
                 } else if e.owner == NONE {
                     if self.sels[i].source == Some(side) {
-                        crate::cliplog!("relay: {} {}: owner gone", SIDE_NAMES[side], self.sel_names[i]);
+                        crate::cliplog!(
+                            "relay: {} {}: owner gone",
+                            SIDE_NAMES[side],
+                            self.sel_names[i]
+                        );
                         self.sels[i].source = None;
                         self.disown(other(side), i)?;
                     }
@@ -468,8 +505,12 @@ impl Relay {
                     self.took(side, i)?;
                 }
             }
-            Event::SelectionRequest(e) if e.owner == self.sides[side].win => self.request(side, e)?,
-            Event::SelectionNotify(e) if e.requestor == self.sides[side].win => self.answered(side, e)?,
+            Event::SelectionRequest(e) if e.owner == self.sides[side].win => {
+                self.request(side, e)?
+            }
+            Event::SelectionNotify(e) if e.requestor == self.sides[side].win => {
+                self.answered(side, e)?
+            }
             Event::PropertyNotify(e) => {
                 if e.window == self.sides[side].win && e.state == Property::NEW_VALUE {
                     self.incr_chunk(side, e.atom)?;
@@ -477,7 +518,9 @@ impl Relay {
                     self.incr_next(side, e.window, e.atom)?;
                 }
             }
-            Event::Error(e) => crate::cliplog!("relay: {} X error {:?}", SIDE_NAMES[side], e.error_kind),
+            Event::Error(e) => {
+                crate::cliplog!("relay: {} X error {:?}", SIDE_NAMES[side], e.error_kind)
+            }
             _ => {}
         }
         Ok(())
@@ -487,7 +530,8 @@ impl Relay {
     fn took(&mut self, side: usize, i: usize) -> Result<(), AnyError> {
         self.sels[i].source = Some(side);
         let o = &self.sides[other(side)];
-        o.conn.set_selection_owner(o.win, o.sel_atoms[i], CURRENT_TIME)?;
+        o.conn
+            .set_selection_owner(o.win, o.sel_atoms[i], CURRENT_TIME)?;
         Ok(())
     }
 
@@ -496,14 +540,17 @@ impl Relay {
         let s = &self.sides[side];
         let owner = s.conn.get_selection_owner(s.sel_atoms[i])?.reply()?.owner;
         if owner == s.win {
-            s.conn.set_selection_owner(NONE, s.sel_atoms[i], CURRENT_TIME)?;
+            s.conn
+                .set_selection_owner(NONE, s.sel_atoms[i], CURRENT_TIME)?;
         }
         Ok(())
     }
 
     /// A requestor on `side` converts a selection we proxy there.
     fn request(&mut self, side: usize, e: SelectionRequestEvent) -> Result<(), AnyError> {
-        let Some(i) = self.sides[side].sel_index(e.selection) else { return refuse(&self.sides[side].conn, &e) };
+        let Some(i) = self.sides[side].sel_index(e.selection) else {
+            return refuse(&self.sides[side].conn, &e);
+        };
         let src = other(side);
         if self.sels[i].source != Some(src) {
             return refuse(&self.sides[side].conn, &e);
@@ -521,7 +568,13 @@ impl Relay {
         }
         if e.target == s.timestamp {
             let since = self.sels[i].since[side].unwrap_or(e.time);
-            s.conn.change_property32(PropMode::REPLACE, e.requestor, e.property, AtomEnum::INTEGER, &[since])?;
+            s.conn.change_property32(
+                PropMode::REPLACE,
+                e.requestor,
+                e.property,
+                AtomEnum::INTEGER,
+                &[since],
+            )?;
             return notify(&s.conn, &e, e.property);
         }
         let in_use: Vec<Atom> = self
@@ -538,15 +591,32 @@ impl Relay {
         let target = translate(&mut self.sides, side, e.target)?;
         let s = &self.sides[src];
         s.conn.delete_property(s.win, prop)?;
-        s.conn.convert_selection(s.win, s.sel_atoms[i], target, prop, CURRENT_TIME)?;
+        s.conn
+            .convert_selection(s.win, s.sel_atoms[i], target, prop, CURRENT_TIME)?;
         crate::cliplog!(
             "relay: {} asks {} for {:?}",
             SIDE_NAMES[side],
             SIDE_NAMES[src],
-            String::from_utf8_lossy(&self.sides[src].names.get(&target).cloned().unwrap_or_default())
+            String::from_utf8_lossy(
+                &self.sides[src]
+                    .names
+                    .get(&target)
+                    .cloned()
+                    .unwrap_or_default()
+            )
         );
         let now = Instant::now();
-        self.forwards.push(Forward { sel: i, src, prop, target, req: e, since: now, asked: now, retries: 0, incr: None });
+        self.forwards.push(Forward {
+            sel: i,
+            src,
+            prop,
+            target,
+            req: e,
+            since: now,
+            asked: now,
+            retries: 0,
+            incr: None,
+        });
         Ok(())
     }
 
@@ -554,9 +624,9 @@ impl Relay {
     fn answered(&mut self, side: usize, n: SelectionNotifyEvent) -> Result<(), AnyError> {
         let i = self.sides[side].sel_index(n.selection);
         let pos = if n.property != NONE {
-            self.forwards
-                .iter()
-                .position(|f| f.src == side && f.prop == n.property && f.target == n.target && f.incr.is_none())
+            self.forwards.iter().position(|f| {
+                f.src == side && f.prop == n.property && f.target == n.target && f.incr.is_none()
+            })
         } else {
             // a refusal names no property: the oldest matching conversion
             let target_name = self.sides[side].name(n.target)?;
@@ -564,7 +634,10 @@ impl Relay {
             for (k, f) in self.forwards.iter().enumerate() {
                 if f.src == side && Some(f.sel) == i && f.incr.is_none() {
                     let dst = other(side);
-                    if self.sides[dst].names.get(&f.req.target).is_some_and(|t| *t == target_name)
+                    if self.sides[dst]
+                        .names
+                        .get(&f.req.target)
+                        .is_some_and(|t| *t == target_name)
                         || f.req.target <= LAST_PREDEFINED && f.req.target == n.target
                     {
                         found = Some(k);
@@ -577,16 +650,32 @@ impl Relay {
         let Some(pos) = pos else {
             // a late answer to an ask that was repeated: throw it away (an
             // INCR answer step by step, see incr_chunk)
-            if n.property != NONE && self.cooling.iter().any(|c| c.0 == side && c.1 == n.property) {
+            if n.property != NONE
+                && self
+                    .cooling
+                    .iter()
+                    .any(|c| c.0 == side && c.1 == n.property)
+            {
                 let s = &self.sides[side];
                 let r = s
                     .conn
-                    .get_property(true, s.win, n.property, AtomEnum::ANY, 0, (MAX_SELECTION_BYTES / 4) as u32)?
+                    .get_property(
+                        true,
+                        s.win,
+                        n.property,
+                        AtomEnum::ANY,
+                        0,
+                        (MAX_SELECTION_BYTES / 4) as u32,
+                    )?
                     .reply()?;
                 crate::cliplog!(
                     "relay: {} answered an earlier ask late{}; dropped",
                     SIDE_NAMES[side],
-                    if r.type_ == s.incr { " (INCR, drained)" } else { "" }
+                    if r.type_ == s.incr {
+                        " (INCR, drained)"
+                    } else {
+                        ""
+                    }
                 );
             }
             return Ok(());
@@ -603,7 +692,14 @@ impl Relay {
         let s = &self.sides[side];
         let r = s
             .conn
-            .get_property(true, s.win, n.property, AtomEnum::ANY, 0, (MAX_SELECTION_BYTES / 4) as u32)?
+            .get_property(
+                true,
+                s.win,
+                n.property,
+                AtomEnum::ANY,
+                0,
+                (MAX_SELECTION_BYTES / 4) as u32,
+            )?
             .reply()?;
         if r.type_ == s.incr {
             // the value comes in steps, each a new value of the (now deleted) property
@@ -612,7 +708,9 @@ impl Relay {
         }
         if r.bytes_after > 0 {
             let f = self.forwards.remove(pos);
-            crate::warning!("xvfb: clipboard relay: a value over {MAX_SELECTION_BYTES} bytes; refused");
+            crate::warning!(
+                "xvfb: clipboard relay: a value over {MAX_SELECTION_BYTES} bytes; refused"
+            );
             return refuse(&self.sides[other(side)].conn, &f.req);
         }
         let f = self.forwards.remove(pos);
@@ -621,26 +719,51 @@ impl Relay {
 
     /// One INCR step of an answer arrived on our window on `side`.
     fn incr_chunk(&mut self, side: usize, prop: Atom) -> Result<(), AnyError> {
-        let Some(pos) = self.forwards.iter().position(|f| f.src == side && f.prop == prop && f.incr.is_some()) else {
+        let Some(pos) = self
+            .forwards
+            .iter()
+            .position(|f| f.src == side && f.prop == prop && f.incr.is_some())
+        else {
             if self.cooling.iter().any(|c| c.0 == side && c.1 == prop) {
                 // a step of a late INCR answer we don't want: delete it, so
                 // the owner goes on to the end
                 let s = &self.sides[side];
                 // (a delete happens only once everything is read)
-                s.conn.get_property(true, s.win, prop, AtomEnum::ANY, 0, (MAX_SELECTION_BYTES / 4) as u32)?.reply()?;
+                s.conn
+                    .get_property(
+                        true,
+                        s.win,
+                        prop,
+                        AtomEnum::ANY,
+                        0,
+                        (MAX_SELECTION_BYTES / 4) as u32,
+                    )?
+                    .reply()?;
             }
             return Ok(());
         };
         let held = self.held_bytes();
         let s = &self.sides[side];
-        let r = s.conn.get_property(true, s.win, prop, AtomEnum::ANY, 0, (MAX_SELECTION_BYTES / 4) as u32)?.reply()?;
+        let r = s
+            .conn
+            .get_property(
+                true,
+                s.win,
+                prop,
+                AtomEnum::ANY,
+                0,
+                (MAX_SELECTION_BYTES / 4) as u32,
+            )?
+            .reply()?;
         let f = &mut self.forwards[pos];
         f.since = Instant::now();
         let (type_, format, buf) = f.incr.as_mut().expect("checked above");
         if !r.value.is_empty() {
             if buf.len() + r.value.len() > MAX_SELECTION_BYTES {
                 let f = self.forwards.remove(pos);
-                crate::warning!("xvfb: clipboard relay: a value over {MAX_SELECTION_BYTES} bytes; refused");
+                crate::warning!(
+                    "xvfb: clipboard relay: a value over {MAX_SELECTION_BYTES} bytes; refused"
+                );
                 // its remaining steps are thrown away
                 self.cooling.push((side, prop, Instant::now()));
                 return refuse(&self.sides[other(side)].conn, &f.req);
@@ -664,13 +787,20 @@ impl Relay {
 
     /// Hands a value from the owner on `f.src` to the requestor on the other
     /// display, translated to that display's atoms.
-    fn deliver(&mut self, f: Forward, type_: Atom, format: u8, mut data: Vec<u8>) -> Result<(), AnyError> {
+    fn deliver(
+        &mut self,
+        f: Forward,
+        type_: Atom,
+        format: u8,
+        mut data: Vec<u8>,
+    ) -> Result<(), AnyError> {
         let (src, dst) = (f.src, other(f.src));
         if type_ == NONE {
             return refuse(&self.sides[dst].conn, &f.req);
         }
         let atom_valued = format == 32
-            && (type_ == Atom::from(AtomEnum::ATOM) || self.sides[src].name(type_)? == b"ATOM_PAIR");
+            && (type_ == Atom::from(AtomEnum::ATOM)
+                || self.sides[src].name(type_)? == b"ATOM_PAIR");
         if atom_valued {
             let mut out = Vec::with_capacity(data.len());
             let drop_multiple = f.req.target == self.sides[dst].targets;
@@ -700,8 +830,9 @@ impl Relay {
         if data.len() + 1024 > d.max_req {
             // a new conversion into a property we are still filling: the
             // requestor gave up on the old one
-            self.outgoing
-                .retain(|o| !(o.side == dst && o.requestor == f.req.requestor && o.property == f.req.property));
+            self.outgoing.retain(|o| {
+                !(o.side == dst && o.requestor == f.req.requestor && o.property == f.req.property)
+            });
             if self.held_bytes() + data.len() > INFLIGHT_CAP {
                 self.over_cap();
                 return refuse(&self.sides[dst].conn, &f.req);
@@ -713,8 +844,13 @@ impl Relay {
                 f.req.requestor,
                 &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
             )?;
-            d.conn
-                .change_property32(PropMode::REPLACE, f.req.requestor, f.req.property, d.incr, &[data.len() as u32])?;
+            d.conn.change_property32(
+                PropMode::REPLACE,
+                f.req.requestor,
+                f.req.property,
+                d.incr,
+                &[data.len() as u32],
+            )?;
             notify(&d.conn, &f.req, f.req.property)?;
             self.outgoing.push(Outgoing {
                 side: dst,
@@ -756,8 +892,15 @@ impl Relay {
         let conn = &self.sides[side].conn;
         if o.finished {
             let o = self.outgoing.remove(pos);
-            if !self.outgoing.iter().any(|x| x.side == side && x.requestor == o.requestor) {
-                let _ = conn.change_window_attributes(o.requestor, &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT));
+            if !self
+                .outgoing
+                .iter()
+                .any(|x| x.side == side && x.requestor == o.requestor)
+            {
+                let _ = conn.change_window_attributes(
+                    o.requestor,
+                    &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+                );
             }
             return Ok(());
         }
@@ -782,7 +925,11 @@ impl Relay {
     /// count at most every 10 s.
     fn over_cap(&mut self) {
         self.capped.0 += 1;
-        if self.capped.1.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+        if self
+            .capped
+            .1
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+        {
             crate::warning!(
                 "xvfb: clipboard relay: {} MiB of values already in transit; refused {} conversion(s)",
                 INFLIGHT_CAP >> 20,
@@ -795,7 +942,12 @@ impl Relay {
     /// Bytes of values in transit: INCR answers being collected and values
     /// going out in INCR steps.
     fn held_bytes(&self) -> usize {
-        let incoming: usize = self.forwards.iter().filter_map(|f| f.incr.as_ref()).map(|(_, _, b)| b.len()).sum();
+        let incoming: usize = self
+            .forwards
+            .iter()
+            .filter_map(|f| f.incr.as_ref())
+            .map(|(_, _, b)| b.len())
+            .sum();
         let outgoing: usize = self.outgoing.iter().map(|o| o.data.len()).sum();
         incoming + outgoing
     }
@@ -825,20 +977,35 @@ impl Relay {
                     f.since.elapsed().as_millis(),
                     f.retries
                 );
-                let _ = s.conn.convert_selection(s.win, s.sel_atoms[f.sel], f.target, f.prop, CURRENT_TIME);
+                let _ = s.conn.convert_selection(
+                    s.win,
+                    s.sel_atoms[f.sel],
+                    f.target,
+                    f.prop,
+                    CURRENT_TIME,
+                );
             }
             k += 1;
         }
-        self.outgoing.retain(|o| o.since.elapsed() <= TRANSFER_TIMEOUT);
+        self.outgoing
+            .retain(|o| o.since.elapsed() <= TRANSFER_TIMEOUT);
         self.cooling.retain(|c| c.2.elapsed() <= TRANSFER_TIMEOUT);
     }
 }
 
 fn fail(side: usize, e: AnyError) -> Failed {
-    if side == ENGINE { Failed::Engine(e) } else { Failed::Desk(e) }
+    if side == ENGINE {
+        Failed::Engine(e)
+    } else {
+        Failed::Desk(e)
+    }
 }
 
-fn notify(conn: &RustConnection, e: &SelectionRequestEvent, property: Atom) -> Result<(), AnyError> {
+fn notify(
+    conn: &RustConnection,
+    e: &SelectionRequestEvent,
+    property: Atom,
+) -> Result<(), AnyError> {
     let ev = SelectionNotifyEvent {
         response_type: SELECTION_NOTIFY_EVENT,
         sequence: 0,
@@ -875,7 +1042,10 @@ mod tests {
         file.extend(entry(0, "0", "MIT-MAGIC-COOKIE-1", &[3, 4])); // an internet entry
         file.extend(entry(256, "0", "XDM-AUTHORIZATION-1", &[5, 6]));
         file.extend(entry(256, "0", "MIT-MAGIC-COOKIE-1", &[7, 8]));
-        assert_eq!(cookie_for(&file, 0), Some((b"MIT-MAGIC-COOKIE-1".to_vec(), vec![7, 8])));
+        assert_eq!(
+            cookie_for(&file, 0),
+            Some((b"MIT-MAGIC-COOKIE-1".to_vec(), vec![7, 8]))
+        );
         assert_eq!(cookie_for(&file, 1).map(|c| c.1), Some(vec![1, 2]));
         assert_eq!(cookie_for(&file, 5), None);
         // a wildcard entry with no number matches any display

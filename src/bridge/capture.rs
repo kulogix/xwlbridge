@@ -225,7 +225,9 @@ impl Framebuffer {
                 continue;
             }
             let start = y as usize * src_stride as usize + x as usize * 4;
-            let Some(sub) = src.get(start..) else { continue };
+            let Some(sub) = src.get(start..) else {
+                continue;
+            };
             blit_rows(
                 &mut fb,
                 ox + x as i32,

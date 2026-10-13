@@ -44,7 +44,6 @@ pub struct KeyTable {
     other_layouts: std::collections::HashMap<u32, u8>,
 }
 
-
 /// Why a `ChangeKeyboardMapping` was not applied.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MappingRefused {
@@ -212,8 +211,9 @@ impl KeyTable {
     ///   (the active layout lacks the keysym);
     /// - otherwise `None`: no layout has it.
     pub fn plan(&self, sym: u32, shortcut: bool) -> Option<(u8, Vec<u8>)> {
-        self.reach(sym)
-            .or_else(|| shortcut.then(|| self.other_layouts.get(&sym).map(|&kc| (kc, Vec::new())))?)
+        self.reach(sym).or_else(|| {
+            shortcut.then(|| self.other_layouts.get(&sym).map(|&kc| (kc, Vec::new())))?
+        })
     }
 
     /// Whether `sym` is on one of the keymap's other layouts only (so
@@ -328,7 +328,9 @@ impl Synth {
         match table.and_then(|t| t.plan(sym, shortcut)) {
             Some((target, mods)) => {
                 let mods: Vec<u8> = mods.into_iter().filter(|&m| !holds(m)).collect();
-                crate::vlog!("{log} spare keycode {kc} (keysym {sym:#x}) down: {mods:?}, then keycode {target}");
+                crate::vlog!(
+                    "{log} spare keycode {kc} (keysym {sym:#x}) down: {mods:?}, then keycode {target}"
+                );
                 out.extend(mods.iter().map(|&m| (true, m)));
                 out.push((true, target));
                 self.held.insert(kc, (target, mods));
@@ -343,7 +345,11 @@ impl Synth {
                     };
                     crate::warning!(
                         "{log} keysym {sym:#x} (on spare keycode {kc}) {why}{}",
-                        if self.warned.len() == SYNTH_WARN_MAX { " (no more such lines for this client)" } else { "" }
+                        if self.warned.len() == SYNTH_WARN_MAX {
+                            " (no more such lines for this client)"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }
@@ -474,8 +480,11 @@ fn other_layouts(
     active: usize,
     served: &crate::bridge::xkbdesc::Desc,
 ) -> std::collections::HashMap<u32, u8> {
-    let have: std::collections::HashSet<u32> =
-        served.keys.iter().flat_map(|k| k.syms.iter().copied()).collect();
+    let have: std::collections::HashSet<u32> = served
+        .keys
+        .iter()
+        .flat_map(|k| k.syms.iter().copied())
+        .collect();
     let mut out = std::collections::HashMap::new();
     for layout in (0..keymap.num_layouts()).filter(|&l| l != active) {
         for kc in MIN_KEYCODE..=MAX_KEYCODE {
@@ -644,7 +653,11 @@ mod tests {
         assert!(ru.spare(248) && !ru.spare(54));
         // RealVNC put the viewer's 'c' on spare keycode 248, Control held
         assert_eq!(k(&mut s, true, 248, Some(C), true), Some(vec![(true, 54)]));
-        assert_eq!(k(&mut s, true, 248, Some(C), true), Some(vec![]), "a repeat");
+        assert_eq!(
+            k(&mut s, true, 248, Some(C), true),
+            Some(vec![]),
+            "a repeat"
+        );
         assert_eq!(k(&mut s, false, 248, None, false), Some(vec![(false, 54)]));
         assert_eq!(s.holding(), 0);
         // without Control: not typed, and its release passes through (to be
@@ -653,16 +666,33 @@ mod tests {
         assert_eq!(k(&mut s, false, 248, None, false), None);
         // a keysym of the active layout's level 2: Shift around it, let go
         // before the client's next key
-        assert_eq!(k(&mut s, true, 247, Some(0x6f3), false), Some(vec![(true, 50), (true, 54)]));
-        assert_eq!(k(&mut s, true, 38, None, false), Some(vec![(false, 50), (true, 38)]));
+        assert_eq!(
+            k(&mut s, true, 247, Some(0x6f3), false),
+            Some(vec![(true, 50), (true, 54)])
+        );
+        assert_eq!(
+            k(&mut s, true, 38, None, false),
+            Some(vec![(false, 50), (true, 38)])
+        );
         assert_eq!(k(&mut s, false, 247, None, false), Some(vec![(false, 54)]));
         // ordinary keys and their releases pass through untouched
         assert_eq!(k(&mut s, false, 38, None, false), None);
         assert_eq!(k(&mut s, true, 37, None, false), None);
         // the client holds Shift itself: not pressed again
-        let shifted = s.key(true, 246, || Some(0x6f3), |m| m == 50, Some(&ru), false, &"[test]");
+        let shifted = s.key(
+            true,
+            246,
+            || Some(0x6f3),
+            |m| m == 50,
+            Some(&ru),
+            false,
+            &"[test]",
+        );
         assert_eq!(shifted, Some(vec![(true, 54)]));
         // no keyboard yet: nothing typed for a spare keycode's keysym
-        assert_eq!(s.key(true, 245, || Some(C), free, None, true, &"[test]"), Some(vec![]));
+        assert_eq!(
+            s.key(true, 245, || Some(C), free, None, true, &"[test]"),
+            Some(vec![])
+        );
     }
 }

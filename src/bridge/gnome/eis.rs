@@ -15,10 +15,10 @@
 //! that never overfill the socket (see `outbox.rs`: mutter's libeis can lose
 //! input, or hang, on a message split across reads).
 
+use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -186,11 +186,13 @@ fn route<D>(abs: &[AbsDevice<D>], gx: f32, gy: f32) -> Option<(usize, f32, f32)>
             .enumerate()
             .flat_map(|(i, a)| a.targets.iter().map(move |t| (i, t)))
     };
-    let hit = all()
-        .find(|(_, t)| t.layout.contains(gx, gy))
-        .or_else(|| {
-            all().min_by(|a, b| a.1.layout.dist2(gx, gy).total_cmp(&b.1.layout.dist2(gx, gy)))
-        });
+    let hit = all().find(|(_, t)| t.layout.contains(gx, gy)).or_else(|| {
+        all().min_by(|a, b| {
+            a.1.layout
+                .dist2(gx, gy)
+                .total_cmp(&b.1.layout.dist2(gx, gy))
+        })
+    });
     if let Some((i, t)) = hit {
         let (x, y) = t.map(gx, gy);
         return Some((i, x, y));
@@ -340,14 +342,21 @@ impl Eis {
                 other => {
                     self.problems += 1;
                     if self.problems.is_power_of_two() {
-                        crate::warning!("gnome: EIS protocol problem ({}x so far): {other:?}", self.problems);
+                        crate::warning!(
+                            "gnome: EIS protocol problem ({}x so far): {other:?}",
+                            self.problems
+                        );
                     }
                     continue;
                 }
             };
             // mutter got a message for an object it doesn't know: normal for
             // a device it just removed, a sign of trouble in numbers
-            if let ei::Event::Connection(_, ei::connection::Event::InvalidObject { invalid_id, .. }) = &ev {
+            if let ei::Event::Connection(
+                _,
+                ei::connection::Event::InvalidObject { invalid_id, .. },
+            ) = &ev
+            {
                 let n = self.shared.invalid.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() && n >= 4 {
                     crate::warning!(
@@ -374,7 +383,9 @@ impl Eis {
                 }
                 continue;
             }
-            let Some(conv) = self.conv.as_mut() else { continue };
+            let Some(conv) = self.conv.as_mut() else {
+                continue;
+            };
             if let Err(e) = conv.handle_event(ev) {
                 crate::warning!("gnome: EIS event error: {e:?}");
             }
@@ -477,7 +488,10 @@ impl Eis {
         let emulating = |dev: &Device| self.devices.iter().any(|d| d.emulating && d.dev == *dev);
         let mut d = lock(&self.shared.devices);
         let same = d.abs.len() == abs.len()
-            && d.abs.iter().zip(&abs).all(|(a, b)| a.dev == b.dev && a.targets == b.targets);
+            && d.abs
+                .iter()
+                .zip(&abs)
+                .all(|(a, b)| a.dev == b.dev && a.targets == b.targets);
         if !same {
             for a in &abs {
                 let name = a.dev.name().unwrap_or("?");
@@ -489,7 +503,11 @@ impl Eis {
                         "gnome: EIS absolute pointer '{name}': region {} covers {}{}",
                         t.region,
                         t.layout,
-                        if t.stream { "" } else { " (no stream of ours: taken as layout coordinates)" }
+                        if t.stream {
+                            ""
+                        } else {
+                            " (no stream of ours: taken as layout coordinates)"
+                        }
                     );
                 }
             }
@@ -535,14 +553,30 @@ fn set_sndbuf(fd: &OwnedFd, size: libc::c_int) -> usize {
     let raw = fd.as_raw_fd();
     let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     unsafe {
-        libc::setsockopt(raw, libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const libc::c_int).cast(), len)
+        libc::setsockopt(
+            raw,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&size as *const libc::c_int).cast(),
+            len,
+        )
     };
     let mut got: libc::c_int = 0;
     let mut got_len = len;
     let rc = unsafe {
-        libc::getsockopt(raw, libc::SOL_SOCKET, libc::SO_SNDBUF, (&mut got as *mut libc::c_int).cast(), &mut got_len)
+        libc::getsockopt(
+            raw,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&mut got as *mut libc::c_int).cast(),
+            &mut got_len,
+        )
     };
-    if rc == 0 && got > 0 { got as usize } else { 212_992 }
+    if rc == 0 && got > 0 {
+        got as usize
+    } else {
+        212_992
+    }
 }
 
 /// Writes ops as `reis` requests.
@@ -677,7 +711,11 @@ impl VirtualPointer for GnomePointer {
         if dev.interface::<ei::PointerAbsolute>().is_none() {
             return;
         }
-        self.0.push(Op::Abs { dev: dev.clone(), x: rx, y: ry });
+        self.0.push(Op::Abs {
+            dev: dev.clone(),
+            x: rx,
+            y: ry,
+        });
         d.mark_dirty(&dev);
         d.last_abs = Some(dev);
     }
@@ -686,7 +724,11 @@ impl VirtualPointer for GnomePointer {
         let mut d = lock(&self.0.devices);
         let Some(dev) = d.rel.clone() else { return };
         if dev.interface::<ei::Pointer>().is_some() {
-            self.0.push(Op::Rel { dev: dev.clone(), dx: dx as f32, dy: dy as f32 });
+            self.0.push(Op::Rel {
+                dev: dev.clone(),
+                dx: dx as f32,
+                dy: dy as f32,
+            });
             d.mark_dirty(&dev);
         }
     }
@@ -740,7 +782,11 @@ impl VirtualPointer for GnomePointer {
                 Axis::HorizontalScroll => (n, 0),
                 _ => (0, n),
             };
-            self.0.push(Op::Scroll { dev: dev.clone(), dx, dy });
+            self.0.push(Op::Scroll {
+                dev: dev.clone(),
+                dx,
+                dy,
+            });
             d.mark_dirty(&dev);
         }
     }
@@ -763,7 +809,11 @@ impl VirtualKeyboard for GnomeKeyboard {
         let d = lock(&self.0.devices);
         let Some(dev) = &d.kbd else { return };
         if dev.interface::<ei::Keyboard>().is_some() {
-            self.0.push(Op::Key { dev: dev.clone(), key, press: state != 0 });
+            self.0.push(Op::Key {
+                dev: dev.clone(),
+                key,
+                press: state != 0,
+            });
             self.0.push(Op::Frame { dev: dev.clone() });
         }
     }
@@ -840,7 +890,10 @@ mod tests {
 
     #[test]
     fn vertical_layout() {
-        let areas = vec![area("top", 0, 0, 1280, 720), area("bottom", 128, 720, 1024, 768)];
+        let areas = vec![
+            area("top", 0, 0, 1280, 720),
+            area("bottom", 128, 720, 1024, 768),
+        ];
         let devs = vec![
             dev(&[(rect(0.0, 0.0, 1280.0, 720.0), Some("top"))], &areas),
             dev(&[(rect(0.0, 0.0, 1024.0, 768.0), Some("bottom"))], &areas),
@@ -857,7 +910,10 @@ mod tests {
         let devs = vec![dev(&[(rect(0.0, 0.0, 2560.0, 1440.0), Some("hi"))], &areas)];
         assert_eq!(route(&devs, 640.0, 360.0), Some((0, 1280.0, 720.0)));
         let (_, x, y) = route(&devs, 1279.0, 719.0).unwrap();
-        assert!(x < 2560.0 && y < 1440.0, "{x},{y} must stay inside the region");
+        assert!(
+            x < 2560.0 && y < 1440.0,
+            "{x},{y} must stay inside the region"
+        );
     }
 
     #[test]
@@ -880,7 +936,10 @@ mod tests {
         // no mapping ids (or a stream we didn't record): the old behaviour
         let devs = vec![dev(&[(rect(0.0, 0.0, 1280.0, 720.0), None)], &[])];
         assert_eq!(route(&devs, 1600.0, 300.0), Some((0, 1279.0, 300.0)));
-        let devs = vec![dev(&[(rect(0.0, 0.0, 1280.0, 720.0), Some("x"))], &[area("y", 9, 9, 9, 9)])];
+        let devs = vec![dev(
+            &[(rect(0.0, 0.0, 1280.0, 720.0), Some("x"))],
+            &[area("y", 9, 9, 9, 9)],
+        )];
         assert_eq!(route(&devs, 100.0, 100.0), Some((0, 100.0, 100.0)));
     }
 

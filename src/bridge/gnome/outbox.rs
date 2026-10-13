@@ -221,17 +221,38 @@ impl<D: Clone + PartialEq> Outbox<D> {
         // a motion held for pacing that has nothing after it but frames is
         // still unsent, so it may coalesce too
         let merged = match (&mut self.queue[i], op) {
-            (Op::Abs { dev: d, x: px, y: py }, Op::Abs { dev, x, y }) if d == dev => {
+            (
+                Op::Abs {
+                    dev: d,
+                    x: px,
+                    y: py,
+                },
+                Op::Abs { dev, x, y },
+            ) if d == dev => {
                 *px = *x;
                 *py = *y;
                 true
             }
-            (Op::Rel { dev: d, dx: pdx, dy: pdy }, Op::Rel { dev, dx, dy }) if d == dev => {
+            (
+                Op::Rel {
+                    dev: d,
+                    dx: pdx,
+                    dy: pdy,
+                },
+                Op::Rel { dev, dx, dy },
+            ) if d == dev => {
                 *pdx += dx;
                 *pdy += dy;
                 true
             }
-            (Op::Scroll { dev: d, dx: pdx, dy: pdy }, Op::Scroll { dev, dx, dy }) if d == dev => {
+            (
+                Op::Scroll {
+                    dev: d,
+                    dx: pdx,
+                    dy: pdy,
+                },
+                Op::Scroll { dev, dx, dy },
+            ) if d == dev => {
                 *pdx = add_scroll(*pdx, *dx);
                 *pdy = add_scroll(*pdy, *dy);
                 true
@@ -347,19 +368,33 @@ impl<D: Clone + PartialEq> Outbox<D> {
                 }
             };
             let (_, mv, wheel) = &mut slots[slot];
-            let at = if matches!(op, Op::Scroll { .. }) { wheel } else { mv };
+            let at = if matches!(op, Op::Scroll { .. }) {
+                wheel
+            } else {
+                mv
+            };
             let merged = match at.map(|i| (&mut into[i], &op)) {
                 Some((Op::Abs { x: px, y: py, .. }, Op::Abs { x, y, .. })) => {
                     *px = *x;
                     *py = *y;
                     true
                 }
-                Some((Op::Rel { dx: pdx, dy: pdy, .. }, Op::Rel { dx, dy, .. })) => {
+                Some((
+                    Op::Rel {
+                        dx: pdx, dy: pdy, ..
+                    },
+                    Op::Rel { dx, dy, .. },
+                )) => {
                     *pdx += dx;
                     *pdy += dy;
                     true
                 }
-                Some((Op::Scroll { dx: pdx, dy: pdy, .. }, Op::Scroll { dx, dy, .. })) => {
+                Some((
+                    Op::Scroll {
+                        dx: pdx, dy: pdy, ..
+                    },
+                    Op::Scroll { dx, dy, .. },
+                )) => {
                     *pdx = add_scroll(*pdx, *dx);
                     *pdy = add_scroll(*pdy, *dy);
                     true
@@ -421,7 +456,8 @@ impl<D: Clone + PartialEq> Outbox<D> {
                 }
                 let op = self.queue.pop_front().expect("front exists");
                 if op.is_motion() {
-                    self.motion_tat = Some(self.motion_tat.map_or(now, |t| t.max(now)) + MOTION_INTERVAL);
+                    self.motion_tat =
+                        Some(self.motion_tat.map_or(now, |t| t.max(now)) + MOTION_INTERVAL);
                 }
                 sink.write(&op);
                 bytes += OP_BYTES;
@@ -455,7 +491,11 @@ impl<D: Clone + PartialEq> Outbox<D> {
     fn motion_due(&self, now: Instant) -> Option<Instant> {
         let tat = self.motion_tat?;
         let followed = self.queue.iter().skip(1).any(|o| !o.is_frame());
-        let slack = if followed { MOTION_INTERVAL * (MOTION_BURST - 1) } else { Duration::ZERO };
+        let slack = if followed {
+            MOTION_INTERVAL * (MOTION_BURST - 1)
+        } else {
+            Duration::ZERO
+        };
         let at = tat.checked_sub(slack).unwrap_or(now);
         (now < at).then_some(at)
     }
@@ -499,7 +539,9 @@ fn add_scroll(a: i32, b: i32) -> i32 {
 /// so stay well under that, with room for the requests the backend thread
 /// adds itself (handshake, pongs).
 pub fn batch_for(sndbuf: usize) -> usize {
-    (sndbuf / 2).saturating_sub(64 + 1024).clamp(OP_BYTES * 8, 4096)
+    (sndbuf / 2)
+        .saturating_sub(64 + 1024)
+        .clamp(OP_BYTES * 8, 4096)
 }
 
 #[cfg(test)]
@@ -541,10 +583,18 @@ mod tests {
         Op::Abs { dev: 1, x, y: x }
     }
     fn key(k: u32, press: bool) -> Op<u8> {
-        Op::Key { dev: 2, key: k, press }
+        Op::Key {
+            dev: 2,
+            key: k,
+            press,
+        }
     }
     fn btn(b: u32, press: bool) -> Op<u8> {
-        Op::Button { dev: 1, button: b, press }
+        Op::Button {
+            dev: 1,
+            button: b,
+            press,
+        }
     }
     fn frame(dev: u8) -> Op<u8> {
         Op::Frame { dev }
@@ -569,7 +619,10 @@ mod tests {
     #[test]
     fn flowing_input_goes_out_at_once_and_unchanged() {
         let mut o = Outbox::new(4096);
-        let mut s = FakeSink { room: 100, ..Default::default() };
+        let mut s = FakeSink {
+            room: 100,
+            ..Default::default()
+        };
         let now = t0();
         o.push(key(30, true));
         o.push(frame(2));
@@ -578,7 +631,10 @@ mod tests {
         o.push(frame(2));
         assert_eq!(o.pump(&mut s, now), Pump::Idle);
         assert_eq!(s.sent.len(), 2);
-        assert_eq!(s.all(), vec![key(30, true), frame(2), key(30, false), frame(2)]);
+        assert_eq!(
+            s.all(),
+            vec![key(30, true), frame(2), key(30, false), frame(2)]
+        );
     }
 
     /// S2: the tail of a burst must not wait for unrelated input once the
@@ -586,7 +642,10 @@ mod tests {
     #[test]
     fn s2_backlog_waits_in_the_outbox_and_goes_out_on_pollout() {
         let mut o = Outbox::new(4096);
-        let mut s = FakeSink { room: 1, ..Default::default() };
+        let mut s = FakeSink {
+            room: 1,
+            ..Default::default()
+        };
         let mut now = t0();
         // mutter stops reading: the first event fills the "socket"
         for i in 0..5000 {
@@ -624,16 +683,38 @@ mod tests {
         let mut o = Outbox::new(4096);
         let now = t0();
         for op in [
-            abs(1.0), frame(1), abs(2.0), frame(1), btn(272, true), frame(1),
-            abs(3.0), frame(1), abs(4.0), frame(1), btn(272, false), frame(1),
+            abs(1.0),
+            frame(1),
+            abs(2.0),
+            frame(1),
+            btn(272, true),
+            frame(1),
+            abs(3.0),
+            frame(1),
+            abs(4.0),
+            frame(1),
+            btn(272, false),
+            frame(1),
         ] {
             o.push(op);
         }
-        let mut s = FakeSink { room: 10, ..Default::default() };
+        let mut s = FakeSink {
+            room: 10,
+            ..Default::default()
+        };
         o.pump(&mut s, now);
         assert_eq!(
             s.all(),
-            vec![abs(2.0), frame(1), btn(272, true), frame(1), abs(4.0), frame(1), btn(272, false), frame(1)]
+            vec![
+                abs(2.0),
+                frame(1),
+                btn(272, true),
+                frame(1),
+                abs(4.0),
+                frame(1),
+                btn(272, false),
+                frame(1)
+            ]
         );
     }
 
@@ -662,7 +743,11 @@ mod tests {
         // backend thread does)
         s.room = usize::MAX;
         drain(&mut o, &mut s, now);
-        let keys: Vec<_> = s.all().into_iter().filter(|o| matches!(o, Op::Key { .. })).collect();
+        let keys: Vec<_> = s
+            .all()
+            .into_iter()
+            .filter(|o| matches!(o, Op::Key { .. }))
+            .collect();
         // every press that went out was released, except Ctrl and Shift
         let mut down = std::collections::HashSet::new();
         for k in &keys {
@@ -682,7 +767,10 @@ mod tests {
     #[test]
     fn s2_motion_is_paced() {
         let mut o = Outbox::new(4096);
-        let mut s = FakeSink { room: 100_000, ..Default::default() };
+        let mut s = FakeSink {
+            room: 100_000,
+            ..Default::default()
+        };
         let start = t0();
         let mut held = None;
         // a flood: 1000 motions within 1 ms of each other
@@ -699,7 +787,10 @@ mod tests {
         let t = held.expect("the last one is held");
         assert_eq!(o.deadline(), Some(t));
         assert_eq!(o.pump(&mut s, t), Pump::Idle);
-        assert_eq!(s.all().iter().rev().find(|o| o.is_motion()), Some(&abs(999.0)));
+        assert_eq!(
+            s.all().iter().rev().find(|o| o.is_motion()),
+            Some(&abs(999.0))
+        );
         // a click releases a held motion at once (and keeps it first)
         let now = t + Duration::from_micros(10);
         o.push(abs(5.0));
@@ -716,7 +807,10 @@ mod tests {
     #[test]
     fn a_stall_counts_from_its_start() {
         let mut o = Outbox::new(4096);
-        let mut s = FakeSink { room: 100, ..Default::default() };
+        let mut s = FakeSink {
+            room: 100,
+            ..Default::default()
+        };
         let start = t0();
         for i in 0..50u32 {
             o.push(abs(i as f32)); // paced: merged into the held one
@@ -726,7 +820,10 @@ mod tests {
         s.room = 0;
         o.push(btn(272, true));
         o.push(frame(1));
-        assert_eq!(o.pump(&mut s, start + Duration::from_millis(5)), Pump::Blocked);
+        assert_eq!(
+            o.pump(&mut s, start + Duration::from_millis(5)),
+            Pump::Blocked
+        );
         for i in 0..10u32 {
             o.push(abs(i as f32));
             o.push(frame(1));
@@ -742,14 +839,20 @@ mod tests {
     #[test]
     fn not_reading_is_only_while_the_socket_stays_full() {
         let mut o = Outbox::new(4096);
-        let mut s = FakeSink { room: 0, ..Default::default() };
+        let mut s = FakeSink {
+            room: 0,
+            ..Default::default()
+        };
         let start = t0();
         o.push(key(1, true));
         o.push(frame(2));
         assert_eq!(o.pump(&mut s, start), Pump::Blocked);
         assert_eq!(o.blocked_since(), Some(start));
         // still full later: still the same stretch
-        assert_eq!(o.pump(&mut s, start + Duration::from_secs(1)), Pump::Blocked);
+        assert_eq!(
+            o.pump(&mut s, start + Duration::from_secs(1)),
+            Pump::Blocked
+        );
         assert_eq!(o.blocked_since(), Some(start));
         for i in 0..40u32 {
             o.push(abs(i as f32));
@@ -758,7 +861,10 @@ mod tests {
         // the compositor reads again: the backlog drains paced, the stall's
         // counts go on, but nothing is "not read" any more
         s.room = usize::MAX;
-        assert!(matches!(o.pump(&mut s, start + Duration::from_secs(2)), Pump::Hold(_)));
+        assert!(matches!(
+            o.pump(&mut s, start + Duration::from_secs(2)),
+            Pump::Hold(_)
+        ));
         assert_eq!(o.blocked_since(), None);
         assert!(o.stall().since.is_some());
     }
@@ -771,14 +877,27 @@ mod tests {
         blocked_flood(&mut o, &[scroll(120), frame(1)], 100_000);
         blocked_flood(&mut o, &[abs(1.0), frame(1)], 1);
         blocked_flood(&mut o, &[scroll(-120), frame(1)], 100_000);
-        let wheel: Vec<i32> = o.queue.iter().filter_map(|o| if let Op::Scroll { dy, .. } = o { Some(*dy) } else { None }).collect();
+        let wheel: Vec<i32> = o
+            .queue
+            .iter()
+            .filter_map(|o| {
+                if let Op::Scroll { dy, .. } = o {
+                    Some(*dy)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(wheel, vec![MAX_SCROLL, -MAX_SCROLL]);
     }
 
     #[test]
     fn batches_respect_the_size_limit() {
         let mut o = Outbox::new(1024);
-        let mut s = FakeSink { room: 1000, ..Default::default() };
+        let mut s = FakeSink {
+            room: 1000,
+            ..Default::default()
+        };
         let now = t0();
         for i in 0..500u32 {
             o.push(key(i % 200, i % 2 == 0));
@@ -796,7 +915,10 @@ mod tests {
     #[test]
     fn the_sinks_own_requests_are_flushed_with_nothing_queued() {
         let mut o: Outbox<u8> = Outbox::new(4096);
-        let mut s = FakeSink { room: 1, ..Default::default() };
+        let mut s = FakeSink {
+            room: 1,
+            ..Default::default()
+        };
         s.pending.push(frame(9)); // stands for start_emulating
         assert_eq!(o.pump(&mut s, t0()), Pump::Idle);
         assert_eq!(s.all(), vec![frame(9)]);
@@ -859,7 +981,10 @@ mod tests {
     fn timed_flood(pattern: &[Op<u8>], rounds: u32) -> (Instant, Vec<(Instant, Op<u8>)>) {
         let mut o = Outbox::new(4096);
         let start = t0();
-        let mut s = Timed { now: start, ops: Vec::new() };
+        let mut s = Timed {
+            now: start,
+            ops: Vec::new(),
+        };
         for i in 0..rounds {
             for op in pattern {
                 let mut op = op.clone();
@@ -911,10 +1036,20 @@ mod tests {
                 }
             }
             let (start, sent) = timed_flood(&pattern, 1000);
-            let motions: Vec<Instant> = sent.iter().filter(|(_, o)| o.is_motion()).map(|(t, _)| *t).collect();
-            let early = motions.iter().filter(|t| **t < start + Duration::from_millis(100)).count();
+            let motions: Vec<Instant> = sent
+                .iter()
+                .filter(|(_, o)| o.is_motion())
+                .map(|(t, _)| *t)
+                .collect();
+            let early = motions
+                .iter()
+                .filter(|t| **t < start + Duration::from_millis(100))
+                .count();
             let bound = MOTION_BURST as usize + 100 / 2 + 1;
-            assert!(early <= bound, "{name}: {early} motions in the first 100 ms (bound {bound})");
+            assert!(
+                early <= bound,
+                "{name}: {early} motions in the first 100 ms (bound {bound})"
+            );
             for w in motions.windows(400) {
                 let span = w[399] - w[0];
                 assert!(
@@ -924,7 +1059,11 @@ mod tests {
             }
             // nothing else was lost or reordered: every non-motion event
             // arrives, each after the motion that came before it
-            let others: Vec<&Op<u8>> = sent.iter().map(|(_, o)| o).filter(|o| !o.is_motion() && !o.is_frame()).collect();
+            let others: Vec<&Op<u8>> = sent
+                .iter()
+                .map(|(_, o)| o)
+                .filter(|o| !o.is_motion() && !o.is_frame())
+                .collect();
             assert_eq!(others.len(), 1000 * (pattern.len() - 1), "{name}");
             let mut last_x = -1.0;
             for (_, op) in &sent {
@@ -948,7 +1087,10 @@ mod tests {
         let mut pattern = vec![abs(0.0), scroll(120)];
         let mut o = Outbox::new(4096);
         let now = t0();
-        let mut s = Timed { now, ops: Vec::new() };
+        let mut s = Timed {
+            now,
+            ops: Vec::new(),
+        };
         o.push(btn(272, true));
         o.push(frame(1));
         for i in 0..2000u32 {
@@ -963,15 +1105,26 @@ mod tests {
         o.push(frame(1));
         loop {
             let now = s.now;
-            let Pump::Hold(t) = o.pump(&mut s, now) else { break };
+            let Pump::Hold(t) = o.pump(&mut s, now) else {
+                break;
+            };
             s.now = t;
         }
-        let ops: Vec<&Op<u8>> = s.ops.iter().map(|(_, o)| o).filter(|o| !o.is_frame()).collect();
+        let ops: Vec<&Op<u8>> = s
+            .ops
+            .iter()
+            .map(|(_, o)| o)
+            .filter(|o| !o.is_frame())
+            .collect();
         assert_eq!(ops.first(), Some(&&btn(272, true)));
         assert_eq!(ops.last(), Some(&&btn(272, false)));
         assert_eq!(ops[ops.len() - 3], &abs(1999.0));
         // ~2000 motions at 500 Hz
-        assert!(s.now - now >= MOTION_INTERVAL * (2000 - MOTION_BURST), "{:?}", s.now - now);
+        assert!(
+            s.now - now >= MOTION_INTERVAL * (2000 - MOTION_BURST),
+            "{:?}",
+            s.now - now
+        );
     }
 
     /// Blocks an outbox (the compositor isn't reading) and floods it.
@@ -1005,10 +1158,30 @@ mod tests {
     /// per MAX_QUEUE / 2 pushes at most.
     #[test]
     fn r4_the_queue_cap_is_hard_and_compaction_amortized() {
-        let alt_abs = [abs(1.0), frame(1), Op::Abs { dev: 3, x: 1.0, y: 1.0 }, frame(3)];
+        let alt_abs = [
+            abs(1.0),
+            frame(1),
+            Op::Abs {
+                dev: 3,
+                x: 1.0,
+                y: 1.0,
+            },
+            frame(3),
+        ];
         let abs_wheel = [abs(1.0), frame(1), scroll(120), frame(1)];
-        let key_taps = [key(30, true), frame(2), key(30, false), frame(2), abs(1.0), frame(1)];
-        for (name, pattern) in [("alt-abs", &alt_abs[..]), ("abs+wheel", &abs_wheel[..]), ("key taps", &key_taps[..])] {
+        let key_taps = [
+            key(30, true),
+            frame(2),
+            key(30, false),
+            frame(2),
+            abs(1.0),
+            frame(1),
+        ];
+        for (name, pattern) in [
+            ("alt-abs", &alt_abs[..]),
+            ("abs+wheel", &abs_wheel[..]),
+            ("key taps", &key_taps[..]),
+        ] {
             let mut o = Outbox::new(4096);
             let rounds = 400_000 / pattern.len();
             let started = Instant::now();
@@ -1016,7 +1189,11 @@ mod tests {
             let took = started.elapsed();
             let pushes = rounds * pattern.len();
             assert!(max <= MAX_QUEUE, "{name}: queue reached {max}");
-            assert!(o.compactions <= pushes / (MAX_QUEUE / 2) + 1, "{name}: {} compactions", o.compactions);
+            assert!(
+                o.compactions <= pushes / (MAX_QUEUE / 2) + 1,
+                "{name}: {} compactions",
+                o.compactions
+            );
             // (36 s for 160000 pushes before; generous for a loaded host)
             assert!(took < Duration::from_secs(20), "{name}: {took:?}");
         }
@@ -1029,19 +1206,57 @@ mod tests {
     fn r4_a_motion_flood_keeps_every_click_where_it_was() {
         let mut o = Outbox::new(4096);
         blocked_flood(&mut o, &[], 0);
-        for op in [abs(10.0), frame(1), btn(272, true), frame(1), abs(500.0), frame(1), btn(272, false), frame(1)] {
+        for op in [
+            abs(10.0),
+            frame(1),
+            btn(272, true),
+            frame(1),
+            abs(500.0),
+            frame(1),
+            btn(272, false),
+            frame(1),
+        ] {
             o.push(op);
         }
-        blocked_flood(&mut o, &[abs(7.0), frame(1), scroll(120), frame(1), abs(8.0), frame(1)], 50_000);
+        blocked_flood(
+            &mut o,
+            &[
+                abs(7.0),
+                frame(1),
+                scroll(120),
+                frame(1),
+                abs(8.0),
+                frame(1),
+            ],
+            50_000,
+        );
         assert!(o.compactions > 0);
         let ops: Vec<Op<u8>> = o.queue.iter().filter(|o| !o.is_frame()).cloned().collect();
-        let press = ops.iter().position(|o| *o == btn(272, true)).expect("press kept");
-        let release = ops.iter().position(|o| *o == btn(272, false)).expect("release kept");
+        let press = ops
+            .iter()
+            .position(|o| *o == btn(272, true))
+            .expect("press kept");
+        let release = ops
+            .iter()
+            .position(|o| *o == btn(272, false))
+            .expect("release kept");
         assert_eq!(ops[press - 1], abs(10.0));
         assert_eq!(ops[release - 1], abs(500.0));
-        let wheel: Vec<i32> = ops.iter().filter_map(|o| if let Op::Scroll { dy, .. } = o { Some(*dy) } else { None }).collect();
+        let wheel: Vec<i32> = ops
+            .iter()
+            .filter_map(|o| {
+                if let Op::Scroll { dy, .. } = o {
+                    Some(*dy)
+                } else {
+                    None
+                }
+            })
+            .collect();
         // the wheel merged too, up to its cap
-        assert!(!wheel.is_empty() && wheel.iter().all(|dy| *dy > 0 && *dy <= MAX_SCROLL), "{wheel:?}");
+        assert!(
+            !wheel.is_empty() && wheel.iter().all(|dy| *dy > 0 && *dy <= MAX_SCROLL),
+            "{wheel:?}"
+        );
         assert_eq!(ops.iter().rev().find(|o| o.is_motion()), Some(&abs(8.0)));
         assert_eq!(o.stall().dropped_taps, 0);
     }
@@ -1056,13 +1271,27 @@ mod tests {
         o.push(frame(2));
         let mut pattern = Vec::new();
         for k in 40..60u32 {
-            pattern.extend([key(k, true), frame(2), key(k, false), frame(2), abs(k as f32), frame(1), scroll(1), frame(1)]);
+            pattern.extend([
+                key(k, true),
+                frame(2),
+                key(k, false),
+                frame(2),
+                abs(k as f32),
+                frame(1),
+                scroll(1),
+                frame(1),
+            ]);
         }
         blocked_flood(&mut o, &pattern, 2_000);
         o.push(key(29, true)); // held
         o.push(frame(2));
         assert!(o.len() <= MAX_QUEUE);
-        let keys: Vec<Op<u8>> = o.queue.iter().filter(|o| matches!(o, Op::Key { key, .. } if *key == 29 || *key == 30)).cloned().collect();
+        let keys: Vec<Op<u8>> = o
+            .queue
+            .iter()
+            .filter(|o| matches!(o, Op::Key { key, .. } if *key == 29 || *key == 30))
+            .cloned()
+            .collect();
         assert_eq!(keys, vec![key(30, false), key(29, true)]);
         assert!(o.stall().dropped_taps > 0);
     }
@@ -1072,10 +1301,20 @@ mod tests {
     #[test]
     fn taps_dropped_behind_paced_motion_are_reported() {
         let mut o = Outbox::new(4096);
-        let mut s = FakeSink { room: usize::MAX, ..Default::default() };
+        let mut s = FakeSink {
+            room: usize::MAX,
+            ..Default::default()
+        };
         let mut now = t0();
         for i in 0..40_000u32 {
-            for op in [abs(i as f32), frame(1), key(42, true), frame(2), key(42, false), frame(2)] {
+            for op in [
+                abs(i as f32),
+                frame(1),
+                key(42, true),
+                frame(2),
+                key(42, false),
+                frame(2),
+            ] {
                 o.push(op);
             }
             if let Pump::Hold(t) = o.pump(&mut s, now) {
@@ -1145,14 +1384,24 @@ mod socket_tests {
             while !self.buf.is_empty() {
                 let (a, b) = self.buf.as_slices();
                 let iov = [
-                    libc::iovec { iov_base: a.as_ptr() as *mut _, iov_len: a.len() },
-                    libc::iovec { iov_base: b.as_ptr() as *mut _, iov_len: b.len() },
+                    libc::iovec {
+                        iov_base: a.as_ptr() as *mut _,
+                        iov_len: a.len(),
+                    },
+                    libc::iovec {
+                        iov_base: b.as_ptr() as *mut _,
+                        iov_len: b.len(),
+                    },
                 ];
                 let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
                 msg.msg_iov = iov.as_ptr() as *mut _;
                 msg.msg_iovlen = 2;
                 let n = unsafe {
-                    libc::sendmsg(self.fd.as_raw_fd(), &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+                    libc::sendmsg(
+                        self.fd.as_raw_fd(),
+                        &msg,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
                 };
                 if n < 0 {
                     return Err(io::Error::last_os_error());
@@ -1169,7 +1418,12 @@ mod socket_tests {
         loop {
             let mut chunk = [0u8; 1024];
             let n = unsafe {
-                libc::recv(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len(), libc::MSG_DONTWAIT)
+                libc::recv(
+                    fd.as_raw_fd(),
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
             };
             if n <= 0 {
                 break;
@@ -1197,11 +1451,20 @@ mod socket_tests {
 
     fn pair() -> (OwnedFd, OwnedFd) {
         let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
         let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let size: libc::c_int = 32 * 1024;
         unsafe {
-            libc::setsockopt(a.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const libc::c_int).cast(), 4)
+            libc::setsockopt(
+                a.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                4,
+            )
         };
         (a, b)
     }
@@ -1210,7 +1473,13 @@ mod socket_tests {
         let mut got: libc::c_int = 0;
         let mut len = 4;
         unsafe {
-            libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&mut got as *mut libc::c_int).cast(), &mut len)
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&mut got as *mut libc::c_int).cast(),
+                &mut len,
+            )
         };
         got as usize
     }
@@ -1221,7 +1490,10 @@ mod socket_tests {
         let (tx, rx) = pair();
         let mut o = Outbox::new(batch);
         o.max_batch = batch; // (the control's "unbounded" batch too)
-        let mut sink = SockSink { fd: tx, buf: VecDeque::new() };
+        let mut sink = SockSink {
+            fd: tx,
+            buf: VecDeque::new(),
+        };
         let mut now = Instant::now();
         let mut lost = 0;
         let mut keys = Vec::new();
@@ -1236,11 +1508,19 @@ mod socket_tests {
         // mutter doesn't read: 20000 motions and a few taps go in
         for i in 0..20_000u32 {
             now += Duration::from_micros(300);
-            o.push(Op::Abs { dev: 1, x: i as f32, y: 1.0 });
+            o.push(Op::Abs {
+                dev: 1,
+                x: i as f32,
+                y: 1.0,
+            });
             o.push(Op::Frame { dev: 1 });
             if i % 1000 == 999 {
                 for press in [true, false] {
-                    o.push(Op::Key { dev: 2, key: i / 1000, press });
+                    o.push(Op::Key {
+                        dev: 2,
+                        key: i / 1000,
+                        press,
+                    });
                     o.push(Op::Frame { dev: 2 });
                 }
             }
@@ -1269,7 +1549,10 @@ mod socket_tests {
         let (_, probe) = pair();
         let batch = batch_for(sndbuf(&probe));
         let (lost, keys) = run(batch);
-        assert_eq!(lost, 0, "the reader threw away {lost} bytes of a split message");
+        assert_eq!(
+            lost, 0,
+            "the reader threw away {lost} bytes of a split message"
+        );
         let want: Vec<(u32, bool)> = (0..20).flat_map(|k| [(k, true), (k, false)]).collect();
         assert_eq!(keys, want);
     }
@@ -1280,13 +1563,23 @@ mod socket_tests {
     #[test]
     fn s2_control_unpaced_flush_splits_messages() {
         let (tx, rx) = pair();
-        let mut sink = SockSink { fd: tx, buf: VecDeque::new() };
+        let mut sink = SockSink {
+            fd: tx,
+            buf: VecDeque::new(),
+        };
         let send = |sink: &mut SockSink, op: Op<u8>| {
             sink.write(&op);
             let _ = sink.flush();
         };
         for i in 0..20_000u32 {
-            send(&mut sink, Op::Abs { dev: 1, x: i as f32, y: 1.0 });
+            send(
+                &mut sink,
+                Op::Abs {
+                    dev: 1,
+                    x: i as f32,
+                    y: 1.0,
+                },
+            );
             send(&mut sink, Op::Frame { dev: 1 });
         }
         let mut lost = 0;
@@ -1294,7 +1587,14 @@ mod socket_tests {
         // mutter reads again; each later X event flushes some more
         for i in 0..10_000u32 {
             lost += libeis_read(&rx, &mut carry).1;
-            send(&mut sink, Op::Abs { dev: 1, x: i as f32, y: 2.0 });
+            send(
+                &mut sink,
+                Op::Abs {
+                    dev: 1,
+                    x: i as f32,
+                    y: 2.0,
+                },
+            );
             send(&mut sink, Op::Frame { dev: 1 });
             if sink.buf.is_empty() {
                 break;

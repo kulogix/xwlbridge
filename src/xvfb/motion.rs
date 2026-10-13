@@ -93,7 +93,13 @@ impl Pairing {
     /// move, waiting until `deadline` for RECORD to report it (it normally has
     /// already: the server records a request before it makes the event).
     /// `None`: unknown (no report in time, or none will come).
-    pub fn kind(&mut self, log: &MotionLog, id: u64, deadline: Instant, alive: impl Fn() -> bool) -> Option<bool> {
+    pub fn kind(
+        &mut self,
+        log: &MotionLog,
+        id: u64,
+        deadline: Instant,
+        alive: impl Fn() -> bool,
+    ) -> Option<bool> {
         let mut q = log.moves.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let mut found = None;
@@ -112,7 +118,11 @@ impl Pairing {
             if now >= deadline || !alive() {
                 return None;
             }
-            q = log.added.wait_timeout(q, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+            q = log
+                .added
+                .wait_timeout(q, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }
@@ -121,12 +131,19 @@ impl Pairing {
 /// (`log`, in the order the server took them), calling `paired(id, kind)` for
 /// each: `Some(relative)`, or `None` for a raw motion no request accounts for.
 /// What can't be paired yet stays.
-fn pair(owed: &mut VecDeque<Raw>, log: &mut VecDeque<Motion>, mut paired: impl FnMut(u64, Option<bool>)) {
+fn pair(
+    owed: &mut VecDeque<Raw>,
+    log: &mut VecDeque<Motion>,
+    mut paired: impl FnMut(u64, Option<bool>),
+) {
     while let Some(&raw) = owed.front() {
         // its request is the first with its values: those before it made no
         // event (a request the server refused, or one from before we looked).
         // If its request hasn't been reported yet, no later one has either.
-        if let Some(i) = log.iter().position(|m| i32::from(m.x) == raw.x && i32::from(m.y) == raw.y) {
+        if let Some(i) = log
+            .iter()
+            .position(|m| i32::from(m.x) == raw.x && i32::from(m.y) == raw.y)
+        {
             log.drain(..i);
             let m = log.pop_front().expect("found above");
             owed.pop_front();
@@ -136,7 +153,12 @@ fn pair(owed: &mut VecDeque<Raw>, log: &mut VecDeque<Motion>, mut paired: impl F
         // the next request reported is a later raw motion's: this one came
         // from no request we saw
         match log.front() {
-            Some(m) if owed.iter().skip(1).any(|r| r.x == i32::from(m.x) && r.y == i32::from(m.y)) => {
+            Some(m)
+                if owed
+                    .iter()
+                    .skip(1)
+                    .any(|r| r.x == i32::from(m.x) && r.y == i32::from(m.y)) =>
+            {
                 owed.pop_front();
                 paired(raw.id, None);
             }
@@ -151,10 +173,18 @@ mod tests {
     use std::time::Duration;
 
     fn abs(x: i16, y: i16) -> Motion {
-        Motion { relative: false, x, y }
+        Motion {
+            relative: false,
+            x,
+            y,
+        }
     }
     fn rel(x: i16, y: i16) -> Motion {
-        Motion { relative: true, x, y }
+        Motion {
+            relative: true,
+            x,
+            y,
+        }
     }
     fn soon() -> Instant {
         Instant::now() + Duration::from_millis(50)
@@ -229,7 +259,10 @@ mod tests {
             l.push(abs(400, 300));
             l.push(rel(10, 10));
         });
-        assert_eq!(p.kind(&log, id, Instant::now() + Duration::from_secs(5), || true), Some(true));
+        assert_eq!(
+            p.kind(&log, id, Instant::now() + Duration::from_secs(5), || true),
+            Some(true)
+        );
         t.join().unwrap();
         // the earlier one was paired on the way
         assert_eq!(p.kind(&log, first, soon(), || true), None);
@@ -244,7 +277,11 @@ mod tests {
         log.push(rel(2, 2));
         let a = p.saw(1, 1);
         p.settle(&log);
-        assert_eq!(log.moves.lock().unwrap().len(), 1, "the later move waits for its raw motion");
+        assert_eq!(
+            log.moves.lock().unwrap().len(),
+            1,
+            "the later move waits for its raw motion"
+        );
         let b = p.saw(2, 2);
         assert_eq!(p.kind(&log, b, soon(), || true), Some(true));
         assert_eq!(p.kind(&log, a, soon(), || true), None, "already paired");
@@ -256,7 +293,10 @@ mod tests {
         let mut p = Pairing::default();
         let id = p.saw(1, 2);
         let t = Instant::now();
-        assert_eq!(p.kind(&log, id, t + Duration::from_millis(20), || true), None);
+        assert_eq!(
+            p.kind(&log, id, t + Duration::from_millis(20), || true),
+            None
+        );
         assert!(t.elapsed() >= Duration::from_millis(20));
         // and without RECORD running, no waiting at all
         let t = Instant::now();

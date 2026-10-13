@@ -93,7 +93,12 @@ impl Freshness {
     }
 
     pub fn wake_backend(&self) {
-        if let Some(w) = self.waker.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if let Some(w) = self
+            .waker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             w();
         }
     }

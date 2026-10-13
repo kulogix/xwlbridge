@@ -87,7 +87,10 @@ static SOCKET_PATH: AtomicPtr<libc::c_char> = AtomicPtr::new(ptr::null_mut()); /
 /// parent-death signal, and can't): its authority file and RFB socket, and
 /// the private directory holding them. Leaked C strings, null if none.
 #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
-static ENGINE_FILES: [AtomicPtr<libc::c_char>; 2] = [AtomicPtr::new(ptr::null_mut()), AtomicPtr::new(ptr::null_mut())];
+static ENGINE_FILES: [AtomicPtr<libc::c_char>; 2] = [
+    AtomicPtr::new(ptr::null_mut()),
+    AtomicPtr::new(ptr::null_mut()),
+];
 #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
 static ENGINE_DIR: AtomicPtr<libc::c_char> = AtomicPtr::new(ptr::null_mut());
 /// Non-zero once [`shutdown`] runs: the status to exit with instead of the
@@ -238,7 +241,11 @@ fn exit_status(status: Option<&io::Result<std::process::ExitStatus>>) -> i32 {
 
 /// [`exit_status`] given whether a stop was asked for and [`shutdown`]'s
 /// status (0: none).
-fn decide_exit(stopped: bool, forced: i32, status: Option<&io::Result<std::process::ExitStatus>>) -> i32 {
+fn decide_exit(
+    stopped: bool,
+    forced: i32,
+    status: Option<&io::Result<std::process::ExitStatus>>,
+) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if !stopped && forced != 0 {
         return forced;
@@ -296,7 +303,10 @@ pub(crate) fn shutdown(code: i32) -> ! {
     thread::sleep(SHUTDOWN_GRACE);
     let child = CHILD.load(Ordering::SeqCst);
     if child > 0 {
-        crate::warning!("the command didn't exit within {}s; killing it", SHUTDOWN_GRACE.as_secs());
+        crate::warning!(
+            "the command didn't exit within {}s; killing it",
+            SHUTDOWN_GRACE.as_secs()
+        );
         unsafe { libc::kill(child, libc::SIGKILL) };
     }
     loop {
@@ -416,7 +426,9 @@ fn main() {
     let xvfb_engine = config.engine != config::EngineType::Builtin;
     #[cfg(not(feature = "xvfb"))]
     if xvfb_engine {
-        crate::warning!("-engine xvfb/xvnc/xwayland needs xwlbridge built with the \"xvfb\" feature");
+        crate::warning!(
+            "-engine xvfb/xvnc/xwayland needs xwlbridge built with the \"xvfb\" feature"
+        );
         process::exit(2);
     }
     if config.xserver.is_some() && !xvfb_engine {
@@ -431,7 +443,9 @@ fn main() {
         (config.reverseinput, "-reverseinput"),
     ] {
         if set && !xvfb_engine {
-            crate::warning!("{flag} is for -engine xvfb, xvnc or xwayland; ignored with the built-in engine");
+            crate::warning!(
+                "{flag} is for -engine xvfb, xvnc or xwayland; ignored with the built-in engine"
+            );
         }
     }
     // which X server program: resolved now, so a missing (or refused) one stops
@@ -439,11 +453,15 @@ fn main() {
     #[cfg(feature = "xvfb")]
     let xserver = xvfb_engine.then(|| {
         let path = std::env::var_os("PATH");
-        xvfb::resolve_server(config.engine, config.xserver.as_deref().map(std::ffi::OsStr::new), path.as_deref())
-            .unwrap_or_else(|e| {
-                crate::warning!("{e}");
-                process::exit(1);
-            })
+        xvfb::resolve_server(
+            config.engine,
+            config.xserver.as_deref().map(std::ffi::OsStr::new),
+            path.as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            crate::warning!("{e}");
+            process::exit(1);
+        })
     });
     #[cfg_attr(not(feature = "xvfb"), allow(unused_mut))]
     let (mut display, listeners) = if xvfb_engine {
@@ -548,7 +566,10 @@ fn main() {
         wait_for_stop();
         // ours to finish, unless a part died meanwhile and shutdown() is
         // already exiting (as for a stop: see exit_status)
-        if CHILD.compare_exchange(0, CLOSED, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if CHILD
+            .compare_exchange(0, CLOSED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             loop {
                 thread::park();
             }
@@ -578,7 +599,14 @@ fn main() {
     // RealVNC's UI on the desktop's display, and never crashing on the
     // built-in engine's (see uidisplay.rs): its setuid launcher would drop the
     // preload hook, so start the core it launches directly
-    let ui_setup = setup_ui(ui_choice, realvnc, display, &mut program, program_args, &server);
+    let ui_setup = setup_ui(
+        ui_choice,
+        realvnc,
+        display,
+        &mut program,
+        program_args,
+        &server,
+    );
     let mut cmd = Command::new(&program);
     cmd.args(program_args);
     childenv::on_display(&mut cmd, display);
@@ -594,7 +622,10 @@ fn main() {
         cmd.env("AT_SPI_BUS_ADDRESS", addr);
     }
     if let Some(ui) = &ui_setup {
-        let placed = ui.placed.as_ref().map(|(d, gate)| (d, gate.as_ref().map(|g| g.path())));
+        let placed = ui
+            .placed
+            .as_ref()
+            .map(|(d, gate)| (d, gate.as_ref().map(|g| g.path())));
         uidisplay::apply(&mut cmd, &ui.hook, placed);
     }
     if dynres {
@@ -602,7 +633,10 @@ fn main() {
         // RealVNC's "-virtual" check and lets the feature turn on
         cmd.env("FORCE_DYNRES", "1");
     }
-    if CHILD.compare_exchange(0, SPAWNING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    if CHILD
+        .compare_exchange(0, SPAWNING, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         // shutdown() got there first: it exits, and the command never starts
         loop {
             thread::park();
@@ -624,8 +658,14 @@ fn main() {
     CHILD.store(child.id() as i32, Ordering::SeqCst);
     // RealVNC's UI: move it when its display answers (or back if it stops),
     // and restart it if its tray icon helper dies (see uidisplay.rs)
-    let gate_path = ui_setup.as_ref().and_then(|ui| ui.placed.as_ref()?.1.as_ref().map(|g| g.path().to_owned()));
-    if let Some(UiSetup { placed: Some((ui, gate)), .. }) = ui_setup {
+    let gate_path = ui_setup
+        .as_ref()
+        .and_then(|ui| ui.placed.as_ref()?.1.as_ref().map(|g| g.path().to_owned()));
+    if let Some(UiSetup {
+        placed: Some((ui, gate)),
+        ..
+    }) = ui_setup
+    {
         let server = server.clone();
         uidisplay::watch(child.id(), ui, gate, move || server.damage.active());
     }
@@ -698,7 +738,9 @@ fn setup_ui(
         uidisplay::Choice::Display(ui) => Some(ui),
         uidisplay::Choice::Off(why) => {
             if let Some(why) = why {
-                crate::log!("RealVNC's UI stays on the engine display, out of sight ({why}); -uidisplay names a display");
+                crate::log!(
+                    "RealVNC's UI stays on the engine display, out of sight ({why}); -uidisplay names a display"
+                );
             }
             None
         }
@@ -751,7 +793,9 @@ fn setup_ui(
             return None;
         }
         Err(e) => {
-            crate::warning!("-uidisplay: can't write the UI hook ({e}); running {program:?} without -uidisplay");
+            crate::warning!(
+                "-uidisplay: can't write the UI hook ({e}); running {program:?} without -uidisplay"
+            );
             return None;
         }
     };
@@ -766,12 +810,18 @@ fn setup_ui(
         true
     } else {
         if uidisplay::is_setid(program, path.as_deref()) {
-            crate::warning!("{program:?} is set-user/group-ID, which keeps the UI hook from what it starts");
+            crate::warning!(
+                "{program:?} is set-user/group-ID, which keeps the UI hook from what it starts"
+            );
         }
-        std::path::Path::new(program).file_name().is_some_and(|n| n == "vncserver-x11-core")
+        std::path::Path::new(program)
+            .file_name()
+            .is_some_and(|n| n == "vncserver-x11-core")
     };
     let Some(ui) = ui else {
-        crate::log!("RealVNC's UI stays on the built-in engine's display, out of sight (the hook keeps it from crashing there)");
+        crate::log!(
+            "RealVNC's UI stays on the built-in engine's display, out of sight (the hook keeps it from crashing there)"
+        );
         return Some(UiSetup { hook, placed: None });
     };
     let name = ui.display.to_string_lossy().into_owned();
@@ -815,7 +865,9 @@ fn setup_ui(
             let ui = ui.clone();
             thread::spawn(move || {
                 thread::sleep(std::time::Duration::from_secs(20));
-                if let Ok(uidisplay::Probe { tray: None }) = uidisplay::probe(&ui, std::time::Duration::from_secs(5)) {
+                if let Ok(uidisplay::Probe { tray: None }) =
+                    uidisplay::probe(&ui, std::time::Duration::from_secs(5))
+                {
                     crate::log!(
                         "-uidisplay: no system tray on X display {name}, so RealVNC's status icon can't show (on GNOME, \
                          enable the AppIndicator extension, e.g. ubuntu-appindicators@ubuntu.com or \
@@ -827,7 +879,10 @@ fn setup_ui(
         }
         None => {}
     }
-    Some(UiSetup { hook, placed: Some((ui, gate)) })
+    Some(UiSetup {
+        hook,
+        placed: Some((ui, gate)),
+    })
 }
 
 /// Where the stock engines' clipboard goes: relayed with the desktop's
@@ -854,16 +909,23 @@ fn xwayland_clipboard(config: &Config) -> Option<uidisplay::UiDisplay> {
         return None;
     }
     if config.engine == EngineType::Builtin {
-        crate::warning!("-clipboard xwayland needs -engine xvfb or xvnc; using the session clipboard");
+        crate::warning!(
+            "-clipboard xwayland needs -engine xvfb or xvnc; using the session clipboard"
+        );
         return None;
     }
     let arg = config.xwayland.as_deref().unwrap_or("auto");
     match uidisplay::resolve(arg) {
         // our own display, or a stale DISPLAY pointing at one of ours, would relay with itself
-        Ok(d) if config.display.is_some_and(|n| {
-            let s = d.display.to_string_lossy();
-            s.trim_start_matches("unix").trim_start_matches(':').split('.').next() == Some(&n.to_string())
-        }) =>
+        Ok(d)
+            if config.display.is_some_and(|n| {
+                let s = d.display.to_string_lossy();
+                s.trim_start_matches("unix")
+                    .trim_start_matches(':')
+                    .split('.')
+                    .next()
+                    == Some(&n.to_string())
+            }) =>
         {
             crate::warning!(
                 "-xwayland {}: that is the bridge's own display; using the session clipboard",
@@ -881,7 +943,9 @@ fn xwayland_clipboard(config: &Config) -> Option<uidisplay::UiDisplay> {
         }
         Ok(d) => Some(d),
         Err(_) if config.clipboard == ClipboardType::Auto => {
-            crate::log!("no desktop X display to relay the clipboard with (no DISPLAY); using the session clipboard");
+            crate::log!(
+                "no desktop X display to relay the clipboard with (no DISPLAY); using the session clipboard"
+            );
             None
         }
         Err(e) => {
@@ -1038,7 +1102,15 @@ mod tests {
     #[test]
     fn a_stop_that_was_asked_for_exits_0() {
         // the command ended because of the stop: whichever way it says so
-        for st in [exited(0), killed(libc::SIGTERM), killed(libc::SIGINT), killed(libc::SIGHUP), exited(143), exited(130), exited(129)] {
+        for st in [
+            exited(0),
+            killed(libc::SIGTERM),
+            killed(libc::SIGINT),
+            killed(libc::SIGHUP),
+            exited(143),
+            exited(130),
+            exited(129),
+        ] {
             assert_eq!(decide_exit(true, 0, st.as_ref()), 0, "{st:?}");
         }
         // -nowrap
@@ -1053,9 +1125,18 @@ mod tests {
     #[test]
     fn a_failure_during_a_stop_is_still_reported() {
         assert_eq!(decide_exit(true, 0, exited(3).as_ref()), 3);
-        assert_eq!(decide_exit(true, 0, killed(libc::SIGSEGV).as_ref()), 128 + libc::SIGSEGV);
-        assert_eq!(decide_exit(true, 0, killed(libc::SIGKILL).as_ref()), 128 + libc::SIGKILL);
-        assert_eq!(decide_exit(true, 0, Some(Err(io::Error::other("x"))).as_ref()), 1);
+        assert_eq!(
+            decide_exit(true, 0, killed(libc::SIGSEGV).as_ref()),
+            128 + libc::SIGSEGV
+        );
+        assert_eq!(
+            decide_exit(true, 0, killed(libc::SIGKILL).as_ref()),
+            128 + libc::SIGKILL
+        );
+        assert_eq!(
+            decide_exit(true, 0, Some(Err(io::Error::other("x"))).as_ref()),
+            1
+        );
     }
 
     #[test]

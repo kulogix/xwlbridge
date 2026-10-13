@@ -457,7 +457,9 @@ mod tests {
         // a client that sends 32768-65535 requests
         // with no reply in between (XTest input) got its next reply stamped
         // with the last reply's sequence
-        for n in [100u32, 30_000, 40_000, 60_000, 65_533, 65_534, 65_535, 70_000, 200_000] {
+        for n in [
+            100u32, 30_000, 40_000, 60_000, 65_533, 65_534, 65_535, 70_000, 200_000,
+        ] {
             let (a, mut b) = UnixStream::pair().unwrap();
             let client = Client::new(a).unwrap();
             let mut seq = 1u16;
@@ -473,7 +475,11 @@ mod tests {
             let mut got = vec![0u8; 64];
             b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             b.read_exact(&mut got).unwrap();
-            assert_eq!(seq_of(&got[32..]), seq, "after {n} requests without a reply");
+            assert_eq!(
+                seq_of(&got[32..]),
+                seq,
+                "after {n} requests without a reply"
+            );
         }
     }
 
@@ -509,7 +515,9 @@ mod tests {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             assert!(!cmsg.is_null(), "no fd came with the reply");
             assert_eq!((*cmsg).cmsg_type, libc::SCM_RIGHTS);
-            OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>()))
+            OwnedFd::from_raw_fd(std::ptr::read_unaligned(
+                libc::CMSG_DATA(cmsg).cast::<RawFd>(),
+            ))
         };
         assert_eq!((got[0], got[1], seq_of(&got)), (1, 1, 9));
         // it is the same file

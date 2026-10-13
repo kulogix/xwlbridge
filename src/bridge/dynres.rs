@@ -291,8 +291,7 @@ mod tests {
                 let (d, failed) = (d.clone(), failed.clone());
                 std::thread::spawn(move || {
                     for i in 0..60u16 {
-                        if d
-                            .change_mode(1, 640 + t, 480 + i, Duration::from_secs(2))
+                        if d.change_mode(1, 640 + t, 480 + i, Duration::from_secs(2))
                             .is_err()
                         {
                             failed.fetch_add(1, Ordering::Relaxed);
@@ -306,7 +305,11 @@ mod tests {
         }
         stop.store(true, Ordering::Release);
         backend.join().unwrap();
-        assert_eq!(failed.load(Ordering::Relaxed), 0, "requests lost their answer");
+        assert_eq!(
+            failed.load(Ordering::Relaxed),
+            0,
+            "requests lost their answer"
+        );
     }
 
     /// A refusal reaches the requester that asked, with the backend's reason.

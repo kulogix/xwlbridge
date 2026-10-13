@@ -1051,7 +1051,10 @@ pub(crate) mod tests {
                     ! layout\n  us              English (US)\n  gb              English (UK)\n\
                     ! variant\n  chr             us: Cherokee\n  extd            gb: English (UK, extended, with Win keys)\n\
                     ! option\n  grp:switch      Right Alt (while pressed)\n";
-        assert_eq!(layout_described(list, "English (UK)"), Some(("gb".into(), String::new())));
+        assert_eq!(
+            layout_described(list, "English (UK)"),
+            Some(("gb".into(), String::new()))
+        );
         assert_eq!(
             layout_described(list, "English (UK, extended, with Win keys)"),
             Some(("gb".into(), "extd".into()))

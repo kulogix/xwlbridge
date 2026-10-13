@@ -172,7 +172,8 @@ impl ArgEnum for PwrMgrType {
 }
 
 impl ArgEnum for ClipboardType {
-    const VARIANTS: &'static [&'static str] = &["auto", "none", "wlr", "ext", "session", "xwayland"];
+    const VARIANTS: &'static [&'static str] =
+        &["auto", "none", "wlr", "ext", "session", "xwayland"];
     fn from_arg(s: &str) -> Option<Self> {
         Some(match s.to_ascii_lowercase().as_str() {
             "auto" => Self::Auto,
@@ -200,7 +201,10 @@ impl std::str::FromStr for Warm {
         if s.eq_ignore_ascii_case("always") {
             return Ok(Warm::Always);
         }
-        s.trim().parse().map(Warm::Secs).map_err(|_| "expected seconds or \"always\"".to_string())
+        s.trim()
+            .parse()
+            .map(Warm::Secs)
+            .map_err(|_| "expected seconds or \"always\"".to_string())
     }
 }
 
@@ -349,7 +353,9 @@ impl Config {
         crate::bridge::input::InputPolicy {
             persist: self.xtestpersist,
             linger: std::time::Duration::from_millis(
-                self.xtestgrace.unwrap_or(crate::bridge::input::LINGER_DEFAULT_MS).into(),
+                self.xtestgrace
+                    .unwrap_or(crate::bridge::input::LINGER_DEFAULT_MS)
+                    .into(),
             ),
             owner_timeout: std::time::Duration::from_secs(self.pointerowner.unwrap_or(10).into()),
             view_only: self.viewonly,
@@ -363,7 +369,10 @@ impl Config {
     /// Whose injected input reaches the desktop (`-xtesthelpers`,
     /// `-xtestdrivers`).
     pub fn xtest_rules(&self) -> crate::bridge::injectors::Rules {
-        crate::bridge::injectors::Rules::new(self.xtesthelpers.as_deref(), self.xtestdrivers.as_deref())
+        crate::bridge::injectors::Rules::new(
+            self.xtesthelpers.as_deref(),
+            self.xtestdrivers.as_deref(),
+        )
     }
 
     /// `-warm`, with its default; `-alwayson` is `-warm always`.

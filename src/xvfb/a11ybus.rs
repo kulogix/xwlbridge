@@ -93,7 +93,11 @@ pub fn start(dir: &Path, display: u32) -> io::Result<Bus> {
     let child = cmd
         .spawn()
         .map_err(|e| io::Error::new(e.kind(), format!("can't start dbus-daemon: {e}")))?;
-    let mut bus = Bus { child, socket, address };
+    let mut bus = Bus {
+        child,
+        socket,
+        address,
+    };
     let deadline = Instant::now() + READY;
     while !bus.socket.exists() {
         if let Ok(Some(status)) = bus.child.try_wait() {
@@ -114,10 +118,15 @@ mod tests {
     #[test]
     fn the_bus_lives_in_the_given_directory() {
         let Some(_) = config() else { return }; // at-spi2-core not installed here
-        if Command::new("dbus-daemon").arg("--version").output().is_err() {
+        if Command::new("dbus-daemon")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("xwlbridge-a11ybus-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("xwlbridge-a11ybus-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         {
             let bus = start(&dir, 99).unwrap();
@@ -125,7 +134,10 @@ mod tests {
             assert!(bus.address.ends_with("/a11y-bus"));
             assert!(dir.join("a11y-bus").exists());
         }
-        assert!(!dir.join("a11y-bus").exists(), "the socket goes with the bus");
+        assert!(
+            !dir.join("a11y-bus").exists(),
+            "the socket goes with the bus"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

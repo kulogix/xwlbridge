@@ -56,7 +56,11 @@ fn install_hint(engine: EngineType) -> &'static str {
 /// The X server binary to run for `engine`: `explicit` (`-xserver`), or the
 /// first acceptable one on `path` (`PATH`). The error says what was found,
 /// why it was refused, and what to install.
-pub fn resolve(engine: EngineType, explicit: Option<&OsStr>, path: Option<&OsStr>) -> Result<PathBuf, String> {
+pub fn resolve(
+    engine: EngineType,
+    explicit: Option<&OsStr>,
+    path: Option<&OsStr>,
+) -> Result<PathBuf, String> {
     let names: &[&str] = match engine {
         EngineType::Xvnc => &["Xtigervnc", "Xvnc"],
         EngineType::Xvfb => &["Xvfb"],
@@ -83,9 +87,16 @@ pub fn resolve(engine: EngineType, explicit: Option<&OsStr>, path: Option<&OsStr
         _ => "-engine xvfb needs Xvfb",
     };
     if refused.is_empty() {
-        Err(format!("{what}, which isn't installed; {}", install_hint(engine)))
+        Err(format!(
+            "{what}, which isn't installed; {}",
+            install_hint(engine)
+        ))
     } else {
-        Err(format!("{what}; refused {}; {}", refused.join(", "), install_hint(engine)))
+        Err(format!(
+            "{what}; refused {}; {}",
+            refused.join(", "),
+            install_hint(engine)
+        ))
     }
 }
 
@@ -131,13 +142,22 @@ fn check(candidate: &Path, engine: EngineType) -> Result<PathBuf, String> {
         EngineType::Xvnc if tiger => Ok(real),
         EngineType::Xvnc if realvnc => Err("RealVNC's Xvnc, not TigerVNC's".into()),
         EngineType::Xvnc => Err("not TigerVNC's Xvnc (no TigerVNC version banner)".into()),
-        _ if realvnc && !tiger => Err(format!("RealVNC's X server, not {}", if engine == EngineType::Xwayland { "Xwayland" } else { "Xvfb" })),
+        _ if realvnc && !tiger => Err(format!(
+            "RealVNC's X server, not {}",
+            if engine == EngineType::Xwayland {
+                "Xwayland"
+            } else {
+                "Xvfb"
+            }
+        )),
         _ => Ok(real),
     }
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
-    let Some((&first, rest)) = needle.split_first() else { return true };
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
     let mut at = 0;
     while let Some(i) = hay[at..].iter().position(|&b| b == first) {
         let start = at + i + 1;
@@ -164,7 +184,8 @@ mod tests {
         }
     }
     fn dir(tag: &str) -> Dir {
-        let d = std::env::temp_dir().join(format!("xwlbridge-xserver-{tag}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("xwlbridge-xserver-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         Dir(d)
@@ -242,16 +263,29 @@ mod tests {
         let real = exe(&a.0, "Xvnc", REAL, 0o4755);
         let tiger = exe(&a.0, "my-xvnc", TIGER, 0o755);
         let e = resolve(EngineType::Xvnc, Some(real.as_os_str()), None).unwrap_err();
-        assert!(e.starts_with(&format!("-xserver {}:", real.display())), "{e}");
-        assert_eq!(resolve(EngineType::Xvnc, Some(tiger.as_os_str()), None), Ok(canon(&tiger)));
+        assert!(
+            e.starts_with(&format!("-xserver {}:", real.display())),
+            "{e}"
+        );
+        assert_eq!(
+            resolve(EngineType::Xvnc, Some(tiger.as_os_str()), None),
+            Ok(canon(&tiger))
+        );
         // a bare name is looked up on the path
         let p = path(&[&a.0]);
-        assert_eq!(resolve(EngineType::Xvnc, Some(OsStr::new("my-xvnc")), Some(&p)), Ok(canon(&tiger)));
+        assert_eq!(
+            resolve(EngineType::Xvnc, Some(OsStr::new("my-xvnc")), Some(&p)),
+            Ok(canon(&tiger))
+        );
         let e = resolve(EngineType::Xvnc, Some(OsStr::new("nonesuch")), Some(&p)).unwrap_err();
         assert!(e.contains("no such program"), "{e}");
         // not executable
         let plain = exe(&a.0, "plain", TIGER, 0o644);
-        assert!(resolve(EngineType::Xvnc, Some(plain.as_os_str()), None).unwrap_err().contains("not executable"));
+        assert!(
+            resolve(EngineType::Xvnc, Some(plain.as_os_str()), None)
+                .unwrap_err()
+                .contains("not executable")
+        );
     }
 
     #[test]
@@ -259,13 +293,24 @@ mod tests {
         let a = dir("xvfb");
         let p = path(&[&a.0]);
         let e = resolve(EngineType::Xvfb, None, Some(&p)).unwrap_err();
-        assert!(e.contains("isn't installed") && e.contains("apt install xvfb"), "{e}");
+        assert!(
+            e.contains("isn't installed") && e.contains("apt install xvfb"),
+            "{e}"
+        );
         let xvfb = exe(&a.0, "Xvfb", b"\x7fELF Xvfb", 0o755);
         assert_eq!(resolve(EngineType::Xvfb, None, Some(&p)), Ok(canon(&xvfb)));
         fs::set_permissions(&xvfb, fs::Permissions::from_mode(0o2755)).unwrap();
-        assert!(resolve(EngineType::Xvfb, None, Some(&p)).unwrap_err().contains("set-user-ID"));
+        assert!(
+            resolve(EngineType::Xvfb, None, Some(&p))
+                .unwrap_err()
+                .contains("set-user-ID")
+        );
         let real = exe(&a.0, "rv", REAL, 0o755);
-        assert!(resolve(EngineType::Xvfb, Some(real.as_os_str()), None).unwrap_err().contains("RealVNC"));
+        assert!(
+            resolve(EngineType::Xvfb, Some(real.as_os_str()), None)
+                .unwrap_err()
+                .contains("RealVNC")
+        );
     }
 
     #[test]
@@ -273,17 +318,30 @@ mod tests {
         let a = dir("xwayland");
         let p = path(&[&a.0]);
         let e = resolve(EngineType::Xwayland, None, Some(&p)).unwrap_err();
-        assert!(e.contains("isn't installed") && e.contains("apt install xwayland"), "{e}");
+        assert!(
+            e.contains("isn't installed") && e.contains("apt install xwayland"),
+            "{e}"
+        );
         let xw = exe(&a.0, "Xwayland", b"\x7fELF Xwayland", 0o755);
-        assert_eq!(resolve(EngineType::Xwayland, None, Some(&p)), Ok(canon(&xw)));
+        assert_eq!(
+            resolve(EngineType::Xwayland, None, Some(&p)),
+            Ok(canon(&xw))
+        );
         fs::set_permissions(&xw, fs::Permissions::from_mode(0o4755)).unwrap();
-        assert!(resolve(EngineType::Xwayland, None, Some(&p)).unwrap_err().contains("set-user-ID"));
+        assert!(
+            resolve(EngineType::Xwayland, None, Some(&p))
+                .unwrap_err()
+                .contains("set-user-ID")
+        );
     }
 
     #[test]
     fn nothing_installed() {
         let e = resolve(EngineType::Xvnc, None, None).unwrap_err();
-        assert!(e.contains("isn't installed") && e.contains("-xserver PATH"), "{e}");
+        assert!(
+            e.contains("isn't installed") && e.contains("-xserver PATH"),
+            "{e}"
+        );
     }
 
     #[test]

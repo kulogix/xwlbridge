@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 use x11rb::protocol::res;
 use x11rb::rust_connection::RustConnection;
 
-use crate::bridge::input::MOTION_NOTIFY;
 pub use crate::bridge::injectors::{Class, Rules};
+use crate::bridge::input::MOTION_NOTIFY;
 
 /// Requests older than this (server time) can't be the source of an event
 /// being handled now: the X server turns a FakeInput into input at once.
@@ -185,7 +185,11 @@ impl Ledger {
             if now >= deadline {
                 return false;
             }
-            st = self.cond.wait_timeout(st, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
+            st = self
+                .cond
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
         st.markers >= n
     }
@@ -216,15 +220,34 @@ mod tests {
     use std::sync::Arc;
 
     fn who(base: u32, class: Class) -> Arc<Who> {
-        Arc::new(Who { base, class, name: "t".into(), program: "t".into(), pid: None })
+        Arc::new(Who {
+            base,
+            class,
+            name: "t".into(),
+            program: "t".into(),
+            pid: None,
+        })
     }
 
     fn fake(w: &Arc<Who>, type_: u8, detail: u8, x: i16, y: i16, time: u32) -> Fake {
-        Fake { who: w.clone(), type_, detail, x, y, time }
+        Fake {
+            who: w.clone(),
+            type_,
+            detail,
+            x,
+            y,
+            time,
+        }
     }
 
     fn sig(type_: u8, detail: u8, time: u32, xy: Option<(i32, i32)>) -> Sig {
-        Sig { type_, detail, time, xy, xy_raw: None }
+        Sig {
+            type_,
+            detail,
+            time,
+            xy,
+            xy_raw: None,
+        }
     }
 
     #[test]
@@ -247,9 +270,14 @@ mod tests {
         l.push(fake(&a, KEY_RELEASE, 40, 0, 0, 100));
         l.push(fake(&b, MOTION_NOTIFY, 0, 600, 300, 101));
         l.push(fake(&b, BUTTON_PRESS, 1, 0, 0, 101));
-        let m = l.take(&sig(MOTION_NOTIFY, 0, 101, Some((600, 300)))).unwrap();
+        let m = l
+            .take(&sig(MOTION_NOTIFY, 0, 101, Some((600, 300))))
+            .unwrap();
         assert_eq!(m.who.base, 2);
-        assert_eq!(l.take(&sig(BUTTON_PRESS, 1, 101, None)).unwrap().who.base, 2);
+        assert_eq!(
+            l.take(&sig(BUTTON_PRESS, 1, 101, None)).unwrap().who.base,
+            2
+        );
         assert_eq!(l.len(), 0);
     }
 
@@ -268,7 +296,13 @@ mod tests {
         let a = who(1, Class::Other);
         let l = Ledger::default();
         l.push(fake(&a, MOTION_NOTIFY, 1, 5, -3, 100));
-        let s = Sig { type_: MOTION_NOTIFY, detail: 0, time: 100, xy: Some((645, 357)), xy_raw: Some((5, -3)) };
+        let s = Sig {
+            type_: MOTION_NOTIFY,
+            detail: 0,
+            time: 100,
+            xy: Some((645, 357)),
+            xy_raw: Some((5, -3)),
+        };
         assert!(l.take(&s).is_some());
     }
 
@@ -277,7 +311,10 @@ mod tests {
         let a = who(1, Class::Helper);
         let l = Ledger::default();
         l.push(fake(&a, KEY_PRESS, 38, 0, 0, 100));
-        assert!(l.take(&sig(KEY_PRESS, 38, 100 + STALE_MS + 1, None)).is_none());
+        assert!(
+            l.take(&sig(KEY_PRESS, 38, 100 + STALE_MS + 1, None))
+                .is_none()
+        );
         assert_eq!(l.len(), 0);
         // and the server clock wrapping around is not "stale"
         l.push(fake(&a, KEY_PRESS, 38, 0, 0, u32::MAX - 5));

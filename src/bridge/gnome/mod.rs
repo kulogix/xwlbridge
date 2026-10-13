@@ -191,7 +191,9 @@ fn session_bus() -> zbus::Result<Connection> {
 /// up would serve a blank screen with no input that no service manager ever
 /// restarts; this way `Restart=on-failure` tries again.
 fn give_up(why: &str) -> ! {
-    crate::warning!("gnome: {why}; exiting (status {EXIT_UNAVAILABLE}) so the service can try again");
+    crate::warning!(
+        "gnome: {why}; exiting (status {EXIT_UNAVAILABLE}) so the service can try again"
+    );
     crate::remove_display_socket();
     std::process::exit(EXIT_UNAVAILABLE)
 }
@@ -228,12 +230,17 @@ pub fn spawn(server: Arc<Server>) {
     // input from an X client that only injects starts a session too (and
     // waits for its devices)
     let input_wake = wake.clone();
-    server.input.set_on_demand(Box::new(move || input_wake.wake()));
+    server
+        .input
+        .set_on_demand(Box::new(move || input_wake.wake()));
     // a client reading the screen (or connecting to a stock engine) while
     // there is no session wakes us at once, and may wait for the first frame
     // (`-coldwait`, see crate::bridge::fresh)
     let fresh_wake = wake.clone();
-    server.framebuffer.fresh.manage(Box::new(move || fresh_wake.wake()));
+    server
+        .framebuffer
+        .fresh
+        .manage(Box::new(move || fresh_wake.wake()));
     // PipeWire's objects can't cross threads, so the backend is built on its
     // own thread; we wait for it to load the layout and keymap so the X server
     // reports them from the start.
@@ -405,8 +412,12 @@ fn cursor_metadata_unsafe(conn: &Connection, record_monitor: bool) -> bool {
     let major = dbus::mutter_major(conn);
     let unsafe_ = !record_monitor && major.is_none_or(|m| m < 47);
     match (major, unsafe_) {
-        (Some(m), true) => crate::log!("gnome: mutter {m}: drawing the cursor into frames (its cursor metadata is unsafe here)"),
-        (None, true) => crate::log!("gnome: can't tell mutter's version: drawing the cursor into frames to be safe"),
+        (Some(m), true) => crate::log!(
+            "gnome: mutter {m}: drawing the cursor into frames (its cursor metadata is unsafe here)"
+        ),
+        (None, true) => crate::log!(
+            "gnome: can't tell mutter's version: drawing the cursor into frames to be safe"
+        ),
         (Some(m), false) => crate::vlog!("gnome: mutter {m}"),
         (None, false) => {}
     }
@@ -414,7 +425,12 @@ fn cursor_metadata_unsafe(conn: &Connection, record_monitor: bool) -> bool {
 }
 
 impl Backend {
-    fn new(server: Arc<Server>, conn: Connection, signals: Receiver<Signal>, wake: Arc<Wake>) -> Self {
+    fn new(
+        server: Arc<Server>,
+        conn: Connection,
+        signals: Receiver<Signal>,
+        wake: Arc<Wake>,
+    ) -> Self {
         let config = &server.config;
         let mut dynres = config.outmgr_wants_gnome();
         if dynres && !display::apply_allowed(&conn) {
@@ -523,20 +539,18 @@ impl Backend {
                 .as_ref()
                 .and_then(|a| a.eis.as_ref())
                 .map(|e| e.shared.poll_needs());
-            let eis_idx = self
-                .active
-                .as_ref()
-                .and_then(|a| a.eis.as_ref())
-                .map(|e| {
-                    let blocked = eis_out.is_some_and(|(b, _)| b);
-                    fds.push(libc::pollfd {
-                        fd: e.fd(),
-                        events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 },
-                        revents: 0,
-                    });
-                    fds.len() - 1
+            let eis_idx = self.active.as_ref().and_then(|a| a.eis.as_ref()).map(|e| {
+                let blocked = eis_out.is_some_and(|(b, _)| b);
+                fds.push(libc::pollfd {
+                    fd: e.fd(),
+                    events: libc::POLLIN | if blocked { libc::POLLOUT } else { 0 },
+                    revents: 0,
                 });
-            let clip_idx = (self.active.as_ref().is_some_and(|a| a.clip.is_some()) || self.idle_clip.is_some()).then(|| {
+                fds.len() - 1
+            });
+            let clip_idx = (self.active.as_ref().is_some_and(|a| a.clip.is_some())
+                || self.idle_clip.is_some())
+            .then(|| {
                 fds.push(libc::pollfd {
                     fd: self.server.clipboard.jobs().wake_fd(),
                     events: libc::POLLIN,
@@ -575,7 +589,10 @@ impl Backend {
             let mut timeout = if settling { 10 } else { 100 };
             let deadline = eis_out.and_then(|(_, d)| d);
             if let Some(d) = deadline {
-                let ms = d.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000);
+                let ms = d
+                    .saturating_duration_since(Instant::now())
+                    .as_micros()
+                    .div_ceil(1000);
                 timeout = timeout.min(ms as i32);
             }
             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
@@ -616,7 +633,8 @@ impl Backend {
             {
                 self.dispatch_eis(); // (pumps too)
             } else if let Some(i) = eis_idx
-                && (fds[i].revents & libc::POLLOUT != 0 || deadline.is_some_and(|d| Instant::now() >= d))
+                && (fds[i].revents & libc::POLLOUT != 0
+                    || deadline.is_some_and(|d| Instant::now() >= d))
                 && let Some(e) = self.active.as_ref().and_then(|a| a.eis.as_ref())
             {
                 e.shared.pump();
@@ -673,9 +691,9 @@ impl Backend {
         let fb = &self.server.framebuffer;
         let wanted = match self.server.config.warm() {
             // `<=`: with -warm 0, wanted exactly while watched
-            crate::config::Warm::Secs(s) => {
-                self.last_watched.is_some_and(|t| now - t <= Duration::from_secs(s.into()))
-            }
+            crate::config::Warm::Secs(s) => self
+                .last_watched
+                .is_some_and(|t| now - t <= Duration::from_secs(s.into())),
             crate::config::Warm::Always => true,
         } || fb.oneshot_within(self.server.config.linger().as_millis() as u64)
             || fb.prefetch_within(PREFETCH_MS);
@@ -704,7 +722,10 @@ impl Backend {
             Some(a) if a.broken.is_some() => {}
             Some(_) if !wanted => {
                 self.stop_session("nobody is watching");
-                crate::bridge::placeholder::paint(&self.server, crate::bridge::placeholder::Kind::Idle);
+                crate::bridge::placeholder::paint(
+                    &self.server,
+                    crate::bridge::placeholder::Kind::Idle,
+                );
             }
             Some(a) if !a.healthy => {
                 // capture never came up: something else in the PipeWire graph
@@ -736,14 +757,19 @@ impl Backend {
     /// can't start for now.
     fn report_liveness(&mut self) {
         let live = self.active.as_ref().is_some_and(|a| {
-            a.pending.is_empty() && !a.captures.is_empty() && a.captures.iter().all(|c| c.state.borrow().frames > 0)
+            a.pending.is_empty()
+                && !a.captures.is_empty()
+                && a.captures.iter().all(|c| c.state.borrow().frames > 0)
         });
         let fresh = &self.server.framebuffer.fresh;
         if live
             && !fresh.is_live()
             && let Some(a) = self.active.as_ref()
         {
-            crate::vlog!("gnome: capture live {} ms after the session started", a.started.elapsed().as_millis());
+            crate::vlog!(
+                "gnome: capture live {} ms after the session started",
+                a.started.elapsed().as_millis()
+            );
         }
         fresh.set_live(live);
         // the local user stopped sharing, the screen is locked (or gnome-shell
@@ -752,7 +778,10 @@ impl Backend {
         // out -coldwait for nothing
         let backing_off = self.active.is_none() && self.retry_at > Instant::now();
         fresh.set_unavailable(
-            self.stopped_by_user || self.locked_logged || self.closed_pending.is_some() || backing_off,
+            self.stopped_by_user
+                || self.locked_logged
+                || self.closed_pending.is_some()
+                || backing_off,
         );
     }
 
@@ -777,8 +806,10 @@ impl Backend {
     /// selections are relayed with the desktop's Xwayland instead (which
     /// needs no session).
     fn clipboard_off(&self) -> bool {
-        matches!(self.server.config.clipboard, crate::config::ClipboardType::None)
-            || self.server.xwayland_clip.is_some()
+        matches!(
+            self.server.config.clipboard,
+            crate::config::ClipboardType::None
+        ) || self.server.xwayland_clip.is_some()
     }
 
     /// Makes the [`ClipWatch`](clip::ClipWatch) if there is none, when it is
@@ -793,7 +824,10 @@ impl Backend {
         }
         match clip::ClipWatch::start(&self.conn) {
             Ok(w) => {
-                crate::vlog!("gnome: watching for GNOME clipboard changes between sessions ({})", w.path);
+                crate::vlog!(
+                    "gnome: watching for GNOME clipboard changes between sessions ({})",
+                    w.path
+                );
                 self.clip_watch = Some(w);
                 self.clip_watch_retry = Some(now);
             }
@@ -801,7 +835,13 @@ impl Backend {
                 if !dbus::is_inhibited(&e) {
                     crate::vlog!("gnome: can't watch GNOME's clipboard yet: {e}");
                 }
-                self.clip_watch_retry = Some(now + if dbus::is_inhibited(&e) { RETRY_WATCH } else { RETRY_ERROR * 10 });
+                self.clip_watch_retry = Some(
+                    now + if dbus::is_inhibited(&e) {
+                        RETRY_WATCH
+                    } else {
+                        RETRY_ERROR * 10
+                    },
+                );
             }
             Err(clip::WatchError::Clipboard(e)) => {
                 crate::warning!(
@@ -850,7 +890,9 @@ impl Backend {
             self.gnome_clip_changed,
         ) {
             Some(c) => {
-                crate::vlog!("gnome: -showwindows: clipboard bridged while no session runs ({path})");
+                crate::vlog!(
+                    "gnome: -showwindows: clipboard bridged while no session runs ({path})"
+                );
                 self.idle_clip = Some(c);
                 self.idle_clip_since = self.clip_generation;
             }
@@ -921,7 +963,13 @@ impl Backend {
                 }
             }
         }
-        match Session::start(&self.conn, &self.monitors, self.baked_cursor, true, self.server.config.recordmonitor) {
+        match Session::start(
+            &self.conn,
+            &self.monitors,
+            self.baked_cursor,
+            true,
+            self.server.config.recordmonitor,
+        ) {
             Ok(mut session) => {
                 // the bus answers: whatever failed before, it isn't gone
                 self.bus_lost = None;
@@ -1031,7 +1079,11 @@ impl Backend {
                 active.started.elapsed().as_secs_f32()
             );
             if active.clip.is_some() {
-                self.clip_generation = Some(self.server.clipboard.generation(crate::bridge::clipboard::Sel::Clipboard));
+                self.clip_generation = Some(
+                    self.server
+                        .clipboard
+                        .generation(crate::bridge::clipboard::Sel::Clipboard),
+                );
                 self.clip_ended = Some(Instant::now());
             }
             self.server.input.clear_devices();
@@ -1068,14 +1120,18 @@ impl Backend {
                     self.classify_close();
                 }
                 if self.idle_clip_path.as_deref() == Some(path.as_str()) {
-                    crate::vlog!("gnome: -showwindows: the clipboard's session was closed; it is made again when mutter allows");
+                    crate::vlog!(
+                        "gnome: -showwindows: the clipboard's session was closed; it is made again when mutter allows"
+                    );
                     self.idle_clip = None;
                     self.idle_clip_path = None;
                     self.idle_clip_retry = Some(Instant::now() + RETRY_WATCH);
                 }
                 if self.clip_watch.as_ref().is_some_and(|w| w.path == path) {
                     // with every other session, on the lock screen
-                    crate::vlog!("gnome: the clipboard watch was closed; it is made again when mutter allows");
+                    crate::vlog!(
+                        "gnome: the clipboard watch was closed; it is made again when mutter allows"
+                    );
                     self.clip_watch = None;
                     self.clip_watch_retry = Some(Instant::now() + RETRY_WATCH);
                 }
@@ -1120,10 +1176,15 @@ impl Backend {
                 {
                     // a session's clipboard hears of changes itself; right
                     // after one goes, the change is its source going
-                    let live = self.active.as_ref().is_some_and(|a| a.clip.is_some()) || self.idle_clip.is_some();
-                    let teardown = self.clip_ended.is_some_and(|t| at.saturating_duration_since(t) < CLIP_TEARDOWN);
+                    let live = self.active.as_ref().is_some_and(|a| a.clip.is_some())
+                        || self.idle_clip.is_some();
+                    let teardown = self
+                        .clip_ended
+                        .is_some_and(|t| at.saturating_duration_since(t) < CLIP_TEARDOWN);
                     if !live && !teardown && !session_is_owner && w.is_change(at) {
-                        crate::cliplog!("gnome: GNOME's CLIPBOARD changed while no session runs ({mimes:?})");
+                        crate::cliplog!(
+                            "gnome: GNOME's CLIPBOARD changed while no session runs ({mimes:?})"
+                        );
                         self.gnome_clip_changed = Some(at);
                     }
                     return;
@@ -1238,7 +1299,8 @@ impl Backend {
             self.apply_outputs(true);
         }
         if lost && let Some(a) = self.active.as_mut() {
-            a.broken.get_or_insert((Instant::now(), "a capture stream ended"));
+            a.broken
+                .get_or_insert((Instant::now(), "a capture stream ended"));
         }
     }
 
@@ -1258,7 +1320,9 @@ impl Backend {
             self.server.input.clear_devices();
             // a session without input is no use: unless mutter closes it
             // (lock, user's stop), it is recreated after BROKEN_GRACE
-            active.broken.get_or_insert((Instant::now(), "the input connection closed"));
+            active
+                .broken
+                .get_or_insert((Instant::now(), "the input connection closed"));
             return;
         }
         // the keymap and the layout in effect first, so input waiting for the
@@ -1294,7 +1358,9 @@ impl Backend {
         let ready_at = *active.eis_ready_at.get_or_insert_with(Instant::now);
         let settled = match self.keymap_watch.as_ref() {
             // the seat's keyboard as every app sees it
-            Some(k) => k.keyboard_since().is_some_and(|t| t.elapsed() >= KEYBOARD_SETTLE),
+            Some(k) => k
+                .keyboard_since()
+                .is_some_and(|t| t.elapsed() >= KEYBOARD_SETTLE),
             // can't see the seat: give apps the same time from our devices
             None => ready_at.elapsed() >= KEYBOARD_SETTLE,
         };
@@ -1310,7 +1376,11 @@ impl Backend {
         crate::vlog!(
             "gnome: input devices ready ({} ms after EIS{})",
             ready_at.elapsed().as_millis(),
-            if settled { "" } else { "; the seat's keyboard never settled" }
+            if settled {
+                ""
+            } else {
+                "; the seat's keyboard never settled"
+            }
         );
         self.arm_input_keymap();
     }
@@ -1342,7 +1412,9 @@ impl Backend {
                 }
                 // the keysym's own key now, if it needs no modifiers there
                 // (the client holds the ones it pressed for its level)
-                t.plan(sym, shortcut).filter(|(_, mods)| mods.is_empty()).map(|(k, _)| k)
+                t.plan(sym, shortcut)
+                    .filter(|(_, mods)| mods.is_empty())
+                    .map(|(k, _)| k)
             });
         }
     }
@@ -1391,8 +1463,7 @@ impl Backend {
             }
             *self.server.keymap.lock().unwrap() = Some(table);
             crate::log!("gnome: {what}");
-            let count =
-                crate::bridge::keymap::MAX_KEYCODE - crate::bridge::keymap::MIN_KEYCODE + 1;
+            let count = crate::bridge::keymap::MAX_KEYCODE - crate::bridge::keymap::MIN_KEYCODE + 1;
             self.server.events.keyboard_mapping_changed(
                 crate::bridge::keymap::MIN_KEYCODE,
                 count,
@@ -1452,7 +1523,10 @@ impl Backend {
         );
         self.stopped_by_user = true;
         if self.active.is_none() {
-            crate::bridge::placeholder::paint(&self.server, crate::bridge::placeholder::Kind::Stopped);
+            crate::bridge::placeholder::paint(
+                &self.server,
+                crate::bridge::placeholder::Kind::Stopped,
+            );
             self.placeholder_shown = false; // a lock must still replace it
         }
     }
@@ -1490,7 +1564,10 @@ impl Backend {
 
     fn show_locked_placeholder(&mut self) {
         if !self.placeholder_shown && self.active.is_none() {
-            crate::bridge::placeholder::paint(&self.server, crate::bridge::placeholder::Kind::Locked);
+            crate::bridge::placeholder::paint(
+                &self.server,
+                crate::bridge::placeholder::Kind::Locked,
+            );
             self.placeholder_shown = true;
             crate::vlog!("gnome: showing the locked placeholder");
         }

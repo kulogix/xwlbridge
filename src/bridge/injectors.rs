@@ -76,7 +76,11 @@ impl Rules {
         let all_drivers = drivers.is_some_and(|d| d.split(',').any(|n| n.trim() == "all"));
         Rules {
             helpers: parse_list(helpers, DEFAULT_HELPERS),
-            drivers: if all_drivers { Vec::new() } else { parse_list(drivers, DEFAULT_DRIVERS) },
+            drivers: if all_drivers {
+                Vec::new()
+            } else {
+                parse_list(drivers, DEFAULT_DRIVERS)
+            },
             all_drivers,
         }
     }
@@ -123,7 +127,9 @@ pub fn process_names(pid: u32) -> Vec<String> {
         add(basename(exe.trim_end_matches(" (deleted)")));
     }
     if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let mut args = cmdline.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned());
+        let mut args = cmdline
+            .split(|&b| b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned());
         if let Some(argv0) = args.next() {
             let a0 = basename(&argv0).to_string();
             add(&a0);
@@ -157,7 +163,10 @@ mod tests {
         assert_eq!(r.classify(&["x11vnc".into()]), Class::Driver);
         assert!(!r.has_helpers());
         let r = Rules::new(Some("tray, xdotool"), Some("all"));
-        assert_eq!(r.classify(&["python3".into(), "xdotool".into()]), Class::Helper);
+        assert_eq!(
+            r.classify(&["python3".into(), "xdotool".into()]),
+            Class::Helper
+        );
         assert_eq!(r.classify(&["anything".into()]), Class::Driver);
         let r = Rules::new(Some(""), Some("none"));
         assert_eq!(r.classify(&["x11vnc".into()]), Class::Other);
@@ -175,5 +184,4 @@ mod tests {
         assert!(!names.is_empty());
         assert!(process_names(u32::MAX).is_empty());
     }
-
 }

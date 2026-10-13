@@ -25,7 +25,10 @@ fn main() {
     ])
     .arg(out.join("libxwlbridge_uihook.so"))
     .arg("uihook/uihook.rs");
-    let linker_var = format!("CARGO_TARGET_{}_LINKER", target.to_uppercase().replace(['-', '.'], "_"));
+    let linker_var = format!(
+        "CARGO_TARGET_{}_LINKER",
+        target.to_uppercase().replace(['-', '.'], "_")
+    );
     println!("cargo:rerun-if-env-changed={linker_var}");
     if let Some(linker) = env::var_os(&linker_var) {
         let mut arg = std::ffi::OsString::from("-Clinker=");
@@ -33,7 +36,8 @@ fn main() {
         cmd.arg(arg);
     }
     // a wrapper (sccache and the like) is for crates cargo builds, not this
-    cmd.env_remove("RUSTC_WRAPPER").env_remove("RUSTC_WORKSPACE_WRAPPER");
+    cmd.env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
     let status = cmd.status().expect("run rustc for uihook");
     assert!(status.success(), "building uihook/uihook.rs failed");
 }

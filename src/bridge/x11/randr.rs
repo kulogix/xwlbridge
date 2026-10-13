@@ -711,7 +711,11 @@ impl Screen {
                         && m.info.height == height
                         && (!m.ours || refresh_mhz == 0 || m.info.dot_clock == want_clock)
                 };
-                let same_mode = self.modes.iter().find(|m| m.info.id == o.mode).is_some_and(fits);
+                let same_mode = self
+                    .modes
+                    .iter()
+                    .find(|m| m.info.id == o.mode)
+                    .is_some_and(fits);
                 let unchanged = o.lx == lx
                     && o.ly == ly
                     && o.lw == lw
@@ -730,7 +734,12 @@ impl Screen {
                     .iter()
                     .copied()
                     .filter(|&id| !self.is_listed(id))
-                    .find(|&id| self.modes.iter().find(|m| m.info.id == id).is_some_and(fits));
+                    .find(|&id| {
+                        self.modes
+                            .iter()
+                            .find(|m| m.info.id == id)
+                            .is_some_and(fits)
+                    });
                 let mode = if same_mode {
                     self.outputs[i].mode
                 } else if let Some(id) = listed {
@@ -943,7 +952,9 @@ mod tests {
         assert_eq!(s.primary_output(), second);
         let mons = s.monitors();
         assert_eq!(
-            mons.iter().map(|m| (m.name.as_slice(), m.primary)).collect::<Vec<_>>(),
+            mons.iter()
+                .map(|m| (m.name.as_slice(), m.primary))
+                .collect::<Vec<_>>(),
             vec![(&b"HEADLESS-1"[..], false), (&b"HEADLESS-2"[..], true)]
         );
         // the primary output goes away: the first active one stands in
@@ -1217,7 +1228,10 @@ mod tests {
         assert_eq!((identity[0][0], identity[0][255]), (0, 65535));
         let half: Vec<u16> = identity[0].iter().map(|v| v / 2).collect();
         assert_eq!(s.set_gamma(crtc, &half, &identity[1], &half), Ok(()));
-        assert_eq!(s.gamma(crtc), [half.clone(), identity[1].clone(), half.clone()]);
+        assert_eq!(
+            s.gamma(crtc),
+            [half.clone(), identity[1].clone(), half.clone()]
+        );
         assert_eq!(
             s.set_gamma(crtc, &half[..10], &half[..10], &half[..10]),
             Err(GammaError::Size)
@@ -1248,7 +1262,10 @@ mod tests {
         );
         let o = the_output(&s);
         assert_eq!(o.mode, current, "the driven mode is unchanged");
-        assert_eq!(o.mode_ids[3], current, "and stands for the compositor's current one");
+        assert_eq!(
+            o.mode_ids[3], current,
+            "and stands for the compositor's current one"
+        );
         let interlaced = s.modes.iter().find(|m| m.name == b"1920x1080i").unwrap();
         assert_eq!(interlaced.info.mode_flags, ModeFlag::INTERLACE);
         assert_eq!(interlaced.info.name_len, 10);
@@ -1267,7 +1284,11 @@ mod tests {
         let n = s.modes.len();
         // the compositor now drives 1920x1080@60
         assert!(s.sync_wayland_output(7, b"HEADLESS-1", 0, 0, 1920, 1080, 1920, 1080, 60_000));
-        assert_eq!(native_modes(&s), vec![(1920, 1080)], "a native mode, not a listed one");
+        assert_eq!(
+            native_modes(&s),
+            vec![(1920, 1080)],
+            "a native mode, not a listed one"
+        );
         let after: Vec<ModeSpec> = compositor_modes()
             .into_iter()
             .map(|m| ModeSpec {
@@ -1287,7 +1308,10 @@ mod tests {
             ]
         );
         let o = the_output(&s);
-        assert_eq!(o.mode_ids[0], o.mode, "the driven mode stands for the preferred one");
+        assert_eq!(
+            o.mode_ids[0], o.mode,
+            "the driven mode stands for the preferred one"
+        );
         assert_eq!((o.width, o.height), (1920, 1080));
         assert_eq!(s.modes.len(), n, "every replaced mode was freed");
         // the output going frees its listed modes too
@@ -1321,7 +1345,10 @@ mod tests {
         assert!(s.set_listed_modes(7, &after));
         let o = the_output(&s);
         assert_eq!(o.mode, pick, "still the client's pick");
-        assert_eq!(o.mode_ids[1], pick, "standing for the compositor's current mode");
+        assert_eq!(
+            o.mode_ids[1], pick,
+            "standing for the compositor's current mode"
+        );
         assert_eq!(listed(&s).len(), 6, "5 offered + the client's own");
         assert!(o.mode_ids.contains(&client));
     }

@@ -182,7 +182,10 @@ impl Clip {
     /// recognises (an offer carrying exactly `TEXT_MIMES`).
     pub fn owner_changed(&mut self, mimes: Option<Vec<String>>, session_is_owner: bool) {
         let (offer, mimes) = if session_is_owner {
-            (Some(self.token()), TEXT_MIMES.iter().map(|m| (*m).to_string()).collect())
+            (
+                Some(self.token()),
+                TEXT_MIMES.iter().map(|m| (*m).to_string()).collect(),
+            )
         } else {
             match mimes {
                 Some(m) if !m.is_empty() => (Some(self.token()), m),
@@ -251,13 +254,14 @@ impl Clip {
     /// are in flight.
     pub fn transfer(&mut self, mime: String, serial: u32) {
         let Ok(rd) = self.rd() else { return };
-        let fd: OwnedFd = match rd.call::<_, _, zbus::zvariant::OwnedFd>("SelectionWrite", &(serial,)) {
-            Ok(fd) => fd.into(),
-            Err(e) => {
-                crate::cliplog!("gnome: SelectionWrite({serial}) failed: {e}");
-                return;
-            }
-        };
+        let fd: OwnedFd =
+            match rd.call::<_, _, zbus::zvariant::OwnedFd>("SelectionWrite", &(serial,)) {
+                Ok(fd) => fd.into(),
+                Err(e) => {
+                    crate::cliplog!("gnome: SelectionWrite({serial}) failed: {e}");
+                    return;
+                }
+            };
         let data = self.published.clone();
         crate::cliplog!(
             "gnome: serving paste #{serial} as {mime} ({} bytes)",
@@ -298,7 +302,9 @@ impl Clip {
     /// Starts the next queued read if none is running.
     fn pump_reads(&mut self) {
         while self.reading.is_none() {
-            let Some(r) = self.queue.pop_front() else { return };
+            let Some(r) = self.queue.pop_front() else {
+                return;
+            };
             // the owner changed since the X client asked: refuse (drop) it
             if self
                 .server
@@ -309,10 +315,9 @@ impl Clip {
             {
                 continue;
             }
-            let fd: OwnedFd = match self
-                .rd()
-                .and_then(|rd| rd.call::<_, _, zbus::zvariant::OwnedFd>("SelectionRead", &(r.mime.as_str(),)))
-            {
+            let fd: OwnedFd = match self.rd().and_then(|rd| {
+                rd.call::<_, _, zbus::zvariant::OwnedFd>("SelectionRead", &(r.mime.as_str(),))
+            }) {
                 Ok(fd) => fd.into(),
                 Err(e) => {
                     crate::cliplog!("gnome: SelectionRead({}) failed: {e}", r.mime);
@@ -393,7 +398,9 @@ pub fn unstarted_session(conn: &Connection) -> zbus::Result<String> {
 /// one `EnableClipboard` at a time; mutter 50 then refuses to enable it again
 /// on that session, so the idle bridge takes a fresh one next time).
 pub fn disable(conn: &Connection, path: &str) -> bool {
-    match Proxy::new(conn, RD, path.to_string(), RD_SESSION).and_then(|rd| rd.call_method("DisableClipboard", &())) {
+    match Proxy::new(conn, RD, path.to_string(), RD_SESSION)
+        .and_then(|rd| rd.call_method("DisableClipboard", &()))
+    {
         Ok(_) => true,
         Err(e) => {
             crate::vlog!("gnome: can't turn off the clipboard of {path}: {e}");
@@ -466,12 +473,19 @@ impl std::fmt::Display for WriteEnd {
 /// than [`WRITE_POLL`]: gives up once the reader has taken nothing for
 /// `stall`, or when `abandon` is set. mutter hands over the blocking end of
 /// its pipe, so the fd is made non-blocking first.
-fn write_pipe(fd: &OwnedFd, data: &[u8], abandon: &AtomicBool, stall: Duration) -> Result<(), WriteEnd> {
+fn write_pipe(
+    fd: &OwnedFd,
+    data: &[u8],
+    abandon: &AtomicBool,
+    stall: Duration,
+) -> Result<(), WriteEnd> {
     let raw = fd.as_raw_fd();
     // SAFETY: plain fcntl on an fd we own; only our end of the pipe changes
     let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(WriteEnd::Failed(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)));
+        return Err(WriteEnd::Failed(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ));
     }
     let mut off = 0;
     let mut progress = Instant::now();
@@ -493,10 +507,17 @@ fn write_pipe(fd: &OwnedFd, data: &[u8], abandon: &AtomicBool, stall: Duration) 
         if n == 0 || err != libc::EAGAIN {
             return Err(WriteEnd::Failed(err));
         }
-        let Some(left) = stall.checked_sub(progress.elapsed()).filter(|d| !d.is_zero()) else {
+        let Some(left) = stall
+            .checked_sub(progress.elapsed())
+            .filter(|d| !d.is_zero())
+        else {
             return Err(WriteEnd::Stalled);
         };
-        let mut pfd = libc::pollfd { fd: raw, events: libc::POLLOUT, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
         let ms = left.min(WRITE_POLL).as_millis().max(1) as i32;
         // SAFETY: one valid pollfd
         unsafe { libc::poll(&mut pfd, 1, ms) };
@@ -551,10 +572,18 @@ mod tests {
         let (_rd, wr) = pipe();
         let data = vec![b'x'; 1 << 20]; // far more than a pipe holds
         let t = Instant::now();
-        let r = write_pipe(&wr, &data, &AtomicBool::new(false), Duration::from_millis(300));
+        let r = write_pipe(
+            &wr,
+            &data,
+            &AtomicBool::new(false),
+            Duration::from_millis(300),
+        );
         assert_eq!(r, Err(WriteEnd::Stalled));
         let took = t.elapsed();
-        assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(5), "{took:?}");
+        assert!(
+            took >= Duration::from_millis(300) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
     }
 
     #[test]
@@ -575,7 +604,12 @@ mod tests {
                 }
             }
         });
-        let r = write_pipe(&wr, &data, &AtomicBool::new(false), Duration::from_millis(500));
+        let r = write_pipe(
+            &wr,
+            &data,
+            &AtomicBool::new(false),
+            Duration::from_millis(500),
+        );
         drop(wr);
         assert_eq!(r, Ok(()));
         assert!(reader.join().unwrap() == data);
@@ -599,7 +633,12 @@ mod tests {
     fn a_closed_reader_ends_the_write() {
         let (rd, wr) = pipe();
         drop(rd);
-        let r = write_pipe(&wr, b"hello", &AtomicBool::new(false), Duration::from_secs(60));
+        let r = write_pipe(
+            &wr,
+            b"hello",
+            &AtomicBool::new(false),
+            Duration::from_secs(60),
+        );
         assert_eq!(r, Err(WriteEnd::Failed(libc::EPIPE)));
     }
 

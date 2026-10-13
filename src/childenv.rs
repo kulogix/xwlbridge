@@ -66,14 +66,22 @@ pub fn pin_x11(cmd: &mut Command) -> &mut Command {
 
 /// [`pin_x11`], and `cmd` on X display `display`.
 pub fn on_display(cmd: &mut Command, display: u32) -> &mut Command {
-    pin_x11(cmd).env("DISPLAY", format!(":{display}")).env(DISPLAY_VAR, format!(":{display}"))
+    pin_x11(cmd)
+        .env("DISPLAY", format!(":{display}"))
+        .env(DISPLAY_VAR, format!(":{display}"))
 }
 
 /// `JAVA_TOOL_OPTIONS` with [`JAVA_SCREENSHOT`] added, unless the user's
 /// options already choose a screenshot method.
 pub fn java_tool_options(existing: Option<&OsStr>) -> OsString {
     match existing {
-        Some(e) if e.as_bytes().windows(26).any(|w| w == b"awt.robot.screenshotMethod") => e.to_os_string(),
+        Some(e)
+            if e.as_bytes()
+                .windows(26)
+                .any(|w| w == b"awt.robot.screenshotMethod") =>
+        {
+            e.to_os_string()
+        }
         Some(e) if !e.as_bytes().iter().all(u8::is_ascii_whitespace) => {
             let mut s = e.to_os_string();
             s.push(" ");
@@ -123,7 +131,10 @@ fn start_time(pid: i32) -> Option<u64> {
     let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
     // the command name (field 2) is in parentheses and may hold anything
     let rest = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
-    let field = rest.split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty()).nth(19)?;
+    let field = rest
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty())
+        .nth(19)?;
     std::str::from_utf8(field).ok()?.parse().ok()
 }
 
@@ -214,7 +225,11 @@ fn leading_number(buf: &[u8]) -> Option<u64> {
     if digits == 0 || digits > 19 {
         return None;
     }
-    Some(buf[..digits].iter().fold(0u64, |n, &d| n * 10 + u64::from(d - b'0')))
+    Some(
+        buf[..digits]
+            .iter()
+            .fold(0u64, |n, &d| n * 10 + u64::from(d - b'0')),
+    )
 }
 
 /// The running bridges listed in `dir`, sorted by display. Entries of
@@ -222,7 +237,9 @@ fn leading_number(buf: &[u8]) -> Option<u64> {
 /// removed.
 fn live_entries(dir: &Path) -> Vec<Entry> {
     let mut found = Vec::new();
-    let Ok(rd) = fs::read_dir(dir) else { return found };
+    let Ok(rd) = fs::read_dir(dir) else {
+        return found;
+    };
     for e in rd.filter_map(Result::ok) {
         let Some(display) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
@@ -230,9 +247,14 @@ fn live_entries(dir: &Path) -> Vec<Entry> {
         let parsed = fs::read(e.path()).ok().and_then(|t| parse_entry(&t));
         match parsed {
             Some((pid, start, xauthority))
-                if alive(pid) && start.is_none_or(|t| start_time(pid).is_none_or(|now| now == t)) =>
+                if alive(pid)
+                    && start.is_none_or(|t| start_time(pid).is_none_or(|now| now == t)) =>
             {
-                found.push(Entry { display, pid, xauthority })
+                found.push(Entry {
+                    display,
+                    pid,
+                    xauthority,
+                })
             }
             _ => {
                 let _ = fs::remove_file(e.path());
@@ -266,8 +288,17 @@ fn resolve(
     socket: impl Fn(u32) -> bool,
 ) -> Result<(u32, Option<PathBuf>), String> {
     let live = dir.map(live_entries).unwrap_or_default();
-    let auth = |n: u32| live.iter().find(|e| e.display == n).and_then(|e| e.xauthority.clone());
-    let listed = || live.iter().map(|e| format!(":{} pid {}", e.display, e.pid)).collect::<Vec<_>>().join(", ");
+    let auth = |n: u32| {
+        live.iter()
+            .find(|e| e.display == n)
+            .and_then(|e| e.xauthority.clone())
+    };
+    let listed = || {
+        live.iter()
+            .map(|e| format!(":{} pid {}", e.display, e.pid))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if let Some(n) = explicit {
         return Ok((n, auth(n)));
     }
@@ -278,7 +309,11 @@ fn resolve(
             return Err(format!(
                 "{DISPLAY_VAR}=:{n} names no running bridge (left over from an earlier one?){}; \
                  unset it or name a display: -display N",
-                if live.is_empty() { String::new() } else { format!("; running: {}", listed()) }
+                if live.is_empty() {
+                    String::new()
+                } else {
+                    format!("; running: {}", listed())
+                }
             ));
         }
         return Ok((n, auth(n)));
@@ -286,7 +321,10 @@ fn resolve(
     match live.as_slice() {
         [e] => Ok((e.display, e.xauthority.clone())),
         [] => Err("no running bridge found; start one, or name its display: -display N".into()),
-        _ => Err(format!("several bridges are running ({}); name one: -display N", listed())),
+        _ => Err(format!(
+            "several bridges are running ({}); name one: -display N",
+            listed()
+        )),
     }
 }
 
@@ -326,7 +364,9 @@ pub fn run_main(args: Vec<OsString>) -> ! {
             i += 1;
             break;
         }
-        let Some(body) = a.strip_prefix('-').filter(|b| !b.is_empty()) else { break };
+        let Some(body) = a.strip_prefix('-').filter(|b| !b.is_empty()) else {
+            break;
+        };
         let (name, inline) = match body.split_once('=') {
             Some((n, v)) => (n.to_ascii_lowercase(), Some(v.to_string())),
             None => (body.trim_start_matches('-').to_ascii_lowercase(), None),
@@ -342,13 +382,21 @@ pub fn run_main(args: Vec<OsString>) -> ! {
                     Some(v) => v,
                     None => {
                         i += 1;
-                        args.get(i).and_then(|v| v.to_str()).map(str::to_string).unwrap_or_default()
+                        args.get(i)
+                            .and_then(|v| v.to_str())
+                            .map(str::to_string)
+                            .unwrap_or_default()
                     }
                 };
                 explicit =
-                    Some(parse_display(&v).unwrap_or_else(|| fail(&format!("-display {v:?} is not an X display"), 2)));
+                    Some(parse_display(&v).unwrap_or_else(|| {
+                        fail(&format!("-display {v:?} is not an X display"), 2)
+                    }));
             }
-            other => fail(&format!("unknown option -{other} (try: xwlbridge run -help)"), 2),
+            other => fail(
+                &format!("unknown option -{other} (try: xwlbridge run -help)"),
+                2,
+            ),
         }
         i += 1;
     }
@@ -357,13 +405,19 @@ pub fn run_main(args: Vec<OsString>) -> ! {
         fail("no command given (try: xwlbridge run -help)", 2);
     }
     let dir = registry_dir();
-    let (display, xauthority) =
-        resolve(explicit, env::var_os(DISPLAY_VAR).as_deref(), dir.as_deref(), has_socket).unwrap_or_else(|e| fail(&e, 2));
+    let (display, xauthority) = resolve(
+        explicit,
+        env::var_os(DISPLAY_VAR).as_deref(),
+        dir.as_deref(),
+        has_socket,
+    )
+    .unwrap_or_else(|e| fail(&e, 2));
     let java = java_tool_options(env::var_os("JAVA_TOOL_OPTIONS").as_deref());
 
     if print {
         let mut out = String::new();
-        let mut export = |k: &str, v: &OsStr| out.push_str(&format!("export {k}={}\n", sh_quote(v)));
+        let mut export =
+            |k: &str, v: &OsStr| out.push_str(&format!("export {k}={}\n", sh_quote(v)));
         export("DISPLAY", OsStr::new(&format!(":{display}")));
         export(DISPLAY_VAR, OsStr::new(&format!(":{display}")));
         for (k, v) in X11_ONLY {
@@ -380,7 +434,9 @@ pub fn run_main(args: Vec<OsString>) -> ! {
 
     if !has_socket(display) {
         // only a hint: the abstract socket may still be there
-        eprintln!("xwlbridge run: warning: display :{display} has no socket /tmp/.X11-unix/X{display}");
+        eprintln!(
+            "xwlbridge run: warning: display :{display} has no socket /tmp/.X11-unix/X{display}"
+        );
     }
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -390,14 +446,24 @@ pub fn run_main(args: Vec<OsString>) -> ! {
         cmd.env("XAUTHORITY", a);
     }
     let e = cmd.exec();
-    let code = if e.kind() == io::ErrorKind::NotFound { 127 } else { 126 };
-    fail(&format!("can't run {}: {e}", command[0].to_string_lossy()), code);
+    let code = if e.kind() == io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    };
+    fail(
+        &format!("can't run {}: {e}", command[0].to_string_lossy()),
+        code,
+    );
 }
 
 /// `v` quoted for a POSIX shell.
 fn sh_quote(v: &OsStr) -> String {
     let s = v.to_string_lossy();
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./:=,+@%".contains(&b)) {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=,+@%".contains(&b))
+    {
         s.into_owned()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -410,7 +476,12 @@ mod tests {
 
     fn envs(cmd: &Command) -> Vec<(String, Option<String>)> {
         cmd.get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
             .collect()
     }
     fn get(e: &[(String, Option<String>)], k: &str) -> Option<Option<String>> {
@@ -476,7 +547,11 @@ mod tests {
         let me = process::id() as i32;
         let no_socket = |_| false;
         // nothing running
-        assert!(resolve(None, None, Some(&dir), no_socket).unwrap_err().contains("no running bridge"));
+        assert!(
+            resolve(None, None, Some(&dir), no_socket)
+                .unwrap_err()
+                .contains("no running bridge")
+        );
         // one live bridge (us), one gone (pid that cannot exist), junk
         fs::write(dir.join("23"), entry_text(me, start_time(me), None)).unwrap();
         fs::write(dir.join("24"), "2147483646\n").unwrap();
@@ -484,22 +559,44 @@ mod tests {
         assert_eq!(resolve(None, None, Some(&dir), no_socket), Ok((23, None)));
         assert!(!dir.join("24").exists(), "a dead bridge's entry is removed");
         // -display and $XWLBRIDGE_DISPLAY come first
-        assert_eq!(resolve(Some(5), Some(OsStr::new(":6")), Some(&dir), no_socket), Ok((5, None)));
-        assert_eq!(resolve(None, Some(OsStr::new(":6")), Some(&dir), |n| n == 6), Ok((6, None)));
+        assert_eq!(
+            resolve(Some(5), Some(OsStr::new(":6")), Some(&dir), no_socket),
+            Ok((5, None))
+        );
+        assert_eq!(
+            resolve(None, Some(OsStr::new(":6")), Some(&dir), |n| n == 6),
+            Ok((6, None))
+        );
         assert!(resolve(None, Some(OsStr::new("nope")), Some(&dir), no_socket).is_err());
         // a leftover $XWLBRIDGE_DISPLAY (no bridge, no X display) is refused
         let e = resolve(None, Some(OsStr::new(":6")), Some(&dir), no_socket).unwrap_err();
         assert!(e.contains("no running bridge") && e.contains(":23"), "{e}");
-        assert_eq!(resolve(None, Some(OsStr::new(":23")), Some(&dir), no_socket), Ok((23, None)));
+        assert_eq!(
+            resolve(None, Some(OsStr::new(":23")), Some(&dir), no_socket),
+            Ok((23, None))
+        );
         // a pid reused by another process (other start time): stale, removed
         fs::write(dir.join("26"), format!("{me} 1\n")).unwrap();
         assert_eq!(resolve(None, None, Some(&dir), no_socket), Ok((23, None)));
-        assert!(!dir.join("26").exists(), "an entry naming another process is removed");
+        assert!(
+            !dir.join("26").exists(),
+            "an entry naming another process is removed"
+        );
         // the cookie a display needs comes with it
         let cookie = dir.join("cookie");
-        fs::write(dir.join("23"), entry_text(me, start_time(me), Some(&cookie))).unwrap();
-        assert_eq!(resolve(None, None, Some(&dir), no_socket), Ok((23, Some(cookie.clone()))));
-        assert_eq!(resolve(Some(23), None, Some(&dir), no_socket), Ok((23, Some(cookie.clone()))));
+        fs::write(
+            dir.join("23"),
+            entry_text(me, start_time(me), Some(&cookie)),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(None, None, Some(&dir), no_socket),
+            Ok((23, Some(cookie.clone())))
+        );
+        assert_eq!(
+            resolve(Some(23), None, Some(&dir), no_socket),
+            Ok((23, Some(cookie.clone())))
+        );
         // two live ones: ambiguous
         fs::write(dir.join("25"), entry_text(me, None, None)).unwrap();
         let e = resolve(None, None, Some(&dir), no_socket).unwrap_err();
@@ -509,10 +606,18 @@ mod tests {
 
     #[test]
     fn entries_round_trip() {
-        let t = entry_text(42, Some(7), Some(Path::new("/run/user/1000/xwlbridge-1-x/auth")));
+        let t = entry_text(
+            42,
+            Some(7),
+            Some(Path::new("/run/user/1000/xwlbridge-1-x/auth")),
+        );
         assert_eq!(
             parse_entry(&t),
-            Some((42, Some(7), Some(PathBuf::from("/run/user/1000/xwlbridge-1-x/auth"))))
+            Some((
+                42,
+                Some(7),
+                Some(PathBuf::from("/run/user/1000/xwlbridge-1-x/auth"))
+            ))
         );
         // an entry written by an older bridge: the pid alone
         assert_eq!(parse_entry(b"42\n"), Some((42, None, None)));
@@ -549,7 +654,10 @@ mod tests {
     fn shell_quoting() {
         assert_eq!(sh_quote(OsStr::new(":20")), ":20");
         assert_eq!(sh_quote(OsStr::new("")), "''");
-        assert_eq!(sh_quote(OsStr::new("-Xmx1g -Dawt.robot.screenshotMethod=x11")), "'-Xmx1g -Dawt.robot.screenshotMethod=x11'");
+        assert_eq!(
+            sh_quote(OsStr::new("-Xmx1g -Dawt.robot.screenshotMethod=x11")),
+            "'-Xmx1g -Dawt.robot.screenshotMethod=x11'"
+        );
         assert_eq!(sh_quote(OsStr::new("it's")), r"'it'\''s'");
     }
 }

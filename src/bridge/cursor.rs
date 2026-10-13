@@ -49,7 +49,12 @@ impl CursorState {
             g.serial = g.serial.wrapping_add(1).max(1);
             g.serial
         };
-        if let Some(f) = self.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        if let Some(f) = self
+            .notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             f();
         }
         serial
@@ -83,14 +88,21 @@ impl CursorState {
     /// Sets the function called after every image change (replacing any).
     #[allow(dead_code)]
     pub fn set_notify(&self, f: Box<dyn Fn() + Send>) {
-        *self.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f);
+        *self
+            .notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f);
     }
 
     /// Removes the function (its consumer is gone); no call of it is in
     /// progress once this returns.
     #[allow(dead_code)]
     pub fn clear_notify(&self) {
-        let f = self.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let f = self
+            .notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         drop(f);
     }
 }
@@ -98,8 +110,8 @@ impl CursorState {
 #[cfg(test)]
 mod tests {
     use super::CursorState;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
     fn a_cleared_notify_is_dropped_and_not_called() {

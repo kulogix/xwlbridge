@@ -70,7 +70,9 @@ impl MonitorProps {
     fn from_dbus(p: &HashMap<String, OwnedValue>) -> MonitorProps {
         let u32_of = |k: &str| p.get(k).and_then(|v| u32::try_from(v).ok());
         MonitorProps {
-            underscanning: p.get("is-underscanning").and_then(|v| bool::try_from(v).ok()),
+            underscanning: p
+                .get("is-underscanning")
+                .and_then(|v| bool::try_from(v).ok()),
             color_mode: u32_of("color-mode"),
             rgb_range: u32_of("rgb-range"),
         }
@@ -329,7 +331,11 @@ impl State {
                         // then the faster one
                         (a.variable != variable)
                             .cmp(&(b.variable != variable))
-                            .then((a.refresh - refresh).abs().total_cmp(&(b.refresh - refresh).abs()))
+                            .then(
+                                (a.refresh - refresh)
+                                    .abs()
+                                    .total_cmp(&(b.refresh - refresh).abs()),
+                            )
                             .then(b.preferred.cmp(&a.preferred))
                             .then(b.refresh.total_cmp(&a.refresh))
                     })
@@ -433,7 +439,11 @@ pub fn apply(conn: &Connection, state: &State, layout: &Layout) -> zbus::Result<
                     .iter()
                     .enumerate()
                     .map(|(i, (c, m))| {
-                        let props = l.props.get(i).map(MonitorProps::to_dbus).unwrap_or_default();
+                        let props = l
+                            .props
+                            .get(i)
+                            .map(MonitorProps::to_dbus)
+                            .unwrap_or_default();
                         (c.as_str(), m.as_str(), props)
                     })
                     .collect(),
@@ -764,7 +774,10 @@ mod tests {
         };
         assert_eq!(
             l.0[0].monitors,
-            vec![("A".to_string(), "A1080@60".to_string()), ("B".to_string(), "B1080".to_string())]
+            vec![
+                ("A".to_string(), "A1080@60".to_string()),
+                ("B".to_string(), "B1080".to_string())
+            ]
         );
         // a size one of them lacks is refused for the group
         assert!(s.plan("A", 800, 600).is_err());

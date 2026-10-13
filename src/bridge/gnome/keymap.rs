@@ -50,7 +50,9 @@ impl KeymapWatch {
         // a keyboard the seat has at our start has been there for apps all
         // along
         if state.keyboard_since.is_some() {
-            state.keyboard_since = Instant::now().checked_sub(Duration::from_secs(3600)).or(state.keyboard_since);
+            state.keyboard_since = Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .or(state.keyboard_since);
         }
         Some(KeymapWatch {
             conn,
@@ -78,9 +80,7 @@ impl KeymapWatch {
         if self.guard.is_none() {
             self.guard = self.queue.prepare_read();
         }
-        self.guard
-            .as_ref()
-            .map(|g| g.connection_fd().as_raw_fd())
+        self.guard.as_ref().map(|g| g.connection_fd().as_raw_fd())
     }
 
     /// Reads (if `readable`) and dispatches. Returns false once the

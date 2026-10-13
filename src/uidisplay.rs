@@ -83,7 +83,10 @@ pub fn resolve(arg: &str) -> Result<UiDisplay, String> {
     let xauthority = env::var_os("XAUTHORITY")
         .filter(|a| !a.is_empty())
         .or_else(|| env::var_os("XDG_RUNTIME_DIR").and_then(|dir| mutter_cookie(Path::new(&dir))));
-    Ok(UiDisplay { display, xauthority })
+    Ok(UiDisplay {
+        display,
+        xauthority,
+    })
 }
 
 /// What `-uidisplay` comes to, before anything starts.
@@ -107,10 +110,13 @@ pub fn choose(arg: Option<&str>, realvnc: bool) -> Result<Choice, String> {
         Some(a) => Choice::Display(resolve(a)?),
         None if !realvnc => Choice::Off(None),
         None => match env::var_os("DISPLAY").filter(|d| !d.is_empty()) {
-            None => Choice::Off(Some("xwlbridge has no DISPLAY: not started in a desktop session".into())),
-            Some(d) if !is_local(&d) => {
-                Choice::Off(Some(format!("DISPLAY {} is not a local display", d.to_string_lossy())))
-            }
+            None => Choice::Off(Some(
+                "xwlbridge has no DISPLAY: not started in a desktop session".into(),
+            )),
+            Some(d) if !is_local(&d) => Choice::Off(Some(format!(
+                "DISPLAY {} is not a local display",
+                d.to_string_lossy()
+            ))),
             Some(_) => Choice::Display(resolve("auto")?),
         },
     })
@@ -118,15 +124,20 @@ pub fn choose(arg: Option<&str>, realvnc: bool) -> Result<Choice, String> {
 
 /// Whether the command is RealVNC Server's (`vncserver-x11` or its core).
 pub fn is_realvnc(program: &OsStr) -> bool {
-    Path::new(program).file_name().is_some_and(|n| n == "vncserver-x11" || n == "vncserver-x11-core")
+    Path::new(program)
+        .file_name()
+        .is_some_and(|n| n == "vncserver-x11" || n == "vncserver-x11-core")
 }
 
 /// Parses a display name as Xlib does, which also takes `unix:N` for the
 /// local display N (x11rb reads it as a socket path).
 fn parse(display: &str) -> Result<ParsedDisplay, String> {
-    let local = display.strip_prefix("unix:").filter(|n| n.starts_with(|c: char| c.is_ascii_digit()));
+    let local = display
+        .strip_prefix("unix:")
+        .filter(|n| n.starts_with(|c: char| c.is_ascii_digit()));
     let name = local.map(|n| format!(":{n}"));
-    parse_display(Some(name.as_deref().unwrap_or(display))).map_err(|e| format!("bad display name {display:?}: {e}"))
+    parse_display(Some(name.as_deref().unwrap_or(display)))
+        .map_err(|e| format!("bad display name {display:?}: {e}"))
 }
 
 /// Whether `display` names an X server on this machine reached through a
@@ -135,7 +146,9 @@ pub fn is_local(display: &OsStr) -> bool {
     display
         .to_str()
         .and_then(|d| parse(d).ok())
-        .is_some_and(|p| p.protocol.as_deref() == Some("unix") || (p.host.is_empty() && p.protocol.is_none()))
+        .is_some_and(|p| {
+            p.protocol.as_deref() == Some("unix") || (p.host.is_empty() && p.protocol.is_none())
+        })
 }
 
 /// Whether `ui` is X display number `n` of this machine (xwlbridge's own).
@@ -156,7 +169,11 @@ fn mutter_cookie(dir: &Path) -> Option<OsString> {
     fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
-        .filter(|e| e.file_name().as_bytes().starts_with(b".mutter-Xwaylandauth."))
+        .filter(|e| {
+            e.file_name()
+                .as_bytes()
+                .starts_with(b".mutter-Xwaylandauth.")
+        })
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .max()
         .map(|(_, p)| p.into_os_string())
@@ -193,8 +210,12 @@ pub fn probe(ui: &UiDisplay, timeout: Duration) -> Result<Probe, String> {
                 continue;
             }
         };
-        stream.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| e.to_string())?;
         let cookie = ui
             .xauthority
             .as_deref()
@@ -228,7 +249,9 @@ fn handshake(
 ) -> Result<Probe, String> {
     let (auth_name, auth_data) = cookie.unwrap_or_default();
     let (mut connect, setup_request) = Connect::with_authorization(auth_name, auth_data);
-    stream.write_all(&setup_request).map_err(|e| format!("sending the connection setup: {e}"))?;
+    stream
+        .write_all(&setup_request)
+        .map_err(|e| format!("sending the connection setup: {e}"))?;
     loop {
         let n = stream
             .read(connect.buffer())
@@ -243,13 +266,21 @@ fn handshake(
     match connect.into_setup() {
         Ok(_) => {}
         Err(ConnectError::SetupFailed(f)) => {
-            return Err(format!("refused the connection: {}", String::from_utf8_lossy(&f.reason).trim_end()));
+            return Err(format!(
+                "refused the connection: {}",
+                String::from_utf8_lossy(&f.reason).trim_end()
+            ));
         }
-        Err(ConnectError::SetupAuthenticate(_)) => return Err("asked for more authentication".into()),
+        Err(ConnectError::SetupAuthenticate(_)) => {
+            return Err("asked for more authentication".into());
+        }
         Err(e) => return Err(format!("connection setup failed: {e}")),
     }
     let name = format!("_NET_SYSTEM_TRAY_S{screen}");
-    let intern = InternAtomRequest { only_if_exists: true, name: name.as_bytes().into() };
+    let intern = InternAtomRequest {
+        only_if_exists: true,
+        name: name.as_bytes().into(),
+    };
     stream
         .write_all(&<InternAtomRequest as Request>::serialize(intern, 0).0)
         .map_err(|e| format!("sending InternAtom: {e}"))?;
@@ -260,20 +291,27 @@ fn handshake(
     if atom.atom == 0 {
         return Ok(Probe { tray: None });
     }
-    let owner = GetSelectionOwnerRequest { selection: atom.atom };
+    let owner = GetSelectionOwnerRequest {
+        selection: atom.atom,
+    };
     stream
         .write_all(&<GetSelectionOwnerRequest as Request>::serialize(owner, 0).0)
         .map_err(|e| format!("sending GetSelectionOwner: {e}"))?;
     let reply = read_reply(&mut stream)?;
     Ok(Probe {
-        tray: GetSelectionOwnerReply::try_parse(&reply).ok().map(|(r, _)| r.owner).filter(|&o| o != 0),
+        tray: GetSelectionOwnerReply::try_parse(&reply)
+            .ok()
+            .map(|(r, _)| r.owner)
+            .filter(|&o| o != 0),
     })
 }
 
 /// One 32-byte reply (or error; both requests have no variable part).
 fn read_reply(stream: &mut impl Read) -> Result<[u8; 32], String> {
     let mut buf = [0u8; 32];
-    stream.read_exact(&mut buf).map_err(|e| format!("no reply: {e}"))?;
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| format!("no reply: {e}"))?;
     Ok(buf)
 }
 
@@ -328,11 +366,20 @@ fn find_cookie(data: &[u8], host: &[u8], display: u16) -> Option<(Vec<u8>, Vec<u
 /// exclusively and never through a symlink, is renamed over it.
 pub fn install_hook() -> io::Result<PathBuf> {
     let mut why = Vec::new();
-    let runtime = env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
-    let cache = env::var_os("HOME").filter(|d| !d.is_empty()).map(|h| PathBuf::from(h).join(".cache/xwlbridge"));
+    let runtime = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    let cache = env::var_os("HOME")
+        .filter(|d| !d.is_empty())
+        .map(|h| PathBuf::from(h).join(".cache/xwlbridge"));
     for (dir, create) in [(runtime, false), (cache, true)] {
         let Some(dir) = dir else { continue };
-        if create && let Err(e) = fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
+        if create
+            && let Err(e) = fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+        {
             why.push(format!("{}: {e}", dir.display()));
             continue;
         }
@@ -357,10 +404,16 @@ fn usable_dir(dir: &Path) -> io::Result<()> {
         return Err(io::Error::other("not a directory"));
     }
     if meta.uid() != uid {
-        return Err(io::Error::other(format!("owned by uid {}, not by us ({uid})", meta.uid())));
+        return Err(io::Error::other(format!(
+            "owned by uid {}, not by us ({uid})",
+            meta.uid()
+        )));
     }
     if meta.mode() & 0o022 != 0 {
-        return Err(io::Error::other(format!("writable by others (mode {:o})", meta.mode() & 0o7777)));
+        return Err(io::Error::other(format!(
+            "writable by others (mode {:o})",
+            meta.mode() & 0o7777
+        )));
     }
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
     // SAFETY: c is NUL-terminated, st is writable
@@ -398,13 +451,21 @@ fn install_in(dir: &Path) -> io::Result<PathBuf> {
 /// Whether `path` is a regular file of ours, writable only by us, holding
 /// exactly the hook (opened without following a symlink).
 fn is_our_copy(path: &Path) -> bool {
-    let Ok(mut f) = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path) else {
+    let Ok(mut f) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
         return false;
     };
     let Ok(meta) = f.metadata() else { return false };
     // SAFETY: geteuid cannot fail
     let uid = unsafe { libc::geteuid() };
-    if !meta.is_file() || meta.uid() != uid || meta.mode() & 0o022 != 0 || meta.len() != HOOK.len() as u64 {
+    if !meta.is_file()
+        || meta.uid() != uid
+        || meta.mode() & 0o022 != 0
+        || meta.len() != HOOK.len() as u64
+    {
         return false;
     }
     let mut have = Vec::with_capacity(HOOK.len());
@@ -412,8 +473,9 @@ fn is_our_copy(path: &Path) -> bool {
 }
 
 fn fnv1a(data: &[u8]) -> u64 {
-    data.iter()
-        .fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    data.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// The program to run instead of `program` so the hook reaches RealVNC's UI:
@@ -443,7 +505,11 @@ pub fn is_setid(program: &OsStr, path: Option<&OsStr>) -> bool {
     let found = if program.components().count() > 1 {
         Some(program.to_path_buf())
     } else {
-        path.and_then(|p| env::split_paths(p).map(|dir| dir.join(program)).find(|p| p.is_file()))
+        path.and_then(|p| {
+            env::split_paths(p)
+                .map(|dir| dir.join(program))
+                .find(|p| p.is_file())
+        })
     };
     found
         .and_then(|p| fs::metadata(p).ok())
@@ -455,15 +521,37 @@ pub fn is_setid(program: &OsStr, path: Option<&OsStr>) -> bool {
 /// a `vncserver-x11` named as the command can be swapped for its core.
 pub fn wrapped_launcher(program: &OsStr, args: &[OsString]) -> bool {
     const WRAPPERS: &[&[u8]] = &[
-        b"env", b"sh", b"bash", b"dash", b"zsh", b"nice", b"ionice", b"setsid", b"stdbuf", b"taskset",
-        b"chrt", b"nohup", b"timeout", b"systemd-run", b"sudo", b"runuser", b"su", b"dbus-run-session",
-        b"systemd-inhibit", b"flatpak-spawn",
+        b"env",
+        b"sh",
+        b"bash",
+        b"dash",
+        b"zsh",
+        b"nice",
+        b"ionice",
+        b"setsid",
+        b"stdbuf",
+        b"taskset",
+        b"chrt",
+        b"nohup",
+        b"timeout",
+        b"systemd-run",
+        b"sudo",
+        b"runuser",
+        b"su",
+        b"dbus-run-session",
+        b"systemd-inhibit",
+        b"flatpak-spawn",
     ];
-    let base = Path::new(program).file_name().map(OsStr::as_bytes).unwrap_or_default();
+    let base = Path::new(program)
+        .file_name()
+        .map(OsStr::as_bytes)
+        .unwrap_or_default();
     WRAPPERS.contains(&base)
         && args.iter().any(|a| {
             let a = a.as_bytes();
-            a.windows(13).enumerate().any(|(i, w)| w == b"vncserver-x11" && !a[i + 13..].starts_with(b"-core"))
+            a.windows(13)
+                .enumerate()
+                .any(|(i, w)| w == b"vncserver-x11" && !a[i + 13..].starts_with(b"-core"))
         })
 }
 
@@ -480,7 +568,10 @@ pub fn command_line_params(args: &[OsString]) -> Vec<String> {
                 && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
                 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
             // vncserver-x11's own modes are not parameters
-            let mode = matches!(name, "service" | "showstatus" | "virtual" | "help" | "version" | "rootHelper");
+            let mode = matches!(
+                name,
+                "service" | "showstatus" | "virtual" | "help" | "version" | "rootHelper"
+            );
             (looks && !mode && (a.starts_with('-') || a.contains('='))).then(|| name.to_string())
         })
         .collect()
@@ -491,19 +582,36 @@ fn proc_info(pid: u32) -> Option<(u32, Vec<Vec<u8>>)> {
     let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
     // "pid (comm) state ppid ...": comm may hold spaces and parentheses
     let rest = &stat[stat.iter().rposition(|&b| b == b')')? + 1..];
-    let ppid = std::str::from_utf8(rest).ok()?.split_whitespace().nth(1)?.parse().ok()?;
+    let ppid = std::str::from_utf8(rest)
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
     let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    Some((ppid, cmdline.split(|&b| b == 0).filter(|a| !a.is_empty()).map(<[u8]>::to_vec).collect()))
+    Some((
+        ppid,
+        cmdline
+            .split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    ))
 }
 
 /// The children of `parent` running `vncserverui`, with their arguments.
 fn ui_children(parent: u32) -> Vec<(u32, Vec<Vec<u8>>)> {
-    let Ok(dir) = fs::read_dir("/proc") else { return Vec::new() };
+    let Ok(dir) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
     dir.filter_map(Result::ok)
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
         .filter_map(|pid| {
             let (ppid, argv) = proc_info(pid)?;
-            let exe = Path::new(OsStr::from_bytes(argv.first()?)).file_name()?.as_bytes() == b"vncserverui";
+            let exe = Path::new(OsStr::from_bytes(argv.first()?))
+                .file_name()?
+                .as_bytes()
+                == b"vncserverui";
             (ppid == parent && exe).then(|| (pid, argv[1..].to_vec()))
         })
         .collect()
@@ -546,11 +654,23 @@ impl StatusIconWatch {
 
     /// One look: `ui` is RealVNC's UI process and `icon` whether its icon
     /// helper is running; `busy` whether a viewer is connected.
-    pub fn poll(&mut self, ui: Option<u32>, icon: bool, busy: bool, now: std::time::Instant) -> IconAction {
+    pub fn poll(
+        &mut self,
+        ui: Option<u32>,
+        icon: bool,
+        busy: bool,
+        now: std::time::Instant,
+    ) -> IconAction {
         if ui != self.ui {
-            *self = Self { ui, restarts: std::mem::take(&mut self.restarts), ..Self::default() };
+            *self = Self {
+                ui,
+                restarts: std::mem::take(&mut self.restarts),
+                ..Self::default()
+            };
         }
-        let Some(pid) = ui else { return IconAction::Nothing };
+        let Some(pid) = ui else {
+            return IconAction::Nothing;
+        };
         if icon {
             self.had_icon = true;
             self.missing = 0;
@@ -564,13 +684,22 @@ impl StatusIconWatch {
         if self.missing < Self::MISSES {
             return IconAction::Nothing;
         }
-        self.restarts.retain(|&t| now.duration_since(t) < Self::WINDOW);
+        self.restarts
+            .retain(|&t| now.duration_since(t) < Self::WINDOW);
         let said = std::mem::replace(&mut self.said, true);
         if self.restarts.len() >= Self::MAX_RESTARTS {
-            return if said { IconAction::Nothing } else { IconAction::GiveUp(pid) };
+            return if said {
+                IconAction::Nothing
+            } else {
+                IconAction::GiveUp(pid)
+            };
         }
         if busy {
-            return if said { IconAction::Nothing } else { IconAction::Deferred(pid) };
+            return if said {
+                IconAction::Nothing
+            } else {
+                IconAction::Deferred(pid)
+            };
         }
         self.restarts.push(now);
         self.had_icon = false;
@@ -620,9 +749,11 @@ impl Gate {
             .open(&tmp)?;
         let written = f.write_all(if on { b"1\n" } else { b"0\n" });
         drop(f);
-        written.and_then(|()| fs::rename(&tmp, &self.path)).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
+        written
+            .and_then(|()| fs::rename(&tmp, &self.path))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp);
+            })?;
         self.on = on;
         Ok(())
     }
@@ -756,7 +887,8 @@ impl Placement {
             } else if fresh && !first {
                 self.unsteady.push(now);
             }
-            self.unsteady.retain(|&t| now.duration_since(t) < Self::CHURN_WINDOW);
+            self.unsteady
+                .retain(|&t| now.duration_since(t) < Self::CHURN_WINDOW);
             if self.unsteady.len() >= Self::CHURN {
                 let n = self.unsteady.len();
                 self.on = false;
@@ -771,9 +903,14 @@ impl Placement {
             return PlaceAction::Nothing;
         }
         self.next_probe = now + Self::RETRY;
-        self.moves.retain(|&t| now.duration_since(t) < Self::MOVE_WINDOW);
+        self.moves
+            .retain(|&t| now.duration_since(t) < Self::MOVE_WINDOW);
         if self.moves.len() >= Self::MAX_MOVES {
-            return if std::mem::replace(&mut self.said, true) { PlaceAction::Nothing } else { PlaceAction::GiveUp };
+            return if std::mem::replace(&mut self.said, true) {
+                PlaceAction::Nothing
+            } else {
+                PlaceAction::GiveUp
+            };
         }
         if !usable() {
             return PlaceAction::Nothing;
@@ -801,10 +938,14 @@ impl Placement {
 /// connection prompt, `-QueryConnectApp`), and whether its tray icon helper
 /// (`vncserverui -statusicon`) runs.
 fn ui_process(core: u32) -> (Option<u32>, bool) {
-    let ui = ui_children(core).into_iter().find(|(_, args)| !args.iter().any(|a| a.starts_with(b"-")));
-    let icon = ui
-        .as_ref()
-        .is_some_and(|(pid, _)| ui_children(*pid).iter().any(|(_, args)| args.iter().any(|a| a == b"-statusicon")));
+    let ui = ui_children(core)
+        .into_iter()
+        .find(|(_, args)| !args.iter().any(|a| a.starts_with(b"-")));
+    let icon = ui.as_ref().is_some_and(|(pid, _)| {
+        ui_children(*pid)
+            .iter()
+            .any(|(_, args)| args.iter().any(|a| a == b"-statusicon"))
+    });
     (ui.map(|(pid, _)| pid), icon)
 }
 
@@ -813,11 +954,19 @@ fn ui_process(core: u32) -> (Option<u32>, bool) {
 /// current ([`Placement`]; without a gate the UI always goes there) and the
 /// UI's tray icon alive ([`StatusIconWatch`]); `busy` tells whether a viewer
 /// is connected.
-pub fn watch(core: u32, ui_display: UiDisplay, gate: Option<Gate>, busy: impl Fn() -> bool + Send + 'static) {
+pub fn watch(
+    core: u32,
+    ui_display: UiDisplay,
+    gate: Option<Gate>,
+    busy: impl Fn() -> bool + Send + 'static,
+) {
     std::thread::spawn(move || {
         let name = ui_display.display.to_string_lossy().into_owned();
         let mut gate = gate;
-        let mut place = Placement::new(gate.as_ref().is_none_or(Gate::is_on), std::time::Instant::now());
+        let mut place = Placement::new(
+            gate.as_ref().is_none_or(Gate::is_on),
+            std::time::Instant::now(),
+        );
         let mut icons = StatusIconWatch::default();
         let mut gate_failed = false;
         let end_ui = |pid: u32| {
@@ -833,11 +982,13 @@ pub fn watch(core: u32, ui_display: UiDisplay, gate: Option<Gate>, busy: impl Fn
             let action = if gate.is_none() {
                 PlaceAction::Nothing
             } else {
-                place.poll(ui, busy, now, || match probe(&ui_display, Duration::from_secs(5)) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        crate::vlog!("-uidisplay: {e}");
-                        false
+                place.poll(ui, busy, now, || {
+                    match probe(&ui_display, Duration::from_secs(5)) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            crate::vlog!("-uidisplay: {e}");
+                            false
+                        }
                     }
                 })
             };
@@ -856,7 +1007,9 @@ pub fn watch(core: u32, ui_display: UiDisplay, gate: Option<Gate>, busy: impl Fn
             match action {
                 PlaceAction::Nothing => {}
                 PlaceAction::On(pid) => {
-                    crate::log!("-uidisplay: X display {name} answers now; RealVNC's UI goes there");
+                    crate::log!(
+                        "-uidisplay: X display {name} answers now; RealVNC's UI goes there"
+                    );
                     if let Some(pid) = pid {
                         end_ui(pid);
                     }
@@ -866,7 +1019,9 @@ pub fn watch(core: u32, ui_display: UiDisplay, gate: Option<Gate>, busy: impl Fn
                      viewer is connected"
                 ),
                 PlaceAction::Restart(pid) => {
-                    crate::log!("-uidisplay: moving RealVNC's UI process ({pid}) to X display {name}");
+                    crate::log!(
+                        "-uidisplay: moving RealVNC's UI process ({pid}) to X display {name}"
+                    );
                     end_ui(pid);
                 }
                 PlaceAction::Off(n) => crate::warning!(
@@ -913,9 +1068,14 @@ pub fn apply(cmd: &mut Command, hook: &Path, ui: Option<(&UiDisplay, Option<&Pat
         preload.push(":");
         preload.push(&previous);
     }
-    cmd.env("LD_PRELOAD", preload).env("XWLBRIDGE_UI_LD_PRELOAD", previous);
+    cmd.env("LD_PRELOAD", preload)
+        .env("XWLBRIDGE_UI_LD_PRELOAD", previous);
     // what the user may have exported must not steer the hook
-    for var in ["XWLBRIDGE_UI_DISPLAY", "XWLBRIDGE_UI_XAUTHORITY", "XWLBRIDGE_UI_GATE"] {
+    for var in [
+        "XWLBRIDGE_UI_DISPLAY",
+        "XWLBRIDGE_UI_XAUTHORITY",
+        "XWLBRIDGE_UI_GATE",
+    ] {
         cmd.env_remove(var);
     }
     if let Some((ui, gate)) = ui {
@@ -937,7 +1097,11 @@ mod tests {
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("xwlbridge-uidisplay-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
         dir
     }
 
@@ -956,13 +1120,22 @@ mod tests {
         // no core next to it: nothing to substitute
         assert_eq!(core_for(launcher.as_os_str(), None), None);
         fs::write(dir.join("vncserver-x11-core"), b"").unwrap();
-        assert_eq!(core_for(launcher.as_os_str(), None), Some(dir.join("vncserver-x11-core")));
+        assert_eq!(
+            core_for(launcher.as_os_str(), None),
+            Some(dir.join("vncserver-x11-core"))
+        );
         // by name, through the search path
         let path = env::join_paths([Path::new("/nonexistent"), &dir]).unwrap();
-        assert_eq!(core_for(OsStr::new("vncserver-x11"), Some(&path)), Some(dir.join("vncserver-x11-core")));
+        assert_eq!(
+            core_for(OsStr::new("vncserver-x11"), Some(&path)),
+            Some(dir.join("vncserver-x11-core"))
+        );
         // other programs are left alone
         assert_eq!(core_for(OsStr::new("x11vnc"), Some(&path)), None);
-        assert_eq!(core_for(OsStr::new("vncserver-x11-core"), Some(&path)), None);
+        assert_eq!(
+            core_for(OsStr::new("vncserver-x11-core"), Some(&path)),
+            None
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -984,36 +1157,65 @@ mod tests {
         assert_eq!(mutter_cookie(&dir), None);
         fs::write(dir.join(".mutter-Xwaylandauth.ABC123"), b"").unwrap();
         fs::write(dir.join("unrelated"), b"").unwrap();
-        assert_eq!(mutter_cookie(&dir), Some(dir.join(".mutter-Xwaylandauth.ABC123").into_os_string()));
+        assert_eq!(
+            mutter_cookie(&dir),
+            Some(dir.join(".mutter-Xwaylandauth.ABC123").into_os_string())
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn apply_keeps_an_existing_preload() {
-        let ui = UiDisplay { display: ":0".into(), xauthority: Some("/run/user/1000/.mutter-Xwaylandauth.X".into()) };
+        let ui = UiDisplay {
+            display: ":0".into(),
+            xauthority: Some("/run/user/1000/.mutter-Xwaylandauth.X".into()),
+        };
         let envs = |cmd: &Command| -> Vec<(OsString, Option<OsString>)> {
-            cmd.get_envs().map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string))).collect()
+            cmd.get_envs()
+                .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+                .collect()
         };
         let get = |envs: &[(OsString, Option<OsString>)], k: &str| {
             envs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
         };
         let hook = Path::new("/run/user/1000/xwlbridge-uihook-0.so");
         let mut cmd = Command::new("true");
-        apply(&mut cmd, hook, Some((&ui, Some(Path::new("/run/user/1000/xwlbridge-ui-7.gate")))));
+        apply(
+            &mut cmd,
+            hook,
+            Some((&ui, Some(Path::new("/run/user/1000/xwlbridge-ui-7.gate")))),
+        );
         let e = envs(&cmd);
         let preload = get(&e, "LD_PRELOAD").flatten().unwrap();
-        assert!(preload.as_bytes().starts_with(b"/run/user/1000/xwlbridge-uihook-0.so"));
+        assert!(
+            preload
+                .as_bytes()
+                .starts_with(b"/run/user/1000/xwlbridge-uihook-0.so")
+        );
         assert_eq!(get(&e, "XWLBRIDGE_UI_DISPLAY").flatten().unwrap(), ":0");
-        assert_eq!(get(&e, "XWLBRIDGE_UI_XAUTHORITY").flatten().unwrap(), "/run/user/1000/.mutter-Xwaylandauth.X");
-        assert_eq!(get(&e, "XWLBRIDGE_UI_GATE").flatten().unwrap(), "/run/user/1000/xwlbridge-ui-7.gate");
+        assert_eq!(
+            get(&e, "XWLBRIDGE_UI_XAUTHORITY").flatten().unwrap(),
+            "/run/user/1000/.mutter-Xwaylandauth.X"
+        );
+        assert_eq!(
+            get(&e, "XWLBRIDGE_UI_GATE").flatten().unwrap(),
+            "/run/user/1000/xwlbridge-ui-7.gate"
+        );
         // the hook restores this in the UI process
-        assert_eq!(get(&e, "XWLBRIDGE_UI_LD_PRELOAD").flatten().unwrap(), env::var_os("LD_PRELOAD").unwrap_or_default());
+        assert_eq!(
+            get(&e, "XWLBRIDGE_UI_LD_PRELOAD").flatten().unwrap(),
+            env::var_os("LD_PRELOAD").unwrap_or_default()
+        );
         // no UI display (the built-in engine's crash guard alone): the hook, and none of the inherited instructions
         let mut cmd = Command::new("true");
         apply(&mut cmd, hook, None);
         let e = envs(&cmd);
         assert!(get(&e, "LD_PRELOAD").flatten().is_some());
-        for var in ["XWLBRIDGE_UI_DISPLAY", "XWLBRIDGE_UI_XAUTHORITY", "XWLBRIDGE_UI_GATE"] {
+        for var in [
+            "XWLBRIDGE_UI_DISPLAY",
+            "XWLBRIDGE_UI_XAUTHORITY",
+            "XWLBRIDGE_UI_GATE",
+        ] {
             assert_eq!(get(&e, var), Some(None), "{var} must be removed");
         }
     }
@@ -1043,11 +1245,15 @@ mod tests {
         assert_eq!(choose(None, false), Ok(Choice::Off(None)));
         // a forwarded (network) display is not the desktop's
         put("DISPLAY", Some("localhost:10.0"));
-        assert!(matches!(choose(None, true), Ok(Choice::Off(Some(why))) if why.contains("not a local")));
+        assert!(
+            matches!(choose(None, true), Ok(Choice::Off(Some(why))) if why.contains("not a local"))
+        );
         // explicit is explicit
         assert!(matches!(choose(Some("auto"), true), Ok(Choice::Display(_))));
         put("DISPLAY", None);
-        assert!(matches!(choose(None, true), Ok(Choice::Off(Some(why))) if why.contains("no DISPLAY")));
+        assert!(
+            matches!(choose(None, true), Ok(Choice::Off(Some(why))) if why.contains("no DISPLAY"))
+        );
         assert!(choose(Some("auto"), true).is_err());
         put("DISPLAY", saved.0.as_deref().and_then(OsStr::to_str));
         put("XAUTHORITY", saved.1.as_deref().and_then(OsStr::to_str));
@@ -1065,7 +1271,10 @@ mod tests {
         for remote in ["localhost:10.0", "otherhost:0", "tcp/host:0", "", "garbage"] {
             assert!(!is_local(OsStr::new(remote)), "{remote}");
         }
-        let d = |s: &str| UiDisplay { display: s.into(), xauthority: None };
+        let d = |s: &str| UiDisplay {
+            display: s.into(),
+            xauthority: None,
+        };
         assert!(same_display(&d(":20"), 20));
         assert!(same_display(&d(":20.0"), 20));
         assert!(!same_display(&d(":0"), 20));
@@ -1104,10 +1313,16 @@ mod tests {
         assert_eq!(p.poll(Some(10), false, at(5), never), PlaceAction::Nothing);
         assert_eq!(p.poll(Some(10), false, at(10), never), PlaceAction::Nothing);
         // probed every RETRY: still nothing there
-        assert_eq!(p.poll(Some(10), false, at(15), || false), PlaceAction::Nothing);
+        assert_eq!(
+            p.poll(Some(10), false, at(15), || false),
+            PlaceAction::Nothing
+        );
         assert_eq!(p.poll(Some(10), false, at(20), never), PlaceAction::Nothing);
         // it answers: gate on, the running UI is ended so RealVNC starts it there
-        assert_eq!(p.poll(Some(10), false, at(30), || true), PlaceAction::On(Some(10)));
+        assert_eq!(
+            p.poll(Some(10), false, at(30), || true),
+            PlaceAction::On(Some(10))
+        );
         assert!(p.on() && !p.settled());
         // the new UI process is there
         assert_eq!(p.poll(Some(11), false, at(35), never), PlaceAction::Nothing);
@@ -1126,9 +1341,22 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut p = Placement::new(true, t0);
         let s = |n: u64| t0 + Duration::from_secs(n);
-        let looks = [(0, Some(100)), (5, Some(100)), (10, None), (15, Some(101)), (20, None), (25, Some(102)), (30, Some(102)), (35, Some(102))];
+        let looks = [
+            (0, Some(100)),
+            (5, Some(100)),
+            (10, None),
+            (15, Some(101)),
+            (20, None),
+            (25, Some(102)),
+            (30, Some(102)),
+            (35, Some(102)),
+        ];
         for (t, ui) in looks {
-            assert_eq!(p.poll(ui, false, s(t), || true), PlaceAction::Nothing, "look at {t} s");
+            assert_eq!(
+                p.poll(ui, false, s(t), || true),
+                PlaceAction::Nothing,
+                "look at {t} s"
+            );
         }
         assert!(p.on());
     }
@@ -1141,11 +1369,17 @@ mod tests {
         let never = || -> bool { panic!("must not probe now") };
         let mut p = Placement::new(false, t0);
         // answers while a viewer is connected: gate on, the move waits (said once)
-        assert_eq!(p.poll(Some(10), true, at(15), || true), PlaceAction::Deferred(10));
+        assert_eq!(
+            p.poll(Some(10), true, at(15), || true),
+            PlaceAction::Deferred(10)
+        );
         assert!(p.on());
         assert_eq!(p.poll(Some(10), true, at(20), never), PlaceAction::Nothing);
         // the viewer leaves: now
-        assert_eq!(p.poll(Some(10), false, at(25), never), PlaceAction::Restart(10));
+        assert_eq!(
+            p.poll(Some(10), false, at(25), never),
+            PlaceAction::Restart(10)
+        );
         assert_eq!(p.poll(Some(11), false, at(30), never), PlaceAction::Nothing);
         assert!(p.settled());
         // the display goes away: UI processes keep exiting there (RealVNC restarts them every 2 s)
@@ -1159,13 +1393,25 @@ mod tests {
         for s in [55, 80, 100, 105] {
             assert_eq!(p.poll(Some(14), false, at(s), never), PlaceAction::Nothing);
         }
-        assert_eq!(p.poll(Some(14), false, at(110), || false), PlaceAction::Nothing);
-        assert_eq!(p.poll(Some(14), false, at(125), || true), PlaceAction::On(Some(14)));
+        assert_eq!(
+            p.poll(Some(14), false, at(110), || false),
+            PlaceAction::Nothing
+        );
+        assert_eq!(
+            p.poll(Some(14), false, at(125), || true),
+            PlaceAction::On(Some(14))
+        );
         // a UI that went by itself before the move: nothing to end, the next one goes there
         let mut q = Placement::new(false, t0);
-        assert_eq!(q.poll(Some(20), false, at(15), || true), PlaceAction::On(Some(20)));
+        assert_eq!(
+            q.poll(Some(20), false, at(15), || true),
+            PlaceAction::On(Some(20))
+        );
         let mut r = Placement::new(false, t0);
-        assert_eq!(r.poll(Some(30), true, at(15), || true), PlaceAction::Deferred(30));
+        assert_eq!(
+            r.poll(Some(30), true, at(15), || true),
+            PlaceAction::Deferred(30)
+        );
         assert_eq!(r.poll(None, true, at(20), never), PlaceAction::Nothing);
         assert!(r.settled());
     }
@@ -1190,7 +1436,11 @@ mod tests {
         let mut q = Placement::new(true, t0);
         for s in (5..600).step_by(5) {
             let ui = if s % 120 == 0 { None } else { Some(9) };
-            assert_eq!(q.poll(ui, false, at(s), never), PlaceAction::Nothing, "at {s}");
+            assert_eq!(
+                q.poll(ui, false, at(s), never),
+                PlaceAction::Nothing,
+                "at {s}"
+            );
         }
     }
 
@@ -1225,13 +1475,28 @@ mod tests {
         let mut p = Placement::new(true, t0);
         assert!(p.settled());
         // RealVNC's first UI process, then a restart now and then (icon watch, Options): no churn
-        assert_eq!(p.poll(Some(1), false, t0 + Duration::from_secs(5), || panic!()), PlaceAction::Nothing);
-        assert_eq!(p.poll(Some(2), false, t0 + Duration::from_secs(30), || panic!()), PlaceAction::Nothing);
-        assert_eq!(p.poll(Some(3), false, t0 + Duration::from_secs(95), || panic!()), PlaceAction::Nothing);
+        assert_eq!(
+            p.poll(Some(1), false, t0 + Duration::from_secs(5), || panic!()),
+            PlaceAction::Nothing
+        );
+        assert_eq!(
+            p.poll(Some(2), false, t0 + Duration::from_secs(30), || panic!()),
+            PlaceAction::Nothing
+        );
+        assert_eq!(
+            p.poll(Some(3), false, t0 + Duration::from_secs(95), || panic!()),
+            PlaceAction::Nothing
+        );
         assert!(p.on());
     }
 
-    fn xauth_entry(family: u16, address: &[u8], number: &[u8], name: &[u8], data: &[u8]) -> Vec<u8> {
+    fn xauth_entry(
+        family: u16,
+        address: &[u8],
+        number: &[u8],
+        name: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut v = family.to_be_bytes().to_vec();
         for f in [address, number, name, data] {
             v.extend_from_slice(&(f.len() as u16).to_be_bytes());
@@ -1245,14 +1510,29 @@ mod tests {
         let m = b"MIT-MAGIC-COOKIE-1";
         let mut file = xauth_entry(256, b"otherhost", b"0", m, b"other");
         file.extend(xauth_entry(256, b"myhost", b"1", m, b"display1"));
-        file.extend(xauth_entry(256, b"myhost", b"0", b"XDM-AUTHORIZATION-1", b"xdm"));
+        file.extend(xauth_entry(
+            256,
+            b"myhost",
+            b"0",
+            b"XDM-AUTHORIZATION-1",
+            b"xdm",
+        ));
         file.extend(xauth_entry(256, b"myhost", b"0", m, b"mine"));
-        assert_eq!(find_cookie(&file, b"myhost", 0), Some((m.to_vec(), b"mine".to_vec())));
-        assert_eq!(find_cookie(&file, b"myhost", 1), Some((m.to_vec(), b"display1".to_vec())));
+        assert_eq!(
+            find_cookie(&file, b"myhost", 0),
+            Some((m.to_vec(), b"mine".to_vec()))
+        );
+        assert_eq!(
+            find_cookie(&file, b"myhost", 1),
+            Some((m.to_vec(), b"display1".to_vec()))
+        );
         assert_eq!(find_cookie(&file, b"myhost", 2), None);
         // mutter writes FamilyWild entries too: any host, and an empty number is any display
         let wild = xauth_entry(65535, b"", b"", m, b"wild");
-        assert_eq!(find_cookie(&wild, b"whatever", 7), Some((m.to_vec(), b"wild".to_vec())));
+        assert_eq!(
+            find_cookie(&wild, b"whatever", 7),
+            Some((m.to_vec(), b"wild".to_vec()))
+        );
         // a truncated file is no cookie, not a panic
         assert_eq!(find_cookie(&file[..9], b"myhost", 0), None);
         assert_eq!(find_cookie(&[], b"myhost", 0), None);
@@ -1272,7 +1552,8 @@ mod tests {
         s.read_exact(&mut rest).unwrap();
         let data = &rest[nlen.div_ceil(4) * 4..][..dlen];
         if data != want {
-            let reason = b"Authorization required, but no authorization protocol specified\n".to_vec();
+            let reason =
+                b"Authorization required, but no authorization protocol specified\n".to_vec();
             let failed = SetupFailed {
                 status: 0,
                 protocol_major_version: 11,
@@ -1287,7 +1568,11 @@ mod tests {
             s.write_all(&buf).unwrap();
             return;
         }
-        s.write_all(&setup(crate::util::Geometry::default(), crate::bridge::x11::CLIENT_RESOURCE_ID_BASE)).unwrap();
+        s.write_all(&setup(
+            crate::util::Geometry::default(),
+            crate::bridge::x11::CLIENT_RESOURCE_ID_BASE,
+        ))
+        .unwrap();
         let mut req = [0u8; 4];
         // InternAtom: header + name
         s.read_exact(&mut req).unwrap();
@@ -1296,7 +1581,12 @@ mod tests {
         s.read_exact(&mut body).unwrap();
         assert_eq!(req[0], 16);
         assert!(body[4..].starts_with(b"_NET_SYSTEM_TRAY_S0"));
-        s.write_all(&build_reply(&InternAtomReply { sequence: 1, length: 0, atom })).unwrap();
+        s.write_all(&build_reply(&InternAtomReply {
+            sequence: 1,
+            length: 0,
+            atom,
+        }))
+        .unwrap();
         if atom == 0 {
             return;
         }
@@ -1304,7 +1594,12 @@ mod tests {
         s.read_exact(&mut req).unwrap();
         assert_eq!(req[0], 23); // GetSelectionOwner
         assert_eq!(u32::from_le_bytes(req[4..8].try_into().unwrap()), atom);
-        s.write_all(&build_reply(&GetSelectionOwnerReply { sequence: 2, length: 0, owner })).unwrap();
+        s.write_all(&build_reply(&GetSelectionOwnerReply {
+            sequence: 2,
+            length: 0,
+            owner,
+        }))
+        .unwrap();
     }
 
     fn probe_fake(cookie: Option<&'static [u8]>, atom: u32, owner: u32) -> Result<Probe, String> {
@@ -1318,9 +1613,17 @@ mod tests {
 
     #[test]
     fn probe_finds_the_tray() {
-        assert_eq!(probe_fake(Some(b"sesame"), 300, 0x60_0009), Ok(Probe { tray: Some(0x60_0009) }));
+        assert_eq!(
+            probe_fake(Some(b"sesame"), 300, 0x60_0009),
+            Ok(Probe {
+                tray: Some(0x60_0009)
+            })
+        );
         // the atom exists but nobody owns the selection
-        assert_eq!(probe_fake(Some(b"sesame"), 300, 0), Ok(Probe { tray: None }));
+        assert_eq!(
+            probe_fake(Some(b"sesame"), 300, 0),
+            Ok(Probe { tray: None })
+        );
         // nobody ever interned the atom
         assert_eq!(probe_fake(Some(b"sesame"), 0, 0), Ok(Probe { tray: None }));
     }
@@ -1335,7 +1638,10 @@ mod tests {
 
     #[test]
     fn probe_of_a_missing_display() {
-        let ui = UiDisplay { display: ":4093".into(), xauthority: None };
+        let ui = UiDisplay {
+            display: ":4093".into(),
+            xauthority: None,
+        };
         let e = probe(&ui, Duration::from_secs(1)).unwrap_err();
         assert!(e.contains(":4093"), "{e}");
     }
@@ -1345,7 +1651,12 @@ mod tests {
         let dir = tmpdir("dirperm");
         assert!(usable_dir(&dir).is_ok());
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777)).unwrap();
-        assert!(usable_dir(&dir).unwrap_err().to_string().contains("writable by others"));
+        assert!(
+            usable_dir(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("writable by others")
+        );
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1394,10 +1705,19 @@ mod tests {
     #[test]
     fn wrappers_hide_the_launcher() {
         let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
-        assert!(wrapped_launcher(OsStr::new("env"), &args(&["A=1", "vncserver-x11", "-RfbPort=5900"])));
-        assert!(wrapped_launcher(OsStr::new("/bin/sh"), &args(&["-c", "exec /usr/bin/vncserver-x11 -x"])));
+        assert!(wrapped_launcher(
+            OsStr::new("env"),
+            &args(&["A=1", "vncserver-x11", "-RfbPort=5900"])
+        ));
+        assert!(wrapped_launcher(
+            OsStr::new("/bin/sh"),
+            &args(&["-c", "exec /usr/bin/vncserver-x11 -x"])
+        ));
         // the core itself is fine behind a wrapper (no setuid launcher in between)
-        assert!(!wrapped_launcher(OsStr::new("env"), &args(&["vncserver-x11-core"])));
+        assert!(!wrapped_launcher(
+            OsStr::new("env"),
+            &args(&["vncserver-x11-core"])
+        ));
         assert!(!wrapped_launcher(OsStr::new("vncserver-x11"), &args(&[])));
         assert!(!wrapped_launcher(OsStr::new("env"), &args(&["x11vnc"])));
     }
@@ -1415,25 +1735,43 @@ mod tests {
         // icon up, then gone: one miss is tolerated, the second asks for a restart
         assert_eq!(w.poll(Some(10), true, false, at(15)), IconAction::Nothing);
         assert_eq!(w.poll(Some(10), false, false, at(20)), IconAction::Nothing);
-        assert_eq!(w.poll(Some(10), false, false, at(25)), IconAction::Restart(10));
+        assert_eq!(
+            w.poll(Some(10), false, false, at(25)),
+            IconAction::Restart(10)
+        );
         // nothing more for that pid until it is replaced
         assert_eq!(w.poll(Some(10), false, false, at(30)), IconAction::Nothing);
         // the new UI's icon dies while a viewer is connected: deferred (said once), then restarted when idle
         assert_eq!(w.poll(Some(11), true, false, at(35)), IconAction::Nothing);
         assert_eq!(w.poll(Some(11), false, true, at(40)), IconAction::Nothing);
-        assert_eq!(w.poll(Some(11), false, true, at(45)), IconAction::Deferred(11));
+        assert_eq!(
+            w.poll(Some(11), false, true, at(45)),
+            IconAction::Deferred(11)
+        );
         assert_eq!(w.poll(Some(11), false, true, at(50)), IconAction::Nothing);
-        assert_eq!(w.poll(Some(11), false, false, at(55)), IconAction::Restart(11));
+        assert_eq!(
+            w.poll(Some(11), false, false, at(55)),
+            IconAction::Restart(11)
+        );
         // a third restart is allowed, a fourth within the hour is not
         assert_eq!(w.poll(Some(12), true, false, at(60)), IconAction::Nothing);
         w.poll(Some(12), false, false, at(65));
-        assert_eq!(w.poll(Some(12), false, false, at(70)), IconAction::Restart(12));
+        assert_eq!(
+            w.poll(Some(12), false, false, at(70)),
+            IconAction::Restart(12)
+        );
         assert_eq!(w.poll(Some(13), true, false, at(75)), IconAction::Nothing);
         w.poll(Some(13), false, false, at(80));
-        assert_eq!(w.poll(Some(13), false, false, at(85)), IconAction::GiveUp(13));
+        assert_eq!(
+            w.poll(Some(13), false, false, at(85)),
+            IconAction::GiveUp(13)
+        );
         assert_eq!(w.poll(Some(13), false, false, at(90)), IconAction::Nothing);
         // an hour after the first restarts there is room again
-        assert_eq!(w.poll(Some(13), false, false, at(3700)), IconAction::Restart(13));
+        assert_eq!(
+            w.poll(Some(13), false, false, at(3700)),
+            IconAction::Restart(13)
+        );
         // no UI process at all
         assert_eq!(w.poll(None, false, false, at(3705)), IconAction::Nothing);
     }
@@ -1450,10 +1788,17 @@ mod tests {
     fn realvnc_parameters_on_the_command_line() {
         let args = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
         assert_eq!(
-            command_line_params(&args(&["-RfbPort=5900", "Encryption=AlwaysOn", "-Log=*:stderr:30"])),
+            command_line_params(&args(&[
+                "-RfbPort=5900",
+                "Encryption=AlwaysOn",
+                "-Log=*:stderr:30"
+            ])),
             ["RfbPort", "Encryption", "Log"]
         );
-        assert_eq!(command_line_params(&args(&["-Authentication", "VncAuth"])), ["Authentication"]);
+        assert_eq!(
+            command_line_params(&args(&["-Authentication", "VncAuth"])),
+            ["Authentication"]
+        );
         assert!(command_line_params(&args(&["-service", "-showstatus"])).is_empty());
         assert!(command_line_params(&args(&[])).is_empty());
     }

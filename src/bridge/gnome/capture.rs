@@ -281,7 +281,11 @@ fn buffer_and_meta_params() -> Vec<Vec<u8>> {
         // mutter offers exactly CURSOR_META_SIZE(384,384); the range must contain it
         meta_param(
             spa::sys::SPA_META_Cursor,
-            int_range(cursor_size(384, 384), cursor_size(1, 1), cursor_size(384, 384)),
+            int_range(
+                cursor_size(384, 384),
+                cursor_size(1, 1),
+                cursor_size(384, 384),
+            ),
         ),
         // up to 32 damage rects per frame (more collapse into their bounding box)
         meta_param(
@@ -382,8 +386,7 @@ impl Capture {
                 st.height = h;
                 st.need_full = true;
                 let bytes = buffer_and_meta_params();
-                let mut pods: Vec<&Pod> =
-                    bytes.iter().filter_map(|b| Pod::from_bytes(b)).collect();
+                let mut pods: Vec<&Pod> = bytes.iter().filter_map(|b| Pod::from_bytes(b)).collect();
                 if let Err(e) = stream.update_params(&mut pods) {
                     crate::warning!("gnome: stream {} buffer params: {e}", st.key);
                 }
@@ -402,7 +405,12 @@ impl Capture {
                         .map(|d| {
                             d.iter()
                                 .map(|r| {
-                                    (r.position().x, r.position().y, r.size().width, r.size().height)
+                                    (
+                                        r.position().x,
+                                        r.position().y,
+                                        r.size().width,
+                                        r.size().height,
+                                    )
                                 })
                                 .collect()
                         })
@@ -458,7 +466,9 @@ impl StreamState {
         let rects: Vec<(u32, u32, u32, u32)> = if diffed {
             // no damage metadata (an area stream): the diff finds it, and
             // has copied what changed
-            self.server.framebuffer.blit_tiles(ox, oy, w, h, stride, src)
+            self.server
+                .framebuffer
+                .blit_tiles(ox, oy, w, h, stride, src)
         } else if self.need_full {
             vec![(0, 0, w, h)]
         } else {
@@ -609,7 +619,10 @@ mod tests {
         let px = [0x80, 0, 0, 0x80, 0, 0, 0xff, 0xff];
         assert_eq!(to_argb(&px, 2, 1, 8, false), vec![0x8080_0000, 0xff00_00ff]);
         let bgra = [0, 0, 0x80, 0x80, 0xff, 0, 0, 0xff];
-        assert_eq!(to_argb(&bgra, 2, 1, 8, true), vec![0x8080_0000, 0xff00_00ff]);
+        assert_eq!(
+            to_argb(&bgra, 2, 1, 8, true),
+            vec![0x8080_0000, 0xff00_00ff]
+        );
     }
 
     #[test]

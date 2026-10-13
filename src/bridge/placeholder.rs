@@ -43,10 +43,20 @@ pub fn paint(server: &Server, kind: Kind) {
         for px in data.chunks_exact_mut(4) {
             px.copy_from_slice(&BG);
         }
-        let mut canvas = Canvas { w: w as i32, h: h as i32, data };
+        let mut canvas = Canvas {
+            w: w as i32,
+            h: h as i32,
+            data,
+        };
         let mut centres: Vec<(i32, i32, i32)> = rects
             .iter()
-            .map(|r| (r.px + r.pw / 2, r.py + r.ph / 2, (r.pw.min(r.ph) / 6).max(24)))
+            .map(|r| {
+                (
+                    r.px + r.pw / 2,
+                    r.py + r.ph / 2,
+                    (r.pw.min(r.ph) / 6).max(24),
+                )
+            })
             .collect();
         if centres.is_empty() {
             centres.push((w as i32 / 2, h as i32 / 2, (w.min(h) as i32 / 6).max(24)));
@@ -124,7 +134,13 @@ impl Canvas<'_> {
         self.rect(cx - ro, ring_cy, cx - ri, body_top, FG);
         self.rect(cx + ri + 1, ring_cy, cx + ro + 1, body_top, FG);
         // body
-        self.rect(cx - body_w / 2, body_top, cx + body_w / 2, body_top + body_h, FG);
+        self.rect(
+            cx - body_w / 2,
+            body_top,
+            cx + body_w / 2,
+            body_top + body_h,
+            FG,
+        );
         // keyhole: a disc and a slot below it
         let kr = (s / 16).max(2);
         let ky = body_top + body_h * 2 / 5;

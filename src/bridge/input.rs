@@ -237,7 +237,9 @@ impl OnDemand {
             .queue
             .iter()
             .filter_map(|p| match p {
-                Pending::Event { at, client, .. } if at.elapsed() > PENDING_MAX_AGE => Some(*client),
+                Pending::Event { at, client, .. } if at.elapsed() > PENDING_MAX_AGE => {
+                    Some(*client)
+                }
                 _ => None,
             })
             .collect();
@@ -270,7 +272,9 @@ impl OnDemand {
     /// a release, which is let through (it may end a press made before the
     /// burst; one of a dropped press does nothing).
     fn cut_off(&mut self, client: u32, type_: u8, now: Instant) -> bool {
-        let Some(last) = self.cut.get_mut(&client) else { return false };
+        let Some(last) = self.cut.get_mut(&client) else {
+            return false;
+        };
         if now.duration_since(*last) >= BURST_GAP {
             self.cut.remove(&client);
             return false;
@@ -435,7 +439,11 @@ impl Input {
             None => Duration::from_secs(60),
         };
         if !wait.is_zero() {
-            drop(self.linger_cv.wait_timeout(st, wait).unwrap_or_else(PoisonError::into_inner));
+            drop(
+                self.linger_cv
+                    .wait_timeout(st, wait)
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
         }
     }
 
@@ -464,7 +472,9 @@ impl Input {
         }
         let guard = self.backend.read().unwrap_or_else(PoisonError::into_inner);
         let active = self.last_input();
-        let due = |left: Option<Instant>| left.is_some_and(|l| now >= linger_due(l, active, self.policy.linger));
+        let due = |left: Option<Instant>| {
+            left.is_some_and(|l| now >= linger_due(l, active, self.policy.linger))
+        };
         let (keys, buttons) = {
             let mut st = lock(&self.state);
             let st = &mut *st;
@@ -502,11 +512,13 @@ impl Input {
         };
         let Some(b) = guard.as_ref() else { return };
         for &kc in &keys {
-            b.keyboard.key(self.time(), u32::from(kc).wrapping_sub(8), 0);
+            b.keyboard
+                .key(self.time(), u32::from(kc).wrapping_sub(8), 0);
             self.update_modifiers(b, kc, false);
         }
         for &i in &buttons {
-            b.pointer.button(self.time(), BUTTON_CODES[i].1, ButtonState::Released);
+            b.pointer
+                .button(self.time(), BUTTON_CODES[i].1, ButtonState::Released);
             b.pointer.frame();
         }
         let released = keys.len() + buttons.len();
@@ -577,7 +589,12 @@ impl Input {
     /// follows its press, whenever it comes.
     #[allow(dead_code)]
     pub fn replay_pending_with(&self, resolve: &dyn Fn(u8, u32, bool) -> Option<u8>) {
-        if self.backend.read().unwrap_or_else(PoisonError::into_inner).is_none() {
+        if self
+            .backend
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+        {
             return;
         }
         let mut od = lock(&self.on_demand);
@@ -637,7 +654,11 @@ impl Input {
                 } else {
                     String::new()
                 },
-                if stale > 0 { format!(", dropped {stale} that waited too long") } else { String::new() }
+                if stale > 0 {
+                    format!(", dropped {stale} that waited too long")
+                } else {
+                    String::new()
+                }
             );
         }
     }
@@ -661,7 +682,9 @@ impl Input {
             }
         }
         if dropped > 0 {
-            crate::log!("dropped {dropped} input event(s) that arrived while input was unavailable");
+            crate::log!(
+                "dropped {dropped} input event(s) that arrived while input was unavailable"
+            );
         }
     }
 
@@ -683,7 +706,9 @@ impl Input {
         }
         let (gone, stale) = od.expire();
         if stale > 0 {
-            crate::vlog!("dropped {stale} input event(s) of a burst that waited too long for devices");
+            crate::vlog!(
+                "dropped {stale} input event(s) of a burst that waited too long for devices"
+            );
         }
         for (c, lived) in gone {
             self.departed(c, lived);
@@ -691,7 +716,13 @@ impl Input {
         if od.cut_off(client, type_, Instant::now()) {
             return true;
         }
-        if od.queue.is_empty() && self.backend.read().unwrap_or_else(PoisonError::into_inner).is_some() {
+        if od.queue.is_empty()
+            && self
+                .backend
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
+        {
             return false;
         }
         let demand = matches!(type_, KEY_PRESS | BUTTON_PRESS | MOTION_NOTIFY);
@@ -704,7 +735,11 @@ impl Input {
             return true;
         }
         let at = Instant::now();
-        let sym = if matches!(type_, KEY_PRESS | KEY_RELEASE) { self.x_sym(detail) } else { 0 };
+        let sym = if matches!(type_, KEY_PRESS | KEY_RELEASE) {
+            self.x_sym(detail)
+        } else {
+            0
+        };
         let coalesced = type_ == MOTION_NOTIFY
             && detail == 0
             && match od.queue.back_mut() {
@@ -772,7 +807,12 @@ impl Input {
     /// dropped until this lands, since the protocol demands a keymap first.
     /// A no-op before [`set_devices`](Self::set_devices), which re-forwards.
     pub fn set_keymap(&self, format: u32, fd: BorrowedFd, size: u32) {
-        if let Some(b) = self.backend.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if let Some(b) = self
+            .backend
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             b.keyboard.keymap(format, fd, size);
             b.keymap_set.store(true, Ordering::Release);
             (b.flush)();
@@ -791,8 +831,7 @@ impl Input {
         // still down
         let key_count = lock(&self.state).key_count;
         for kc in 0..=u8::MAX {
-            if key_count[kc as usize] != 0 && state.key_get_layout(u32::from(kc)).is_some()
-            {
+            if key_count[kc as usize] != 0 && state.key_get_layout(u32::from(kc)).is_some() {
                 state.update_key(u32::from(kc), KeyDirection::Down);
             }
         }
@@ -881,7 +920,10 @@ impl Input {
         let st = &mut *st;
         let w = (x_keycode / 64) as usize;
         let bit = 1u64 << (x_keycode % 64);
-        let holds = st.clients.get(&client).is_some_and(|h| h.keys[w] & bit != 0);
+        let holds = st
+            .clients
+            .get(&client)
+            .is_some_and(|h| h.keys[w] & bit != 0);
         let count = &mut st.key_count[x_keycode as usize];
         if press {
             if holds {
@@ -962,7 +1004,10 @@ impl Input {
         {
             let mut od = lock(&self.on_demand);
             od.cut.remove(&client);
-            let queued = od.queue.iter().any(|p| matches!(p, Pending::Event { client: c, .. } if *c == client));
+            let queued = od
+                .queue
+                .iter()
+                .any(|p| matches!(p, Pending::Event { client: c, .. } if *c == client));
             if queued {
                 od.queue.push_back(Pending::Gone { client, lived });
                 return;
@@ -993,7 +1038,9 @@ impl Input {
         // its presses stay, as orphans any client may release; where an
         // orphan already holds the same key or button, two holders become
         // one (lingering from now on)
-        let Some(h) = st.clients.remove(&client) else { return };
+        let Some(h) = st.clients.remove(&client) else {
+            return;
+        };
         let mut kept = 0;
         for (w, &word) in h.keys.iter().enumerate() {
             let dup = st.orphan.keys[w] & word;
@@ -1063,7 +1110,8 @@ impl Input {
                 *count == 0
             };
             if last {
-                b.keyboard.key(self.time(), u32::from(kc).wrapping_sub(8), 0);
+                b.keyboard
+                    .key(self.time(), u32::from(kc).wrapping_sub(8), 0);
                 self.update_modifiers(b, kc, false);
                 released += 1;
             }
@@ -1172,9 +1220,7 @@ impl Input {
                     self.update_modifiers(b, detail, press);
                 }
             }
-            BUTTON_PRESS | BUTTON_RELEASE => {
-                self.button(b, client, detail, type_ == BUTTON_PRESS)
-            }
+            BUTTON_PRESS | BUTTON_RELEASE => self.button(b, client, detail, type_ == BUTTON_PRESS),
             MOTION_NOTIFY => {
                 if !self.pointer_allowed(b, &mut lock(&self.state), client) {
                     return;
@@ -1272,9 +1318,7 @@ impl Input {
         // lands correctly under mixed or fractional output scaling: the virtual
         // pointer resolves value/extent over the logical layout, so physical
         // coords with a physical extent would misplace the cursor.
-        if let Some((lx, ly, lw, lh)) = lock(&self.layout)
-            .as_ref()
-            .and_then(|l| l.to_logical(x, y))
+        if let Some((lx, ly, lw, lh)) = lock(&self.layout).as_ref().and_then(|l| l.to_logical(x, y))
         {
             b.pointer.motion_absolute(self.time(), lx, ly, lw, lh);
             b.pointer.frame();
@@ -1321,7 +1365,11 @@ mod tests {
             self.0.0.lock().unwrap().push("r".into());
         }
         fn button(&self, _: u32, button: u32, state: ButtonState) {
-            let s = if state == ButtonState::Pressed { "+" } else { "-" };
+            let s = if state == ButtonState::Pressed {
+                "+"
+            } else {
+                "-"
+            };
             self.0.0.lock().unwrap().push(format!("b{button}{s}"));
         }
         fn axis(&self, _: u32, _: Axis, _: f64) {}
@@ -1343,7 +1391,11 @@ mod tests {
     fn input(policy: InputPolicy) -> (Input, Log) {
         let log = Log::default();
         let i = Input::new(100, 100, policy);
-        i.set_devices(Box::new(|| {}), Box::new(Ptr(log.clone())), Box::new(Kbd(log.clone())));
+        i.set_devices(
+            Box::new(|| {}),
+            Box::new(Ptr(log.clone())),
+            Box::new(Kbd(log.clone())),
+        );
         let null = std::fs::File::open("/dev/null").unwrap();
         use std::os::fd::AsFd;
         i.set_keymap(1, null.as_fd(), 0);
@@ -1527,7 +1579,11 @@ mod tests {
     }
 
     fn install(i: &Input, log: &Log) {
-        i.set_devices(Box::new(|| {}), Box::new(Ptr(log.clone())), Box::new(Kbd(log.clone())));
+        i.set_devices(
+            Box::new(|| {}),
+            Box::new(Ptr(log.clone())),
+            Box::new(Kbd(log.clone())),
+        );
         let null = std::fs::File::open("/dev/null").unwrap();
         use std::os::fd::AsFd;
         i.set_keymap(1, null.as_fd(), 0);
@@ -1551,7 +1607,10 @@ mod tests {
         i.fake_input(A, KEY_PRESS, KC, 0, 0);
         i.fake_input(A, KEY_RELEASE, KC, 0, 0);
         i.client_gone(A, LONG);
-        assert!(asked.load(Ordering::Relaxed) >= 1, "the backend was asked for devices");
+        assert!(
+            asked.load(Ordering::Relaxed) >= 1,
+            "the backend was asked for devices"
+        );
         assert!(i.demanded_within(1000));
         assert!(i.has_pending());
         install(&i, &log);
@@ -1589,7 +1648,10 @@ mod tests {
         i.fake_input(A, KEY_PRESS, KC, 0, 0);
         i.fake_input(A, KEY_RELEASE, KC, 0, 0);
         assert!(!i.has_pending());
-        assert!(asked.load(Ordering::Relaxed) > n, "the backend still hears of it");
+        assert!(
+            asked.load(Ordering::Relaxed) > n,
+            "the backend still hears of it"
+        );
         // unlocked: a session starts, its devices come
         i.accept_pending();
         install(&i, &log);
@@ -1678,7 +1740,11 @@ mod tests {
         i.replay_pending();
         let got = log.take();
         assert_eq!(got.first().map(String::as_str), Some("k30+"));
-        assert_eq!(got.last().map(String::as_str), Some("k30-"), "the key must not stay down");
+        assert_eq!(
+            got.last().map(String::as_str),
+            Some("k30-"),
+            "the key must not stay down"
+        );
     }
 
     #[test]
@@ -1724,7 +1790,11 @@ mod tests {
         install(&i, &log);
         i.replay_pending_with(&|_, _, _| Some(29));
         i.client_gone(A, LONG);
-        assert_eq!(log.take(), vec!["k21+", "k21-"], "released where it was pressed");
+        assert_eq!(
+            log.take(),
+            vec!["k21+", "k21-"],
+            "released where it was pressed"
+        );
         i.fake_input(B, KEY_PRESS, 52, 0, 0);
         assert_eq!(log.take(), vec!["k44+"]);
     }
@@ -1914,7 +1984,11 @@ mod tests {
                 ..InputPolicy::default()
             };
             for kind in ["key", "keydown", "click", "buttondown", "stray_release"] {
-                assert_eq!(entries_after(policy, 2000, kind), 0, "persist={persist} {kind}");
+                assert_eq!(
+                    entries_after(policy, 2000, kind),
+                    0,
+                    "persist={persist} {kind}"
+                );
             }
         }
     }
@@ -2155,7 +2229,11 @@ mod tests {
                 ..InputPolicy::default()
             },
         ));
-        i.set_devices(Box::new(|| {}), Box::new(Ptr(log.clone())), Box::new(Kbd(log.clone())));
+        i.set_devices(
+            Box::new(|| {}),
+            Box::new(Ptr(log.clone())),
+            Box::new(Kbd(log.clone())),
+        );
         let null = std::fs::File::open("/dev/null").unwrap();
         use std::os::fd::AsFd;
         i.set_keymap(1, null.as_fd(), 0);
@@ -2169,6 +2247,9 @@ mod tests {
         }
         let took = t.elapsed();
         assert_eq!(log.take(), vec!["k42-"]);
-        assert!(took >= Duration::from_millis(100) && took < Duration::from_millis(1000), "{took:?}");
+        assert!(
+            took >= Duration::from_millis(100) && took < Duration::from_millis(1000),
+            "{took:?}"
+        );
     }
 }

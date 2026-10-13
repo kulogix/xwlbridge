@@ -54,16 +54,18 @@ use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, MapState, StackMode,
-    Window, WindowClass,
+    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, MapState,
+    StackMode, Window, WindowClass,
 };
-use x11rb::protocol::{composite, damage, shm, xtest, Event};
+use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
 
 use super::{AnyError, Auth};
@@ -81,7 +83,12 @@ const MAX_POOL: usize = 1 << 30;
 
 /// The plain background of `-showscreen` (no desktop picture: that would
 /// show the desktop inside itself).
-const SCREEN_BG: render::Color = render::Color { red: 0x3030, green: 0x3434, blue: 0x3838, alpha: 0xffff };
+const SCREEN_BG: render::Color = render::Color {
+    red: 0x3030,
+    green: 0x3434,
+    blue: 0x3838,
+    alpha: 0xffff,
+};
 
 /// The resource base of the reverse thread's X connection (0: none yet). Its
 /// XTest is on the reverse master, whose buttons and keys are its own, so
@@ -144,7 +151,11 @@ fn add_master_len(name_len: usize) -> u16 {
 /// Where a window of `len` pixels at `p` goes so it is wholly on a screen of
 /// `max` pixels (at 0 if it can't be).
 fn fit(p: i16, len: u16, max: i32) -> i16 {
-    if len as i32 >= max { 0 } else { (p as i32).clamp(0, max - len as i32) as i16 }
+    if len as i32 >= max {
+        0
+    } else {
+        (p as i32).clamp(0, max - len as i32) as i16
+    }
 }
 
 /// The bytes of one frame of `w`x`h` pixels, if a window that size may be
@@ -184,7 +195,10 @@ fn x_button(code: u32) -> Option<u8> {
 }
 
 fn find_master(conn: &RustConnection) -> Result<Option<Devices>, AnyError> {
-    let infos = conn.xinput_xi_query_device(xinput::Device::ALL)?.reply()?.infos;
+    let infos = conn
+        .xinput_xi_query_device(xinput::Device::ALL)?
+        .reply()?
+        .infos;
     let find = |suffix: &str, ty: xinput::DeviceType| {
         let want = format!("{MASTER_NAME} {suffix}");
         infos
@@ -192,13 +206,15 @@ fn find_master(conn: &RustConnection) -> Result<Option<Devices>, AnyError> {
             .find(|i| i.type_ == ty && i.name == want.as_bytes())
             .map(|i| i.deviceid)
     };
-    Ok(match (
-        find("pointer", xinput::DeviceType::MASTER_POINTER),
-        find("keyboard", xinput::DeviceType::MASTER_KEYBOARD),
-    ) {
-        (Some(pointer), Some(keyboard)) => Some(Devices { pointer, keyboard }),
-        _ => None,
-    })
+    Ok(
+        match (
+            find("pointer", xinput::DeviceType::MASTER_POINTER),
+            find("keyboard", xinput::DeviceType::MASTER_KEYBOARD),
+        ) {
+            (Some(pointer), Some(keyboard)) => Some(Devices { pointer, keyboard }),
+            _ => None,
+        },
+    )
 }
 
 /// Runs the reverse direction on its own thread (own X and Wayland
@@ -242,9 +258,15 @@ struct Buffers {
 
 enum Role {
     Toplevel(xdg_toplevel::XdgToplevel),
-    Popup { popup: xdg_popup::XdgPopup, parent: Window },
+    Popup {
+        popup: xdg_popup::XdgPopup,
+        parent: Window,
+    },
     /// `-showscreen`: the whole X screen.
-    Screen { toplevel: xdg_toplevel::XdgToplevel, viewport: Option<wp_viewport::WpViewport> },
+    Screen {
+        toplevel: xdg_toplevel::XdgToplevel,
+        viewport: Option<wp_viewport::WpViewport>,
+    },
 }
 
 struct Shown {
@@ -398,13 +420,16 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
     }
     // our XTest goes through the reverse master's XTest devices, and our
     // cursor queries are about its pointer
-    x.xinput_xi_set_client_pointer(x11rb::NONE, devs.pointer)?.check()?;
+    x.xinput_xi_set_client_pointer(x11rb::NONE, devs.pointer)?
+        .check()?;
     x.change_window_attributes(
         root,
-        &x11rb::protocol::xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+        &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+            .event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
     )?;
     x.xfixes_select_cursor_input(root, xfixes::CursorNotifyMask::DISPLAY_CURSOR)?;
-    let atom = |name: &[u8]| -> Result<u32, AnyError> { Ok(x.intern_atom(false, name)?.reply()?.atom) };
+    let atom =
+        |name: &[u8]| -> Result<u32, AnyError> { Ok(x.intern_atom(false, name)?.reply()?.atom) };
     let atoms = Atoms {
         wm_protocols: atom(b"WM_PROTOCOLS")?,
         wm_delete_window: atom(b"WM_DELETE_WINDOW")?,
@@ -414,7 +439,8 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         utf8_string: atom(b"UTF8_STRING")?,
     };
 
-    let wl = WlConnection::connect_to_env().map_err(|e| format!("no Wayland display to show windows on: {e}"))?;
+    let wl = WlConnection::connect_to_env()
+        .map_err(|e| format!("no Wayland display to show windows on: {e}"))?;
     let mut queue: EventQueue<State> = wl.new_event_queue();
     let qh = queue.handle();
     wl.display().get_registry(&qh, ());
@@ -466,14 +492,32 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
     }
     crate::log!(
         "-showwindows: showing the engine display's {} on the desktop (reverse master {:?}; pointer lock {}, viewporter {})",
-        if screen_mode { "screen as one window" } else { "windows" },
+        if screen_mode {
+            "screen as one window"
+        } else {
+            "windows"
+        },
         state.devs,
-        if state.constraints.is_some() && state.relative_manager.is_some() { "yes" } else { "no" },
-        if state.viewporter.is_some() { "yes" } else { "no" },
+        if state.constraints.is_some() && state.relative_manager.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
+        if state.viewporter.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
     );
     if let Some(c) = state.compositor.as_ref() {
         let surface = c.create_surface(&qh, 0);
-        state.cursor = Some(CursorImage { surface, buffer: None, hot: (0, 0), serial: 0, blank: false });
+        state.cursor = Some(CursorImage {
+            surface,
+            buffer: None,
+            hot: (0, 0),
+            serial: 0,
+            blank: false,
+        });
     }
     state.update_cursor();
 
@@ -502,15 +546,24 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         match wl.flush() {
             Ok(()) => {}
             // the compositor is slow to read: try again next time (review F7)
-            Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(wayland_client::backend::WaylandError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(format!("Wayland connection lost: {e}").into()),
         }
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
         let mut pfds = [
-            libc::pollfd { fd: xfd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: guard.connection_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: xfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 1000) };
         if n > 0 && pfds[1].revents != 0 {
@@ -544,7 +597,11 @@ impl State {
             .and_then(|r| r.value32().map(|v| v.collect()))
             .unwrap_or_default();
         let flags = v.first().copied().unwrap_or(0);
-        let input = if flags & 1 != 0 { v.get(1).copied().unwrap_or(1) != 0 } else { true };
+        let input = if flags & 1 != 0 {
+            v.get(1).copied().unwrap_or(1) != 0
+        } else {
+            true
+        };
         let iconic = flags & 2 != 0 && v.get(2).copied() == Some(3);
         (input, iconic)
     }
@@ -606,7 +663,8 @@ impl State {
         damage::create(&self.x, dmg, w, damage::ReportLevel::NON_EMPTY)?;
         self.x.change_window_attributes(
             w,
-            &x11rb::protocol::xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+                .event_mask(EventMask::PROPERTY_CHANGE),
         )?;
         Ok((g.x, g.y, width, height, g.depth, dmg))
     }
@@ -615,7 +673,10 @@ impl State {
     /// pointer grabs, warps and queries follow the desktop's input on it.
     fn adopt_client(&mut self, w: Window) {
         let set = self.x.xinput_xi_set_client_pointer(w, self.devs.pointer);
-        match set.map_err(AnyError::from).and_then(|c| c.check().map_err(AnyError::from)) {
+        match set
+            .map_err(AnyError::from)
+            .and_then(|c| c.check().map_err(AnyError::from))
+        {
             Ok(()) => {
                 let client = self.client_of(w);
                 if !self.adopted.contains(&client) {
@@ -626,7 +687,9 @@ impl State {
                     }
                 }
             }
-            Err(e) => crate::vlog!("-showwindows: can't give {w:#x}'s client the reverse pointer: {e}"),
+            Err(e) => {
+                crate::vlog!("-showwindows: can't give {w:#x}'s client the reverse pointer: {e}")
+            }
         }
     }
 
@@ -638,7 +701,10 @@ impl State {
         let (sw, sh) = (self.screen.0 as i32, self.screen.1 as i32);
         let (fx, fy) = (fit(x, width, sw), fit(y, height, sh));
         if (fx, fy) != (x, y) {
-            self.x.configure_window(w, &ConfigureWindowAux::new().x(i32::from(fx)).y(i32::from(fy)))?;
+            self.x.configure_window(
+                w,
+                &ConfigureWindowAux::new().x(i32::from(fx)).y(i32::from(fy)),
+            )?;
             (x, y) = (fx, fy);
         }
         let (input, iconic) = self.hints(w);
@@ -674,7 +740,11 @@ impl State {
             y,
             depth,
             if iconic { ", starts iconic" } else { "" },
-            if no_input { ", takes no keyboard input" } else { "" },
+            if no_input {
+                ", takes no keyboard input"
+            } else {
+                ""
+            },
         );
         let client = self.client_of(w);
         self.windows.insert(
@@ -711,7 +781,9 @@ impl State {
     fn show_popup(&mut self, w: Window, qh: &QueueHandle<State>) -> Result<(), AnyError> {
         let client = self.client_of(w);
         let mine = |s: &&Window, windows: &HashMap<Window, Shown>| {
-            windows.get(*s).is_some_and(|sh| sh.client == client && sh.frames > 0)
+            windows
+                .get(*s)
+                .is_some_and(|sh| sh.client == client && sh.frames > 0)
         };
         let parent = self
             .popups
@@ -725,12 +797,16 @@ impl State {
             .or_else(|| {
                 self.windows
                     .iter()
-                    .filter(|(_, s)| s.client == client && s.frames > 0 && matches!(s.role, Role::Toplevel(_)))
+                    .filter(|(_, s)| {
+                        s.client == client && s.frames > 0 && matches!(s.role, Role::Toplevel(_))
+                    })
                     .map(|(w, _)| *w)
                     .min()
             });
         let Some(parent) = parent else {
-            crate::vlog!("-showwindows: {w:#x} is override-redirect with no shown window of its client: not shown");
+            crate::vlog!(
+                "-showwindows: {w:#x} is override-redirect with no shown window of its client: not shown"
+            );
             return Ok(());
         };
         let (x, y, width, height, depth, dmg) = self.watch(w)?;
@@ -783,19 +859,32 @@ impl State {
         );
         self.popups.push(w);
         // it is on top on the X screen too, where the reverse pointer goes
-        let _ = self.x.configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        let _ = self
+            .x
+            .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
         Ok(())
     }
 
     /// `_NET_WM_WINDOW_TYPE`'s first atom's name, for the log.
     fn window_type(&self, w: Window) -> String {
         self.x
-            .get_property(false, w, self.atoms.net_wm_window_type, AtomEnum::ATOM, 0, 1)
+            .get_property(
+                false,
+                w,
+                self.atoms.net_wm_window_type,
+                AtomEnum::ATOM,
+                0,
+                1,
+            )
             .ok()
             .and_then(|c| c.reply().ok())
             .and_then(|r| r.value32().and_then(|mut v| v.next()))
             .and_then(|a| self.x.get_atom_name(a).ok()?.reply().ok())
-            .map(|r| String::from_utf8_lossy(&r.name).trim_start_matches("_NET_WM_WINDOW_TYPE_").to_lowercase())
+            .map(|r| {
+                String::from_utf8_lossy(&r.name)
+                    .trim_start_matches("_NET_WM_WINDOW_TYPE_")
+                    .to_lowercase()
+            })
             .unwrap_or_else(|| "untyped".into())
     }
 
@@ -898,7 +987,10 @@ impl State {
                     (s.x, s.y) = (e.x, e.y);
                     if (w, h) != (s.width, s.height) {
                         if frame_bytes(w, h).is_none() {
-                            crate::warning!("-showwindows: {:#x} grew to {w}x{h}, too big to show", e.window);
+                            crate::warning!(
+                                "-showwindows: {:#x} grew to {w}x{h}, too big to show",
+                                e.window
+                            );
                             self.hide(e.window, qh);
                             return;
                         }
@@ -920,7 +1012,11 @@ impl State {
             }
             Event::DamageNotify(e) => {
                 let _ = damage::subtract(&self.x, e.damage, x11rb::NONE, x11rb::NONE);
-                if self.canvas.as_ref().is_some_and(|c| c.members.contains_key(&e.drawable)) {
+                if self
+                    .canvas
+                    .as_ref()
+                    .is_some_and(|c| c.members.contains_key(&e.drawable))
+                {
                     self.screen_dirty();
                 } else if let Some(s) = self.windows.get_mut(&e.drawable) {
                     s.dirty = true;
@@ -932,7 +1028,11 @@ impl State {
                     && self.windows.contains_key(&e.window) =>
             {
                 let title = self.title(e.window);
-                if let Some(Shown { role: Role::Toplevel(t), .. }) = self.windows.get(&e.window) {
+                if let Some(Shown {
+                    role: Role::Toplevel(t),
+                    ..
+                }) = self.windows.get(&e.window)
+                {
                     t.set_title(title);
                 }
             }
@@ -949,8 +1049,14 @@ impl State {
                 s.frame_pending = false;
                 if let Some(t) = s.committed_at {
                     let ms = t.elapsed().as_millis();
-                    if ms > 30 && std::env::var_os("XWLBRIDGE_SHOW_FRAMELOG").is_some_and(|v| !v.is_empty()) {
-                        crate::warning!("-showwindows: frame callback of {w:#x} {ms} ms after its commit (dirty: {})", s.dirty);
+                    if ms > 30
+                        && std::env::var_os("XWLBRIDGE_SHOW_FRAMELOG")
+                            .is_some_and(|v| !v.is_empty())
+                    {
+                        crate::warning!(
+                            "-showwindows: frame callback of {w:#x} {ms} ms after its commit (dirty: {})",
+                            s.dirty
+                        );
                     }
                 }
             }
@@ -976,7 +1082,12 @@ impl State {
                 && (width as u16, height as u16) != (s.width, s.height)
                 && frame_bytes(width as u16, height as u16).is_some()
             {
-                let _ = self.x.configure_window(w, &ConfigureWindowAux::new().width(width as u32).height(height as u32));
+                let _ = self.x.configure_window(
+                    w,
+                    &ConfigureWindowAux::new()
+                        .width(width as u32)
+                        .height(height as u32),
+                );
             }
         }
         for (w, px, py) in std::mem::take(&mut self.placed) {
@@ -988,8 +1099,14 @@ impl State {
             {
                 let (nx, ny) = (i32::from(p.x) + px, i32::from(p.y) + py);
                 if (nx, ny) != (i32::from(s.x), i32::from(s.y)) {
-                    crate::vlog!("-showwindows: popup {w:#x} placed at {nx},{ny}, not {},{}", s.x, s.y);
-                    let _ = self.x.configure_window(w, &ConfigureWindowAux::new().x(nx).y(ny));
+                    crate::vlog!(
+                        "-showwindows: popup {w:#x} placed at {nx},{ny}, not {},{}",
+                        s.x,
+                        s.y
+                    );
+                    let _ = self
+                        .x
+                        .configure_window(w, &ConfigureWindowAux::new().x(nx).y(ny));
                 }
             }
         }
@@ -1001,13 +1118,22 @@ impl State {
         for locked in std::mem::take(&mut self.lock_events) {
             if let Some(l) = self.lock.as_mut() {
                 l.active = locked;
-                crate::log!("-showwindows: pointer {} on {:#x}", if locked { "locked" } else { "unlocked" }, l.window);
+                crate::log!(
+                    "-showwindows: pointer {} on {:#x}",
+                    if locked { "locked" } else { "unlocked" },
+                    l.window
+                );
             }
         }
         for (dx, dy) in std::mem::take(&mut self.relative) {
             self.relative_motion(dx, dy);
         }
-        let dirty: Vec<Window> = self.windows.iter().filter(|(_, s)| s.dirty).map(|(w, _)| *w).collect();
+        let dirty: Vec<Window> = self
+            .windows
+            .iter()
+            .filter(|(_, s)| s.dirty)
+            .map(|(w, _)| *w)
+            .collect();
         for w in dirty {
             self.paint(w);
         }
@@ -1033,7 +1159,11 @@ impl State {
             return Ok(());
         }
         let realloc = self.windows.get(&w).is_some_and(|s| {
-            s.configured && s.dirty && s.buffers.as_ref().is_none_or(|b| (b.width, b.height) != (s.width, s.height))
+            s.configured
+                && s.dirty
+                && s.buffers
+                    .as_ref()
+                    .is_none_or(|b| (b.width, b.height) != (s.width, s.height))
         });
         if realloc {
             // (re)allocate for the current size
@@ -1050,7 +1180,11 @@ impl State {
             let fd = memfd(frame * 2)?;
             let seg = self.x.generate_id()?;
             shm::attach_fd(&self.x, seg, fd.try_clone()?, false)?;
-            let format = if s.depth == 32 { wl_shm::Format::Argb8888 } else { wl_shm::Format::Xrgb8888 };
+            let format = if s.depth == 32 {
+                wl_shm::Format::Argb8888
+            } else {
+                wl_shm::Format::Xrgb8888
+            };
             let qh = self.qh.clone();
             let pool = shm_global.create_pool(fd.as_fd(), (frame * 2) as i32, &qh, ());
             let mk = |i: usize| {
@@ -1065,7 +1199,15 @@ impl State {
                 )
             };
             let buffers = [mk(0), mk(1)];
-            s.buffers = Some(Buffers { seg, pool, buffers, busy: [false; 2], width, height, frame });
+            s.buffers = Some(Buffers {
+                seg,
+                pool,
+                buffers,
+                busy: [false; 2],
+                width,
+                height,
+                frame,
+            });
         }
         let Some(s) = self.windows.get(&w) else {
             return Ok(());
@@ -1120,7 +1262,8 @@ impl State {
             return Err(e.into());
         }
         s.surface.attach(Some(&b.buffers[i]), 0, 0);
-        s.surface.damage_buffer(0, 0, b.width as i32, b.height as i32);
+        s.surface
+            .damage_buffer(0, 0, b.width as i32, b.height as i32);
         if self.throttle {
             s.surface.frame(&self.qh, w);
             s.frame_pending = true;
@@ -1144,7 +1287,9 @@ impl State {
 
     fn close_window(&mut self, w: Window) {
         if w == self.root {
-            crate::log!("-showscreen: the desktop closed the screen window; it stays up while the bridge runs");
+            crate::log!(
+                "-showscreen: the desktop closed the screen window; it stays up while the bridge runs"
+            );
             return;
         }
         if self.protocols(w).contains(&self.atoms.wm_delete_window) {
@@ -1157,7 +1302,9 @@ impl State {
             );
             let _ = self.x.send_event(false, w, EventMask::NO_EVENT, ev);
         } else {
-            crate::log!("-showwindows: closing {w:#x} (no WM_DELETE_WINDOW: disconnecting its client)");
+            crate::log!(
+                "-showwindows: closing {w:#x} (no WM_DELETE_WINDOW: disconnecting its client)"
+            );
             let _ = self.x.kill_client(w);
         }
     }
@@ -1212,9 +1359,15 @@ impl State {
             ((sx / scale).floor() as i32, (sy / scale).floor() as i32)
         } else {
             let s = self.windows.get(&w)?;
-            (s.x as i32 + sx.floor() as i32, s.y as i32 + sy.floor() as i32)
+            (
+                s.x as i32 + sx.floor() as i32,
+                s.y as i32 + sy.floor() as i32,
+            )
         };
-        Some((x.clamp(0, self.screen.0 as i32 - 1) as i16, y.clamp(0, self.screen.1 as i32 - 1) as i16))
+        Some((
+            x.clamp(0, self.screen.0 as i32 - 1) as i16,
+            y.clamp(0, self.screen.1 as i32 - 1) as i16,
+        ))
     }
 
     /// Moves the reverse pointer to surface-local `(sx, sy)` of `w`.
@@ -1244,7 +1397,12 @@ impl State {
     }
 
     fn query_pointer(&self) -> Option<(i16, i16)> {
-        let r = self.x.xinput_xi_query_pointer(self.root, self.devs.pointer).ok()?.reply().ok()?;
+        let r = self
+            .x
+            .xinput_xi_query_pointer(self.root, self.devs.pointer)
+            .ok()?
+            .reply()
+            .ok()?;
         Some(((r.root_x >> 16) as i16, (r.root_y >> 16) as i16))
     }
 
@@ -1266,7 +1424,13 @@ impl State {
             (),
         );
         let relative = manager.get_relative_pointer(pointer, &self.qh, ());
-        self.lock = Some(Lock { locked, relative, window: w, active: false, rest: (0.0, 0.0) });
+        self.lock = Some(Lock {
+            locked,
+            relative,
+            window: w,
+            active: false,
+            rest: (0.0, 0.0),
+        });
     }
 
     fn unlock(&mut self) {
@@ -1305,7 +1469,16 @@ impl State {
             return;
         }
         // XTest relative motion: detail 1
-        let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 1, 0, self.root, ix as i16, iy as i16, 0);
+        let _ = xtest::fake_input(
+            &self.x,
+            MOTION_NOTIFY,
+            1,
+            0,
+            self.root,
+            ix as i16,
+            iy as i16,
+            0,
+        );
         self.last_pos = None;
     }
 
@@ -1313,7 +1486,11 @@ impl State {
         let Some(b) = x_button(button) else {
             return;
         };
-        let ty = if pressed { BUTTON_PRESS } else { BUTTON_RELEASE };
+        let ty = if pressed {
+            BUTTON_PRESS
+        } else {
+            BUTTON_RELEASE
+        };
         if pressed {
             self.buttons_down.push(b);
             if self.screen_mode() {
@@ -1322,7 +1499,11 @@ impl State {
         } else {
             self.buttons_down.retain(|&x| x != b);
         }
-        crate::vlog!("-showwindows: button {b} {} on {:?}", if pressed { "down" } else { "up" }, self.pointer_on);
+        crate::vlog!(
+            "-showwindows: button {b} {} on {:?}",
+            if pressed { "down" } else { "up" },
+            self.pointer_on
+        );
         let _ = xtest::fake_input(&self.x, ty, b, 0, self.root, 0, 0, 0);
     }
 
@@ -1377,7 +1558,9 @@ impl State {
         let (input, _) = self.hints(w);
         if input {
             self.x_focus = Some(w);
-            let _ = self.x.xinput_xi_set_focus(w, x11rb::CURRENT_TIME, self.devs.keyboard);
+            let _ = self
+                .x
+                .xinput_xi_set_focus(w, x11rb::CURRENT_TIME, self.devs.keyboard);
         }
         if self.protocols(w).contains(&self.atoms.wm_take_focus) {
             let ev = ClientMessageEvent::new(
@@ -1405,19 +1588,33 @@ impl State {
         c.serial = img.cursor_serial;
         let blank = blank_cursor(&img.cursor_image);
         if blank != c.blank {
-            crate::vlog!("-showwindows: the X cursor is {}", if blank { "blank" } else { "visible" });
+            crate::vlog!(
+                "-showwindows: the X cursor is {}",
+                if blank { "blank" } else { "visible" }
+            );
         }
         c.blank = blank;
         if !blank && img.width > 0 && img.height > 0 && img.width <= 256 && img.height <= 256 {
             let (w, h) = (img.width as usize, img.height as usize);
             let shm = self.shm.as_ref().expect("checked at start");
             if let Ok(fd) = memfd(w * h * 4) {
-                let bytes: Vec<u8> = img.cursor_image.iter().flat_map(|p| p.to_le_bytes()).collect();
+                let bytes: Vec<u8> = img
+                    .cursor_image
+                    .iter()
+                    .flat_map(|p| p.to_le_bytes())
+                    .collect();
                 let file = std::fs::File::from(fd.try_clone().expect("memfd dup"));
                 let _ = std::os::unix::fs::FileExt::write_all_at(&file, &bytes, 0);
                 let pool = shm.create_pool(fd.as_fd(), (w * h * 4) as i32, &self.qh, ());
-                let buffer =
-                    pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888, &self.qh, (0, 9));
+                let buffer = pool.create_buffer(
+                    0,
+                    w as i32,
+                    h as i32,
+                    (w * 4) as i32,
+                    wl_shm::Format::Argb8888,
+                    &self.qh,
+                    (0, 9),
+                );
                 c.surface.attach(Some(&buffer), 0, 0);
                 c.surface.damage_buffer(0, 0, w as i32, h as i32);
                 c.surface.commit();
@@ -1466,13 +1663,32 @@ impl State {
                 }
             }
         }
-        let root_visual = self.x.setup().roots.iter().find(|s| s.root == self.root).map(|s| s.root_visual);
-        let canvas_format = root_visual.and_then(|v| by_visual.get(&v).copied()).ok_or("no picture format for the root")?;
+        let root_visual = self
+            .x
+            .setup()
+            .roots
+            .iter()
+            .find(|s| s.root == self.root)
+            .map(|s| s.root_visual);
+        let canvas_format = root_visual
+            .and_then(|v| by_visual.get(&v).copied())
+            .ok_or("no picture format for the root")?;
         let pixmap = self.x.generate_id()?;
-        let depth = self.x.setup().roots.iter().find(|s| s.root == self.root).map_or(24, |s| s.root_depth);
+        let depth = self
+            .x
+            .setup()
+            .roots
+            .iter()
+            .find(|s| s.root == self.root)
+            .map_or(24, |s| s.root_depth);
         self.x.create_pixmap(depth, pixmap, self.root, sw, sh)?;
         let picture = self.x.generate_id()?;
-        self.x.render_create_picture(picture, pixmap, canvas_format, &render::CreatePictureAux::new())?;
+        self.x.render_create_picture(
+            picture,
+            pixmap,
+            canvas_format,
+            &render::CreatePictureAux::new(),
+        )?;
         self.canvas = Some(Canvas {
             pixmap,
             picture,
@@ -1490,7 +1706,10 @@ impl State {
         let toplevel = xdg_surface.get_toplevel(qh, self.root);
         toplevel.set_title(format!("X display :{display} (xwlbridge)"));
         toplevel.set_app_id("xwlbridge-screen".into());
-        let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(&surface, qh, ()));
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, qh, ()));
         if viewport.is_some() {
             // fill the work area, scaled to fit (the X screen is the
             // desktop's size, which a window on it can't be)
@@ -1528,7 +1747,11 @@ impl State {
     /// The compositor's size for the screen window: scale to fit it.
     fn rescale(&mut self, width: i32, height: i32) {
         let (sw, sh) = (f64::from(self.screen.0), f64::from(self.screen.1));
-        let scale = if width > 0 && height > 0 { (f64::from(width) / sw).min(f64::from(height) / sh).min(1.0) } else { 1.0 };
+        let scale = if width > 0 && height > 0 {
+            (f64::from(width) / sw).min(f64::from(height) / sh).min(1.0)
+        } else {
+            1.0
+        };
         let Some(c) = self.canvas.as_mut() else {
             return;
         };
@@ -1536,7 +1759,13 @@ impl State {
             return;
         }
         c.scale = scale;
-        if let Some(Shown { role: Role::Screen { viewport: Some(v), .. }, .. }) = self.windows.get(&self.root) {
+        if let Some(Shown {
+            role: Role::Screen {
+                viewport: Some(v), ..
+            },
+            ..
+        }) = self.windows.get(&self.root)
+        {
             let (dw, dh) = ((sw * scale).round() as i32, (sh * scale).round() as i32);
             v.set_destination(dw.max(1), dh.max(1));
             crate::log!("-showscreen: shown at {dw}x{dh} (scale {scale:.3})");
@@ -1551,11 +1780,24 @@ impl State {
         self.paint(self.root);
     }
 
-    fn add_member(&mut self, w: Window, override_redirect: bool, visual: u32) -> Result<(), AnyError> {
-        if self.canvas.as_ref().is_some_and(|c| c.members.contains_key(&w)) {
+    fn add_member(
+        &mut self,
+        w: Window,
+        override_redirect: bool,
+        visual: u32,
+    ) -> Result<(), AnyError> {
+        if self
+            .canvas
+            .as_ref()
+            .is_some_and(|c| c.members.contains_key(&w))
+        {
             return Ok(());
         }
-        let format = self.canvas.as_ref().and_then(|c| c.formats.get(&visual).copied()).ok_or("no picture format")?;
+        let format = self
+            .canvas
+            .as_ref()
+            .and_then(|c| c.formats.get(&visual).copied())
+            .ok_or("no picture format")?;
         let (mut x, mut y, mut width, mut height, depth, damage) = self.watch(w)?;
         if !override_redirect {
             // no window manager keeps a managed window on the screen: one
@@ -1568,7 +1810,9 @@ impl State {
             if (fx, fy, fw, fh) != (x, y, width, height) {
                 let g = self.x.get_geometry(w)?.reply()?;
                 let b = 2 * g.border_width;
-                crate::log!("-showscreen: fitting {w:#x} {width}x{height}+{x}+{y} into the screen: {fw}x{fh}+{fx}+{fy}");
+                crate::log!(
+                    "-showscreen: fitting {w:#x} {width}x{height}+{x}+{y} into the screen: {fw}x{fh}+{fx}+{fy}"
+                );
                 self.x.configure_window(
                     w,
                     &ConfigureWindowAux::new()
@@ -1591,12 +1835,28 @@ impl State {
             height,
             x,
             y,
-            if override_redirect { " (override-redirect)" } else { "" }
+            if override_redirect {
+                " (override-redirect)"
+            } else {
+                ""
+            }
         );
         let c = self.canvas.as_mut().expect("screen mode");
         c.members.insert(
             w,
-            Member { x, y, width, height, depth, format, damage, pixmap: None, picture: None, override_redirect, no_input },
+            Member {
+                x,
+                y,
+                width,
+                height,
+                depth,
+                format,
+                damage,
+                pixmap: None,
+                picture: None,
+                override_redirect,
+                no_input,
+            },
         );
         c.restacked = true;
         // a new managed window gets the keyboard, as under a window manager
@@ -1635,7 +1895,11 @@ impl State {
                 .order
                 .iter()
                 .rev()
-                .find(|o| c.members.get(o).is_some_and(|m| !m.override_redirect && !m.no_input))
+                .find(|o| {
+                    c.members
+                        .get(o)
+                        .is_some_and(|m| !m.override_redirect && !m.no_input)
+                })
                 .copied();
             if let Some(f) = c.focus
                 && self.keyboard_on == Some(self.root)
@@ -1656,7 +1920,10 @@ impl State {
         if restack {
             let order = self.x.query_tree(self.root)?.reply()?.children;
             let c = self.canvas.as_mut().expect("screen mode");
-            c.order = order.into_iter().filter(|w| c.members.contains_key(w)).collect();
+            c.order = order
+                .into_iter()
+                .filter(|w| c.members.contains_key(w))
+                .collect();
             c.restacked = false;
         }
         let c = self.canvas.as_mut().expect("screen mode");
@@ -1664,7 +1931,12 @@ impl State {
             render::PictOp::SRC,
             c.picture,
             SCREEN_BG,
-            &[x11rb::protocol::xproto::Rectangle { x: 0, y: 0, width: sw, height: sh }],
+            &[x11rb::protocol::xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width: sw,
+                height: sh,
+            }],
         )?;
         for w in c.order.clone() {
             let Some(m) = c.members.get_mut(&w) else {
@@ -1672,15 +1944,23 @@ impl State {
             };
             if m.picture.is_none() {
                 let p = self.x.generate_id()?;
-                if composite::name_window_pixmap(&self.x, w, p)?.check().is_err() {
+                if composite::name_window_pixmap(&self.x, w, p)?
+                    .check()
+                    .is_err()
+                {
                     continue;
                 }
                 let pic = self.x.generate_id()?;
-                self.x.render_create_picture(pic, p, m.format, &render::CreatePictureAux::new())?;
+                self.x
+                    .render_create_picture(pic, p, m.format, &render::CreatePictureAux::new())?;
                 m.pixmap = Some(p);
                 m.picture = Some(pic);
             }
-            let op = if m.depth == 32 { render::PictOp::OVER } else { render::PictOp::SRC };
+            let op = if m.depth == 32 {
+                render::PictOp::OVER
+            } else {
+                render::PictOp::SRC
+            };
             self.x.render_composite(
                 op,
                 m.picture.expect("named above"),
@@ -1710,7 +1990,9 @@ impl State {
         };
         let hit = c.order.iter().rev().copied().find(|w| {
             c.members.get(w).is_some_and(|m| {
-                px >= m.x && py >= m.y && i32::from(px) < i32::from(m.x) + i32::from(m.width)
+                px >= m.x
+                    && py >= m.y
+                    && i32::from(px) < i32::from(m.x) + i32::from(m.width)
                     && i32::from(py) < i32::from(m.y) + i32::from(m.height)
             })
         });
@@ -1722,7 +2004,9 @@ impl State {
             return; // a menu, or a window that never takes the keyboard
         }
         c.focus = Some(w);
-        let _ = self.x.configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        let _ = self
+            .x
+            .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
         self.focus_x(w);
     }
 }
@@ -1748,14 +2032,27 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
         _: &WlConnection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
             match interface.as_str() {
-                "wl_compositor" => state.compositor = Some(registry.bind(name, version.min(4), qh, ())),
+                "wl_compositor" => {
+                    state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
+                }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => state.wm_base = Some(registry.bind(name, version.min(2), qh, ())),
-                "wl_seat" if state.seat.is_none() => state.seat = Some(registry.bind(name, version.min(5), qh, ())),
-                "zwp_pointer_constraints_v1" => state.constraints = Some(registry.bind(name, 1, qh, ())),
-                "zwp_relative_pointer_manager_v1" => state.relative_manager = Some(registry.bind(name, 1, qh, ())),
+                "wl_seat" if state.seat.is_none() => {
+                    state.seat = Some(registry.bind(name, version.min(5), qh, ()))
+                }
+                "zwp_pointer_constraints_v1" => {
+                    state.constraints = Some(registry.bind(name, 1, qh, ()))
+                }
+                "zwp_relative_pointer_manager_v1" => {
+                    state.relative_manager = Some(registry.bind(name, 1, qh, ()))
+                }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
                 _ => {}
             }
@@ -1772,7 +2069,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         _: &WlConnection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        {
             // The seat's devices come and go (a pointer is a capability only
             // while some pointer device exists: on a headless or remote
             // desktop that may be a remote-desktop session's virtual one), and
@@ -1855,7 +2155,9 @@ impl Dispatch<xdg_toplevel::XdgToplevel, Window> for State {
     ) {
         match event {
             xdg_toplevel::Event::Close => state.close.push(*w),
-            xdg_toplevel::Event::Configure { width, height, .. } => state.resize.push((*w, width, height)),
+            xdg_toplevel::Event::Configure { width, height, .. } => {
+                state.resize.push((*w, width, height))
+            }
             _ => {}
         }
     }
@@ -1920,8 +2222,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
-                let Some(&w) = surface.data::<Window>() else { return };
+            wl_pointer::Event::Enter {
+                serial,
+                surface,
+                surface_x,
+                surface_y,
+            } => {
+                let Some(&w) = surface.data::<Window>() else {
+                    return;
+                };
                 if w == 0 {
                     return; // the cursor surface
                 }
@@ -1931,10 +2240,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     // the reverse pointer must hit this window, not one
                     // stacked above it on the X screen; the popups shown stay
                     // above it
-                    let _ = state.x.configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+                    let _ = state.x.configure_window(
+                        w,
+                        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                    );
                     for p in state.popups.clone() {
                         if p != w {
-                            let _ = state.x.configure_window(p, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+                            let _ = state.x.configure_window(
+                                p,
+                                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                            );
                         }
                     }
                 }
@@ -1945,15 +2260,26 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.release_buttons();
                 state.pointer_on = None;
             }
-            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
                 if let Some(w) = state.pointer_on {
                     state.motion(w, surface_x, surface_y);
                 }
             }
-            wl_pointer::Event::Button { button, state: WEnum::Value(bs), .. } if state.pointer_on.is_some() => {
+            wl_pointer::Event::Button {
+                button,
+                state: WEnum::Value(bs),
+                ..
+            } if state.pointer_on.is_some() => {
                 state.button(button, bs == wl_pointer::ButtonState::Pressed);
             }
-            wl_pointer::Event::AxisDiscrete { axis: WEnum::Value(axis), discrete } if state.pointer_on.is_some() => {
+            wl_pointer::Event::AxisDiscrete {
+                axis: WEnum::Value(axis),
+                discrete,
+            } if state.pointer_on.is_some() => {
                 state.wheel(axis, discrete);
             }
             _ => {}
@@ -1972,7 +2298,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     ) {
         match event {
             wl_keyboard::Event::Enter { surface, .. } => {
-                let Some(&w) = surface.data::<Window>() else { return };
+                let Some(&w) = surface.data::<Window>() else {
+                    return;
+                };
                 state.keyboard_on = Some(w);
                 if w == state.root {
                     if let Some(f) = state.canvas.as_ref().and_then(|c| c.focus) {
@@ -1986,7 +2314,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.release_keys();
                 state.keyboard_on = None;
             }
-            wl_keyboard::Event::Key { key, state: WEnum::Value(ks), .. } if state.keyboard_on.is_some() => {
+            wl_keyboard::Event::Key {
+                key,
+                state: WEnum::Value(ks),
+                ..
+            } if state.keyboard_on.is_some() => {
                 state.key(key, ks == wl_keyboard::KeyState::Pressed);
             }
             _ => {}
@@ -2081,7 +2413,10 @@ mod tests {
 
     #[test]
     fn the_reverse_master_owns_only_its_devices() {
-        let d = Devices { pointer: 8, keyboard: 9 };
+        let d = Devices {
+            pointer: 8,
+            keyboard: 9,
+        };
         assert!(d.owns(8) && d.owns(9));
         assert!(!d.owns(2) && !d.owns(3) && !d.owns(10));
     }

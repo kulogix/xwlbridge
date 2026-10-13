@@ -32,9 +32,7 @@ use wayland_backend::server::{
     Backend, ClientData, ClientId, DisconnectReason, GlobalHandler, GlobalId, Handle, ObjectData,
     ObjectId,
 };
-use wayland_client::protocol::__interfaces::{
-    WL_COMPOSITOR_INTERFACE, WL_SHM_INTERFACE,
-};
+use wayland_client::protocol::__interfaces::{WL_COMPOSITOR_INTERFACE, WL_SHM_INTERFACE};
 use wayland_protocols::xdg::shell::client::__interfaces::XDG_WM_BASE_INTERFACE;
 
 /// How long after a commit its frame callbacks are answered (60 Hz).
@@ -43,7 +41,10 @@ const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 /// The frame-callback interval: [`FRAME_INTERVAL`], or for measurements
 /// `XWLBRIDGE_XWAYLAND_FRAME_MS` (0 = never answer them).
 fn frame_interval() -> Option<Duration> {
-    match std::env::var("XWLBRIDGE_XWAYLAND_FRAME_MS").ok().and_then(|v| v.parse::<f64>().ok()) {
+    match std::env::var("XWLBRIDGE_XWAYLAND_FRAME_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
         Some(ms) if ms <= 0.0 => None,
         Some(ms) => Some(Duration::from_secs_f64(ms / 1000.0)),
         None => Some(FRAME_INTERVAL),
@@ -167,7 +168,13 @@ impl Host {
                 thread_ctl.connected.store(false, Ordering::Release);
             })?;
         let theirs: OwnedFd = theirs.into();
-        Ok((Host { ctl, thread: Some(thread) }, theirs))
+        Ok((
+            Host {
+                ctl,
+                thread: Some(thread),
+            },
+            theirs,
+        ))
     }
 
     pub fn resizer(&self) -> Resizer {
@@ -205,8 +212,16 @@ fn run(backend: &mut Backend<State>, state: &mut State, ctl: &Ctl) -> io::Result
             .map(|d| d.as_millis().clamp(1, 1000) as i32)
             .unwrap_or(1000);
         let mut pfds = [
-            libc::pollfd { fd: backend.poll_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: ctl.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: backend.poll_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: ctl.wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) };
         if n < 0 {
@@ -287,9 +302,16 @@ impl State {
         if self.serials.len() > 64 {
             self.serials.remove(0);
         }
-        let _ = handle.send_event(event(xdg_surface, "configure", vec![Argument::Uint(self.serial)]));
+        let _ = handle.send_event(event(
+            xdg_surface,
+            "configure",
+            vec![Argument::Uint(self.serial)],
+        ));
         self.ctl.stats.configures.fetch_add(1, Ordering::Relaxed);
-        crate::vlog!("xwayland: configured the X screen at {w}x{h} (serial {})", self.serial);
+        crate::vlog!(
+            "xwayland: configured the X screen at {w}x{h} (serial {})",
+            self.serial
+        );
     }
 
     fn fire_frames(&mut self, handle: &Handle, now: Instant) {
@@ -312,7 +334,9 @@ impl State {
 
     fn commit(&mut self, handle: &Handle, surface: &ObjectId) {
         self.ctl.stats.commits.fetch_add(1, Ordering::Relaxed);
-        let Some(s) = self.surfaces.get_mut(surface) else { return };
+        let Some(s) = self.surfaces.get_mut(surface) else {
+            return;
+        };
         // the picture is never read: hand the buffer back at once
         if let Some(Some(buffer)) = s.pending_buffer.take() {
             let _ = handle.send_event(event(&buffer, "release", vec![]));
@@ -336,20 +360,31 @@ impl State {
 }
 
 fn monotonic_ms() -> u32 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000) as u32
 }
 
 /// An event message by name (the opcode is its index in the interface).
-fn event(id: &ObjectId, name: &str, args: Vec<Argument<ObjectId, std::os::fd::RawFd>>) -> Message<ObjectId, std::os::fd::RawFd> {
+fn event(
+    id: &ObjectId,
+    name: &str,
+    args: Vec<Argument<ObjectId, std::os::fd::RawFd>>,
+) -> Message<ObjectId, std::os::fd::RawFd> {
     let iface: &Interface = id.interface();
     let opcode = iface
         .events
         .iter()
         .position(|e| e.name == name)
         .unwrap_or_else(|| panic!("{} has no event {name}", iface.name)) as u16;
-    Message { sender_id: id.clone(), opcode, args: args.into_iter().collect() }
+    Message {
+        sender_id: id.clone(),
+        opcode,
+        args: args.into_iter().collect(),
+    }
 }
 
 struct Client(Arc<AtomicBool>);
@@ -375,7 +410,8 @@ impl GlobalHandler<State> for Global {
         if object_id.interface().name == WL_SHM_INTERFACE.name {
             // the two formats every wl_shm has
             for format in [0u32, 1] {
-                let _ = handle.send_event(event(&object_id, "format", vec![Argument::Uint(format)]));
+                let _ =
+                    handle.send_event(event(&object_id, "format", vec![Argument::Uint(format)]));
             }
         }
         Arc::new(Obj)
@@ -429,7 +465,8 @@ impl ObjectData<State> for Obj {
                 }
             }
             ("xdg_surface", "get_toplevel") => {
-                if let (Some(top), Some(surface)) = (new_id(), state.xdg_surfaces.get(&id).cloned()) {
+                if let (Some(top), Some(surface)) = (new_id(), state.xdg_surfaces.get(&id).cloned())
+                {
                     state.toplevels.insert(top.clone(), id.clone());
                     if let Some(s) = state.surfaces.get_mut(&surface) {
                         s.toplevel = Some((id.clone(), top));
@@ -528,7 +565,12 @@ mod tests {
             _: &Connection,
             qh: &QueueHandle<Self>,
         ) {
-            if let wl_registry::Event::Global { name, interface, version } = event {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
                 match interface.as_str() {
                     "wl_compositor" => t.compositor = Some(reg.bind(name, version.min(4), qh, ())),
                     "wl_shm" => t.shm = Some(reg.bind(name, 1, qh, ())),
@@ -540,28 +582,56 @@ mod tests {
         }
     }
     impl Dispatch<wl_shm::WlShm, ()> for T {
-        fn event(t: &mut Self, _: &wl_shm::WlShm, e: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            t: &mut Self,
+            _: &wl_shm::WlShm,
+            e: wl_shm::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             if let wl_shm::Event::Format { format } = e {
                 t.formats.push(u32::from(format));
             }
         }
     }
     impl Dispatch<wl_buffer::WlBuffer, ()> for T {
-        fn event(t: &mut Self, _: &wl_buffer::WlBuffer, e: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            t: &mut Self,
+            _: &wl_buffer::WlBuffer,
+            e: wl_buffer::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             if let wl_buffer::Event::Release = e {
                 t.released += 1;
             }
         }
     }
     impl Dispatch<wl_callback::WlCallback, ()> for T {
-        fn event(t: &mut Self, _: &wl_callback::WlCallback, e: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            t: &mut Self,
+            _: &wl_callback::WlCallback,
+            e: wl_callback::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             if let wl_callback::Event::Done { .. } = e {
                 t.frame_done = Some(Instant::now());
             }
         }
     }
     impl Dispatch<xdg_surface::XdgSurface, ()> for T {
-        fn event(t: &mut Self, s: &xdg_surface::XdgSurface, e: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            t: &mut Self,
+            s: &xdg_surface::XdgSurface,
+            e: xdg_surface::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             if let xdg_surface::Event::Configure { serial } = e {
                 s.ack_configure(serial);
                 t.serials.push(serial);
@@ -569,8 +639,20 @@ mod tests {
         }
     }
     impl Dispatch<xdg_toplevel::XdgToplevel, ()> for T {
-        fn event(t: &mut Self, _: &xdg_toplevel::XdgToplevel, e: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
-            if let xdg_toplevel::Event::Configure { width, height, states } = e {
+        fn event(
+            t: &mut Self,
+            _: &xdg_toplevel::XdgToplevel,
+            e: xdg_toplevel::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } = e
+            {
                 t.toplevel_sizes.push((width, height, states));
             }
         }
@@ -614,8 +696,15 @@ mod tests {
         let mfd = unsafe { libc::memfd_create(c"wlhost-test".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(mfd >= 0);
         let mfd = unsafe { OwnedFd::from_raw_fd(mfd) };
-        assert_eq!(unsafe { libc::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&mfd), len as i64) }, 0);
-        let pool = t.shm.as_ref().unwrap().create_pool(mfd.as_fd(), len, &qh, ());
+        assert_eq!(
+            unsafe { libc::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&mfd), len as i64) },
+            0
+        );
+        let pool = t
+            .shm
+            .as_ref()
+            .unwrap()
+            .create_pool(mfd.as_fd(), len, &qh, ());
         let buffer = pool.create_buffer(0, 800, 600, 3200, wl_shm::Format::Xrgb8888, &qh, ());
         surface.attach(Some(&buffer), 0, 0);
         surface.damage_buffer(0, 0, 800, 600);
@@ -629,7 +718,10 @@ mod tests {
             queue.roundtrip(&mut t).unwrap();
         }
         let waited = t.frame_done.expect("frame callback answered") - committed;
-        assert!(waited >= Duration::from_millis(15) && waited < Duration::from_millis(500), "{waited:?}");
+        assert!(
+            waited >= Duration::from_millis(15) && waited < Duration::from_millis(500),
+            "{waited:?}"
+        );
 
         // a resize is a new configure, at the new size
         resizer.resize(1024, 768);

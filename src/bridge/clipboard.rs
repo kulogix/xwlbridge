@@ -555,12 +555,21 @@ impl Clipboard {
     /// it is in progress, and none follows.
     #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
     pub fn clear_watcher(&self) {
-        let f = self.watcher.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let f = self
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         drop(f);
     }
 
     fn poke(&self) {
-        if let Some(f) = self.watcher.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if let Some(f) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             f();
         }
     }
@@ -1572,11 +1581,17 @@ mod tests {
     fn an_x_copy_made_while_the_compositor_was_away_is_handed_to_it() {
         // GNOME's clipboard exists only with a session: none yet
         let c = Clipboard::default();
-        assert!(c.x_value_since(Sel::Clipboard, None).is_none(), "nobody owns it");
+        assert!(
+            c.x_value_since(Sel::Clipboard, None).is_none(),
+            "nobody owns it"
+        );
         let (fx, time) = c.x_took_external(Sel::Clipboard, 0x10);
         drop(fx);
         drop(c.x_fetched(Sel::Clipboard, 0x10, time, b"early".to_vec()));
-        let value = |since| c.x_value_since(Sel::Clipboard, since).map(|(d, at)| (d.to_vec(), at));
+        let value = |since| {
+            c.x_value_since(Sel::Clipboard, since)
+                .map(|(d, at)| (d.to_vec(), at))
+        };
         // the first session gets it, with when it was taken ...
         let before = std::time::Instant::now();
         let (data, early_at) = value(None).unwrap();
@@ -1590,7 +1605,10 @@ mod tests {
         drop(c.x_fetched(Sel::Clipboard, 0x11, time, b"between".to_vec()));
         let (data, between_at) = value(Some(ended)).unwrap();
         assert_eq!(data, b"between");
-        assert!(between_at >= before, "taken after the first: ordered by when it was taken");
+        assert!(
+            between_at >= before,
+            "taken after the first: ordered by when it was taken"
+        );
         // a Wayland app's selection is not ours to hand over
         announced(&c, Sel::Clipboard, &text_mimes());
         assert!(c.x_value_since(Sel::Clipboard, Some(ended)).is_none());

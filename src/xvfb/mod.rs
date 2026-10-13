@@ -71,14 +71,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
-use x11rb::wrapper::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Family, HostMode,
-    ImageFormat, NotifyDetail, NotifyMode, StackMode, Window, WindowClass,
+    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Family,
+    HostMode, ImageFormat, NotifyDetail, NotifyMode, StackMode, Window, WindowClass,
 };
-use x11rb::protocol::{composite, randr, res, shm, xtest, Event};
+use x11rb::protocol::{Event, composite, randr, res, shm, xtest};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
+use x11rb::wrapper::ConnectionExt as _;
 
 mod a11ybus;
 mod attrib;
@@ -94,9 +94,9 @@ mod xserver;
 pub use xserver::resolve as resolve_server;
 
 use crate::bridge::Server;
+use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
 use crate::bridge::xkbdesc::one_layout;
 use crate::config::EngineType;
-use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
 
 /// The X client id the agent's forwarded input is accounted under. Xvfb
 /// merges every client's XTest into one device, so per-client accounting is
@@ -167,7 +167,9 @@ impl Auth {
         let mut cookie = [0u8; 16];
         let mut got = 0;
         while got < cookie.len() {
-            let n = unsafe { libc::getrandom(cookie[got..].as_mut_ptr().cast(), cookie.len() - got, 0) };
+            let n = unsafe {
+                libc::getrandom(cookie[got..].as_mut_ptr().cast(), cookie.len() - got, 0)
+            };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -178,7 +180,11 @@ impl Auth {
             got += n as usize;
         }
         let file = dir.join("Xauthority");
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file)?;
         f.write_all(&xauth_entry(&cookie))?;
         f.sync_all()?;
         Ok(Auth { cookie, file })
@@ -201,10 +207,15 @@ fn xauth_entry(cookie: &[u8]) -> Vec<u8> {
 /// Connects to the engine's display with the cookie.
 fn connect(display: u32, auth: &Auth) -> Result<(RustConnection, usize), AnyError> {
     // the abstract socket first, then the file (as libxcb does)
-    let addr = x11rb_protocol::parse_display::ConnectAddress::Socket(format!("/tmp/.X11-unix/X{display}"));
+    let addr =
+        x11rb_protocol::parse_display::ConnectAddress::Socket(format!("/tmp/.X11-unix/X{display}"));
     let (stream, _) = DefaultStream::connect(&addr)?;
-    let conn =
-        RustConnection::connect_to_stream_with_auth_info(stream, 0, MIT_MAGIC_COOKIE.to_vec(), auth.cookie.to_vec())?;
+    let conn = RustConnection::connect_to_stream_with_auth_info(
+        stream,
+        0,
+        MIT_MAGIC_COOKIE.to_vec(),
+        auth.cookie.to_vec(),
+    )?;
     Ok((conn, 0))
 }
 /// What the agent selects on the root window: windows mapped or restacked
@@ -360,7 +371,10 @@ fn private_dir() -> io::Result<PrivateDir> {
         match mkdtemp(&base.join(format!("xwlbridge-{}-XXXXXX", std::process::id()))) {
             Ok(d) => return Ok(PrivateDir(d)),
             Err(e) => {
-                err = Some(io::Error::new(e.kind(), format!("can't make a private directory in {}: {e}", base.display())))
+                err = Some(io::Error::new(
+                    e.kind(),
+                    format!("can't make a private directory in {}: {e}", base.display()),
+                ))
             }
         }
     }
@@ -416,8 +430,15 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
     if let Some(n) = server.config.display {
         cmd.arg(format!(":{n}"));
     }
-    cmd.args(["-displayfd", &wr_fd.to_string(), "-nolisten", "tcp", "-noreset", "-auth"])
-        .arg(&auth.file);
+    cmd.args([
+        "-displayfd",
+        &wr_fd.to_string(),
+        "-nolisten",
+        "tcp",
+        "-noreset",
+        "-auth",
+    ])
+    .arg(&auth.file);
     if engine == EngineType::Xwayland {
         // Rootful (no -rootless), software rendering into shared memory
         // (-shm: no GPU, and our compositor offers no dmabuf anyway), on our
@@ -426,17 +447,22 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
         // the desktop's compositor; no libei socket either (rootful Xwayland
         // handles XTest itself).
         let (w, h) = (w.max(320), h.max(200));
-        cmd.args(["-geometry", &format!("{w}x{h}"), "-shm"]).env_remove("LIBEI_SOCKET");
+        cmd.args(["-geometry", &format!("{w}x{h}"), "-shm"])
+            .env_remove("LIBEI_SOCKET");
         match std::env::var("XWLBRIDGE_XWAYLAND_COMPOSITOR") {
             // For measurements only: an existing private compositor (e.g. a
             // weston --backend=headless) instead of ours; fixed size then
             Ok(other) if !other.is_empty() => {
-                crate::warning!("xwayland: on the compositor {other:?} (XWLBRIDGE_XWAYLAND_COMPOSITOR); the screen keeps its size");
-                cmd.env("WAYLAND_DISPLAY", other).env_remove("WAYLAND_SOCKET");
+                crate::warning!(
+                    "xwayland: on the compositor {other:?} (XWLBRIDGE_XWAYLAND_COMPOSITOR); the screen keeps its size"
+                );
+                cmd.env("WAYLAND_DISPLAY", other)
+                    .env_remove("WAYLAND_SOCKET");
             }
             _ => {
                 let (compositor, sock) = wlhost::Host::start(w, h)?;
-                cmd.env("WAYLAND_SOCKET", sock.as_raw_fd().to_string()).env_remove("WAYLAND_DISPLAY");
+                cmd.env("WAYLAND_SOCKET", sock.as_raw_fd().to_string())
+                    .env_remove("WAYLAND_DISPLAY");
                 host = Some(compositor);
                 wl_sock = Some(sock);
             }
@@ -445,20 +471,27 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
         // Xvnc insists on an RFB listener: give it a socket only this user can
         // reach (in our private directory), which accepts no input, clipboard
         // or resize requests either
-        cmd.args(["-geometry", &format!("{w}x{h}"), "-depth", "24", "-rfbport", "-1"])
-            .arg("-rfbunixpath")
-            .arg(&sock)
-            .args([
-                "-rfbunixmode",
-                "0600",
-                "-SecurityTypes",
-                "None",
-                "-AcceptKeyEvents=0",
-                "-AcceptPointerEvents=0",
-                "-AcceptCutText=0",
-                "-SendCutText=0",
-                "-AcceptSetDesktopSize=0",
-            ]);
+        cmd.args([
+            "-geometry",
+            &format!("{w}x{h}"),
+            "-depth",
+            "24",
+            "-rfbport",
+            "-1",
+        ])
+        .arg("-rfbunixpath")
+        .arg(&sock)
+        .args([
+            "-rfbunixmode",
+            "0600",
+            "-SecurityTypes",
+            "None",
+            "-AcceptKeyEvents=0",
+            "-AcceptPointerEvents=0",
+            "-AcceptCutText=0",
+            "-SendCutText=0",
+            "-AcceptSetDesktopSize=0",
+        ]);
     } else {
         cmd.args(["-screen", "0", &format!("{w}x{h}x24")]);
     }
@@ -481,13 +514,21 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
     drop(wr);
     drop(wl_sock);
     // from here on, a failure stops it again (and removes the directory)
-    let mut engine = Engine { child, _a11y: None, _dir: dir, host };
+    let mut engine = Engine {
+        child,
+        _a11y: None,
+        _dir: dir,
+        host,
+    };
     let display = read_display(rd)?;
     let mut a11y_bus = None;
     if server.config.a11ybus {
         match a11ybus::start(&engine._dir.0, display) {
             Ok(bus) => {
-                crate::log!("xvfb: private accessibility bus for display :{display} at {}", bus.address);
+                crate::log!(
+                    "xvfb: private accessibility bus for display :{display} at {}",
+                    bus.address
+                );
                 let _ = A11Y_BUS.set(bus.address.clone());
                 a11y_bus = Some(bus.address.clone());
                 engine._a11y = Some(bus);
@@ -512,10 +553,19 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
     crate::log!(
         "xvfb: {} serving display :{display} ({w}x{h}); X clients need the cookie{}",
         program.display(),
-        if xauthority.is_none() { " or to run as this user (or root)" } else { "" }
+        if xauthority.is_none() {
+            " or to run as this user (or root)"
+        } else {
+            ""
+        }
     );
     *ENGINE.lock().unwrap_or_else(PoisonError::into_inner) = Some(engine);
-    Ok(Started { display, auth, xauthority, a11y_bus })
+    Ok(Started {
+        display,
+        auth,
+        xauthority,
+        a11y_bus,
+    })
 }
 
 /// Lets clients running as our own user, and root, in without the cookie
@@ -531,7 +581,12 @@ fn allow_own_user(display: u32, auth: &Auth) -> Result<(), AnyError> {
     for u in uids {
         // a numeric uid ('#'), so no user database is needed
         let address = format!("localuser\0#{u}");
-        conn.change_hosts(HostMode::INSERT, Family::SERVER_INTERPRETED, address.as_bytes())?.check()?;
+        conn.change_hosts(
+            HostMode::INSERT,
+            Family::SERVER_INTERPRETED,
+            address.as_bytes(),
+        )?
+        .check()?;
     }
     // the hosts stay: with -noreset the server never resets its access list
     Ok(())
@@ -544,7 +599,9 @@ fn allow_own_user(display: u32, auth: &Auth) -> Result<(), AnyError> {
 /// while a process with the pid in its name runs, or anything answers on its
 /// socket.
 fn remove_stale_private_dirs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name
@@ -562,7 +619,9 @@ fn remove_stale_private_dirs(dir: &Path) {
             continue;
         }
         let sock = path.join(XVNC_SOCKET);
-        if std::fs::symlink_metadata(&sock).is_ok() && std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        if std::fs::symlink_metadata(&sock).is_ok()
+            && std::os::unix::net::UnixStream::connect(&sock).is_ok()
+        {
             continue;
         }
         crate::vlog!("xvfb: removing a stale engine directory {}", path.display());
@@ -586,7 +645,9 @@ fn pid_gone(pid: libc::pid_t) -> bool {
 /// One is left alone while a process with its pid runs, or anything answers on
 /// it.
 fn remove_stale_rfb_sockets(dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name
@@ -624,13 +685,19 @@ fn read_display(fd: OwnedFd) -> io::Result<u32> {
         revents: 0,
     };
     if unsafe { libc::poll(&mut pfd, 1, 15_000) } <= 0 {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "the X server didn't start"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the X server didn't start",
+        ));
     }
     let mut s = String::new();
     std::fs::File::from(fd).read_to_string(&mut s)?;
-    s.trim()
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("the X server didn't start (display {s:?})")))
+    s.trim().parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the X server didn't start (display {s:?})"),
+        )
+    })
 }
 
 /// One MIT-SHM segment, attached by us and the X server; it goes away once
@@ -740,7 +807,10 @@ impl AttribStats {
         self.events += 1;
         self.marked += u64::from(marked);
         let ms = d.as_secs_f64() * 1000.0;
-        let i = [0.1, 1.0, 5.0, 20.0].iter().position(|&b| ms <= b).unwrap_or(4);
+        let i = [0.1, 1.0, 5.0, 20.0]
+            .iter()
+            .position(|&b| ms <= b)
+            .unwrap_or(4);
         self.wait_hist[i] += 1;
         self.wait_max = self.wait_max.max(d);
     }
@@ -752,7 +822,11 @@ impl AttribStats {
 
     /// A summary, at most every 10 s and only if anything happened.
     fn report(&mut self) {
-        if self.events == self.logged || self.last_log.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+        if self.events == self.logged
+            || self
+                .last_log
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        {
             return;
         }
         crate::vlog!(
@@ -786,7 +860,10 @@ impl Target {
     /// sends the root nothing, and changes nothing here either.
     fn focus_event(&mut self, focus_in: bool, detail: NotifyDetail) {
         if focus_in {
-            self.focus_inferior = matches!(detail, NotifyDetail::VIRTUAL | NotifyDetail::NONLINEAR_VIRTUAL);
+            self.focus_inferior = matches!(
+                detail,
+                NotifyDetail::VIRTUAL | NotifyDetail::NONLINEAR_VIRTUAL
+            );
         } else if detail == NotifyDetail::INFERIOR {
             self.focus_inferior = true;
         }
@@ -797,7 +874,9 @@ impl Target {
     /// `keyboard_grabbed`), and Pointer details are about the window under
     /// the pointer, not the focus: neither moves the focus.
     fn own_focus_event(&mut self, focus_in: bool, mode: NotifyMode, detail: NotifyDetail) {
-        if matches!(mode, NotifyMode::NORMAL | NotifyMode::WHILE_GRABBED) && detail != NotifyDetail::POINTER {
+        if matches!(mode, NotifyMode::NORMAL | NotifyMode::WHILE_GRABBED)
+            && detail != NotifyDetail::POINTER
+        {
             self.focus_ours = focus_in;
         }
     }
@@ -805,7 +884,10 @@ impl Target {
 
 /// The XTest slave devices: their raw events are injected input.
 fn xtest_devices(conn: &RustConnection) -> Result<Vec<u16>, AnyError> {
-    let infos = conn.xinput_xi_query_device(xinput::Device::ALL)?.reply()?.infos;
+    let infos = conn
+        .xinput_xi_query_device(xinput::Device::ALL)?
+        .reply()?
+        .infos;
     Ok(infos
         .iter()
         .filter(|d| d.name.windows(5).any(|w| w == b"XTEST"))
@@ -888,7 +970,8 @@ impl Failures {
     /// Counts a failure at `now`; whether a new agent may still be started
     /// (no more than [`AGENT_RESTARTS`] failures within [`AGENT_RESTART_WINDOW`]).
     fn record(&mut self, now: Instant) -> bool {
-        self.0.retain(|t| now.duration_since(*t) < AGENT_RESTART_WINDOW);
+        self.0
+            .retain(|t| now.duration_since(*t) < AGENT_RESTART_WINDOW);
         self.0.push_back(now);
         self.0.len() <= AGENT_RESTARTS
     }
@@ -906,7 +989,12 @@ fn supervise(server: Arc<Server>, display: u32, auth: Auth) {
             if let Some(devs) = agent.reverse.as_ref().filter(|_| server.config.showwindows) {
                 // one reverse thread for the process: it outlives agent restarts
                 // (the master device stays, and the thread re-reads windows)
-                reverse::spawn_once(display, devs.clone(), auth.clone(), server.config.showscreen);
+                reverse::spawn_once(
+                    display,
+                    devs.clone(),
+                    auth.clone(),
+                    server.config.showscreen,
+                );
             }
             if restart {
                 // the old agent's clients may have left keys down in the X
@@ -978,7 +1066,10 @@ fn stopping() -> bool {
 /// waited out [`ENGINE_LOSS_SETTLE`] and called it a loss, and main must not
 /// then take the command's own status for the cause.
 pub fn lost_by_itself() -> bool {
-    let started = ENGINE.lock().unwrap_or_else(PoisonError::into_inner).is_some();
+    let started = ENGINE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some();
     started && !stopping() && engine_lost()
 }
 
@@ -1188,7 +1279,11 @@ impl Agent {
                 &CreateWindowAux::new()
                     .override_redirect(1)
                     // crossing: to see the pointer grabbed (see `attrib`)
-                    .event_mask(EventMask::POINTER_MOTION | EventMask::ENTER_WINDOW | EventMask::LEAVE_WINDOW),
+                    .event_mask(
+                        EventMask::POINTER_MOTION
+                            | EventMask::ENTER_WINDOW
+                            | EventMask::LEAVE_WINDOW,
+                    ),
             )?;
             // -showwindows / -reverseinput: shown windows (or a desktop-side
             // proxy's reverse pointer) must reach this display's windows, so
@@ -1242,12 +1337,20 @@ impl Agent {
         // needs the reverse master; -reverseinput sets up only the master
         // (for a desktop-side proxy, tools/x11-a11y-proxy)
         let want_reverse = server.config.showwindows || server.config.reverseinput;
-        let flag = if server.config.showwindows { "-showwindows" } else { "-reverseinput" };
+        let flag = if server.config.showwindows {
+            "-showwindows"
+        } else {
+            "-reverseinput"
+        };
         if want_reverse && !composited {
             if server.config.showwindows {
-                crate::warning!("-showwindows needs Composite on the X server; not showing windows");
+                crate::warning!(
+                    "-showwindows needs Composite on the X server; not showing windows"
+                );
             } else {
-                crate::warning!("xvfb: -reverseinput needs Composite on the X server; the input shield stays");
+                crate::warning!(
+                    "xvfb: -reverseinput needs Composite on the X server; the input shield stays"
+                );
             }
         } else if want_reverse {
             match Self::setup_reverse(&conn, root) {
@@ -1266,7 +1369,9 @@ impl Agent {
                     if server.config.showwindows {
                         crate::warning!("-showwindows: can't set up ({e}); not showing windows");
                     } else {
-                        crate::warning!("xvfb: -reverseinput: can't set up ({e}); the input shield stays");
+                        crate::warning!(
+                            "xvfb: -reverseinput: can't set up ({e}); the input shield stays"
+                        );
                     }
                     conn.map_window(top)?;
                 }
@@ -1305,7 +1410,9 @@ impl Agent {
                 unsafe { libc::write(wake.as_raw_fd(), (&one as *const u64).cast(), 8) };
             }
         };
-        server.damage.set_external(false, Some(Box::new(poke.clone())));
+        server
+            .damage
+            .set_external(false, Some(Box::new(poke.clone())));
         // and when the desktop's cursor sprite changes
         let cursor = match cursor::CursorSync::new(&conn, root, top) {
             Ok(c) => {
@@ -1334,7 +1441,10 @@ impl Agent {
         };
 
         let (tx, releases) = mpsc::channel();
-        let holds = Arc::new(Mutex::new(record::Holds::new(&server.config.input_policy(), own_base)));
+        let holds = Arc::new(Mutex::new(record::Holds::new(
+            &server.config.input_policy(),
+            own_base,
+        )));
         let rec_holds = holds.clone();
         let recording = Arc::new(AtomicBool::new(true));
         let rec = recording.clone();
@@ -1357,7 +1467,11 @@ impl Agent {
         // (below the root, ours included: only -showwindows / -reverseinput
         // focus a window of ours, and `focus_ours` says when it is that one,
         // as the root's events would from here on)
-        let focus_now = conn.get_input_focus().ok().and_then(|c| c.reply().ok()).map(|f| f.focus);
+        let focus_now = conn
+            .get_input_focus()
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|f| f.focus);
         let focus_inferior = focus_now.is_some_and(|f| f > 1 && f != root);
         let focus_ours = kfocus.is_some() && focus_now == kfocus;
         let ledger = Arc::new(attrib::Ledger::default());
@@ -1382,8 +1496,16 @@ impl Agent {
             std::thread::Builder::new()
                 .name("xvfb-record".into())
                 .spawn(move || {
-                    if let Err(e) = record::run(rconn, &rec_holds, tx, reads, &rec_motions, poke, &flag, attrib)
-                        && !flag.load(Ordering::Acquire)
+                    if let Err(e) = record::run(
+                        rconn,
+                        &rec_holds,
+                        tx,
+                        reads,
+                        &rec_motions,
+                        poke,
+                        &flag,
+                        attrib,
+                    ) && !flag.load(Ordering::Acquire)
                         && !STOPPING.load(Ordering::SeqCst)
                     {
                         crate::warning!(
@@ -1516,7 +1638,12 @@ impl Agent {
         let events = self.synth.key(
             press,
             kc,
-            || keymap.as_ref().filter(|t| t.spare(kc)).and((x_sym != 0).then_some(x_sym)),
+            || {
+                keymap
+                    .as_ref()
+                    .filter(|t| t.spare(kc))
+                    .and((x_sym != 0).then_some(x_sym))
+            },
             |m| input.holds(AGENT_CLIENT, m),
             keymap.as_ref(),
             shortcut,
@@ -1526,10 +1653,22 @@ impl Agent {
         match events {
             Some(events) => {
                 for (down, k) in events {
-                    input.fake_input(AGENT_CLIENT, if down { KEY_PRESS } else { KEY_RELEASE }, k, 0, 0);
+                    input.fake_input(
+                        AGENT_CLIENT,
+                        if down { KEY_PRESS } else { KEY_RELEASE },
+                        k,
+                        0,
+                        0,
+                    );
                 }
             }
-            None => input.fake_input(AGENT_CLIENT, if press { KEY_PRESS } else { KEY_RELEASE }, kc, 0, 0),
+            None => input.fake_input(
+                AGENT_CLIENT,
+                if press { KEY_PRESS } else { KEY_RELEASE },
+                kc,
+                0,
+                0,
+            ),
         }
     }
 
@@ -1547,24 +1686,35 @@ impl Agent {
         }
         use x11rb::protocol::xproto::{AtomEnum, ChangeWindowAttributesAux, PropMode};
         let result = (|| -> Result<(), AnyError> {
-            let atom = conn.intern_atom(false, b"_XWAYLAND_ALLOW_COMMITS")?.reply()?.atom;
+            let atom = conn
+                .intern_atom(false, b"_XWAYLAND_ALLOW_COMMITS")?
+                .reply()?
+                .atom;
             // an event mask replaces this client's whole selection on the
             // root: keep the agent's own (`root_events`: its focus events are
             // what U3 judges keys by) around the redirect, and put it back
             conn.change_window_attributes(
                 root,
-                &ChangeWindowAttributesAux::new().event_mask(root_events() | EventMask::SUBSTRUCTURE_REDIRECT),
+                &ChangeWindowAttributesAux::new()
+                    .event_mask(root_events() | EventMask::SUBSTRUCTURE_REDIRECT),
             )?
             .check()?;
-            let set = conn.change_property32(PropMode::REPLACE, root, atom, AtomEnum::CARDINAL, &[0])?.check();
-            conn.change_window_attributes(root, &ChangeWindowAttributesAux::new().event_mask(root_events()))?
-                .check()?;
+            let set = conn
+                .change_property32(PropMode::REPLACE, root, atom, AtomEnum::CARDINAL, &[0])?
+                .check();
+            conn.change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new().event_mask(root_events()),
+            )?
+            .check()?;
             set?;
             Ok(())
         })();
         match result {
             Ok(()) => crate::vlog!("xwayland: commits off (the root window is never shown)"),
-            Err(e) => crate::warning!("xwayland: can't stop Xwayland's commits ({e}); it copies every frame for nothing"),
+            Err(e) => crate::warning!(
+                "xwayland: can't stop Xwayland's commits ({e}); it copies every frame for nothing"
+            ),
         }
     }
 
@@ -1574,7 +1724,10 @@ impl Agent {
     /// own pointer, driven by the display's clients, reaches none), and the
     /// core keyboard focused on an input-only window of ours, so it types
     /// into no X window either.
-    fn setup_reverse(conn: &RustConnection, root: Window) -> Result<(reverse::Devices, Window), AnyError> {
+    fn setup_reverse(
+        conn: &RustConnection,
+        root: Window,
+    ) -> Result<(reverse::Devices, Window), AnyError> {
         let devs = reverse::create_master(conn)?;
         let kfocus = conn.generate_id()?;
         conn.create_window(
@@ -1589,7 +1742,9 @@ impl Agent {
             WindowClass::INPUT_ONLY,
             0,
             // its focus events tell U3's judging that the focus is ours
-            &CreateWindowAux::new().override_redirect(1).event_mask(EventMask::FOCUS_CHANGE),
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .event_mask(EventMask::FOCUS_CHANGE),
         )?;
         conn.map_window(kfocus)?;
         Self::grab_core(conn, root, kfocus)?;
@@ -1621,7 +1776,11 @@ impl Agent {
         if status != x11rb::protocol::xproto::GrabStatus::SUCCESS {
             return Err(format!("can't grab the core pointer: {status:?}").into());
         }
-        conn.set_input_focus(x11rb::protocol::xproto::InputFocus::PARENT, kfocus, x11rb::CURRENT_TIME)?;
+        conn.set_input_focus(
+            x11rb::protocol::xproto::InputFocus::PARENT,
+            kfocus,
+            x11rb::CURRENT_TIME,
+        )?;
         Ok(())
     }
 
@@ -1666,15 +1825,16 @@ impl Agent {
                 .background_pixel(s.black_pixel)
                 // the pointer's position, beside raw motion; crossing, to see
                 // the pointer grabbed (see `attrib`)
-                .event_mask(EventMask::POINTER_MOTION | EventMask::ENTER_WINDOW | EventMask::LEAVE_WINDOW),
+                .event_mask(
+                    EventMask::POINTER_MOTION | EventMask::ENTER_WINDOW | EventMask::LEAVE_WINDOW,
+                ),
         )?;
         conn.map_window(mirror)?;
         // hear about other windows being mapped or restacked, to stay on top,
         // and about the keyboard being grabbed
         conn.change_window_attributes(
             root,
-            &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
-                .event_mask(root_events()),
+            &x11rb::protocol::xproto::ChangeWindowAttributesAux::new().event_mask(root_events()),
         )?;
         Ok(mirror)
     }
@@ -1728,8 +1888,16 @@ impl Agent {
             }
             self.conn.flush()?;
             let mut pfds = [
-                libc::pollfd { fd: xfd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: self.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd: xfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.wake.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             let mut timeout = HOUSEKEEPING;
             if let Some(due) = record::lock(&self.holds).next_due() {
@@ -1790,9 +1958,9 @@ impl Agent {
         if let Some(devs) = &self.reverse {
             let from = match &ev {
                 Event::XinputRawKeyPress(e) | Event::XinputRawKeyRelease(e) => Some(e.deviceid),
-                Event::XinputRawButtonPress(e) | Event::XinputRawButtonRelease(e) | Event::XinputRawMotion(e) => {
-                    Some(e.deviceid)
-                }
+                Event::XinputRawButtonPress(e)
+                | Event::XinputRawButtonRelease(e)
+                | Event::XinputRawMotion(e) => Some(e.deviceid),
                 _ => None,
             };
             if let Some(d) = from
@@ -1856,13 +2024,28 @@ impl Agent {
                 self.resolve_pending();
                 let (x, y) = first_two_valuators(&e.valuator_mask, &e.axisvalues);
                 let (raw_x, raw_y) = first_two_valuators(&e.valuator_mask, &e.axisvalues_raw);
-                let sig = raw_sig(MOTION_NOTIFY, 0, e.time, &e.valuator_mask, &e.axisvalues, &e.axisvalues_raw);
+                let sig = raw_sig(
+                    MOTION_NOTIFY,
+                    0,
+                    e.time,
+                    &e.valuator_mask,
+                    &e.axisvalues,
+                    &e.axisvalues_raw,
+                );
                 let forward = self.forward(e.sourceid, sig);
                 let id = self
                     .recording
                     .load(Ordering::Acquire)
                     .then(|| self.pairing.saw(raw_x.unwrap_or(0), raw_y.unwrap_or(0)));
-                self.pending = Some(PendingMotion { id, x, y, raw_x, raw_y, time: e.time, forward });
+                self.pending = Some(PendingMotion {
+                    id,
+                    x,
+                    y,
+                    raw_x,
+                    raw_y,
+                    time: e.time,
+                    forward,
+                });
                 self.pos_dirty |= forward;
             }
             // -showwindows / -reverseinput: the core pointer's motion, through
@@ -1907,7 +2090,9 @@ impl Agent {
             Event::FocusIn(e) if e.event == self.root => self.target.focus_event(true, e.detail),
             Event::FocusOut(e) if e.event == self.root => self.target.focus_event(false, e.detail),
             // -showwindows / -reverseinput: whether it is on our keyboard window
-            Event::FocusIn(e) if Some(e.event) == self.kfocus => self.target.own_focus_event(true, e.mode, e.detail),
+            Event::FocusIn(e) if Some(e.event) == self.kfocus => {
+                self.target.own_focus_event(true, e.mode, e.detail)
+            }
             Event::FocusOut(e) if Some(e.event) == self.kfocus => {
                 self.target.own_focus_event(false, e.mode, e.detail)
             }
@@ -1932,7 +2117,9 @@ impl Agent {
                 let _ = self.conn.map_window(e.window);
             }
             Event::ConfigureRequest(e) => {
-                let _ = self.conn.configure_window(e.window, &ConfigureWindowAux::from_configure_request(&e));
+                let _ = self
+                    .conn
+                    .configure_window(e.window, &ConfigureWindowAux::from_configure_request(&e));
             }
             Event::MapNotify(e) if e.window != self.top => self.raise(),
             Event::ConfigureNotify(e) if e.window != self.top => self.raise(),
@@ -1962,7 +2149,9 @@ impl Agent {
         use attrib::Class;
         let why = match fake.who.class {
             Class::Agent | Class::Driver => return true,
-            Class::Helper => "it drives windows on this display (an engine helper, -xtesthelpers)".to_string(),
+            Class::Helper => {
+                "it drives windows on this display (an engine helper, -xtesthelpers)".to_string()
+            }
             Class::Other => {
                 let t0 = Instant::now();
                 let bound = self.engine_bound(sig.type_);
@@ -1977,7 +2166,11 @@ impl Agent {
         if self.target.dropped.len() >= 1024 {
             self.target.dropped.clear();
         }
-        if self.target.dropped.insert((fake.who.base, fake.who.name.clone(), why.clone())) {
+        if self
+            .target
+            .dropped
+            .insert((fake.who.base, fake.who.name.clone(), why.clone()))
+        {
             crate::log!(
                 "xvfb: input from X client {:#x} ({}) stays on this display: {why}",
                 fake.who.base,
@@ -2022,7 +2215,8 @@ impl Agent {
                 }
                 // None, PointerRoot or the root: the desktop; with
                 // -showwindows / -reverseinput, our own keyboard window too
-                (t.focus_inferior && !t.focus_ours).then(|| "the X focus is on another client's window".into())
+                (t.focus_inferior && !t.focus_ours)
+                    .then(|| "the X focus is on another client's window".into())
             }
             // -showwindows / -reverseinput: the core pointer is ours
             // (grabbed), so its clicks and moves reach no other client's
@@ -2057,9 +2251,10 @@ impl Agent {
         if self.reverse.is_some() {
             return; // no shield up: the core pointer is grabbed instead
         }
-        let _ = self
-            .conn
-            .configure_window(self.top, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        let _ = self.conn.configure_window(
+            self.top,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        );
     }
 
     /// A raw motion went without its core event (another client holds a
@@ -2069,9 +2264,10 @@ impl Agent {
         let Some(m) = self.pending.take() else { return };
         let recording = &self.recording;
         let relative = m.id.and_then(|id| {
-            self.pairing.kind(&self.motions, id, Instant::now() + MOTION_KIND_WAIT, || {
-                recording.load(Ordering::Acquire)
-            })
+            self.pairing
+                .kind(&self.motions, id, Instant::now() + MOTION_KIND_WAIT, || {
+                    recording.load(Ordering::Acquire)
+                })
         });
         let clamp = |v: i32, len: u16| v.clamp(0, i32::from(len.max(1)) - 1) as i16;
         self.pos = match (relative, self.pos) {
@@ -2117,7 +2313,9 @@ impl Agent {
             if self.debug {
                 crate::warning!("xvfb: pointer to ({x}, {y})");
             }
-            self.server.input.fake_input(AGENT_CLIENT, MOTION_NOTIFY, 0, x, y);
+            self.server
+                .input
+                .fake_input(AGENT_CLIENT, MOTION_NOTIFY, 0, x, y);
         }
     }
 
@@ -2183,8 +2381,14 @@ impl Agent {
         // while a client's resize is on its way to the desktop (or another
         // client is still in the middle of one), the desktop's size is the
         // old one: following it would undo the client's resize
-        let busy = self.dynres_out.is_some() || self.dynres_next.is_some() || self.settle_at.is_some();
-        if (w, h) != (self.width, self.height) && w > 0 && h > 0 && !busy && self.refused != Some((w, h)) {
+        let busy =
+            self.dynres_out.is_some() || self.dynres_next.is_some() || self.settle_at.is_some();
+        if (w, h) != (self.width, self.height)
+            && w > 0
+            && h > 0
+            && !busy
+            && self.refused != Some((w, h))
+        {
             if self.resizable {
                 self.resize(w, h)?;
             } else if !self.warned_fixed {
@@ -2222,7 +2426,12 @@ impl Agent {
 
     /// Asks Xwayland's compositor for `w`x`h` and waits (up to 3 s) for the
     /// root window to take it. The size it took, or `None` if it stayed.
-    fn resize_by_host(&mut self, r: &wlhost::Resizer, w: u16, h: u16) -> Result<Option<(u16, u16)>, AnyError> {
+    fn resize_by_host(
+        &mut self,
+        r: &wlhost::Resizer,
+        w: u16,
+        h: u16,
+    ) -> Result<Option<(u16, u16)>, AnyError> {
         r.resize(w, h);
         let start = Instant::now();
         loop {
@@ -2283,7 +2492,9 @@ impl Agent {
                     name_len: name.len() as u16,
                     mode_flags: 0u32.into(),
                 };
-                let id = randr::create_mode(&self.conn, self.root, mi, name.as_bytes())?.reply()?.mode;
+                let id = randr::create_mode(&self.conn, self.root, mi, name.as_bytes())?
+                    .reply()?
+                    .mode;
                 randr::add_output_mode(&self.conn, output, id)?;
                 id
             }
@@ -2317,7 +2528,9 @@ impl Agent {
     fn adopt_size(&mut self, w: u16, h: u16) -> Result<(), AnyError> {
         self.conn.configure_window(
             self.top,
-            &ConfigureWindowAux::new().width(u32::from(w)).height(u32::from(h)),
+            &ConfigureWindowAux::new()
+                .width(u32::from(w))
+                .height(u32::from(h)),
         )?;
         let len = w as usize * h as usize * 4;
         if len > self.shm.len {
@@ -2365,7 +2578,11 @@ impl Agent {
         // asked for once it stands (and the previous one is answered); a
         // newer size replaces it
         let now = Instant::now();
-        self.dynres_next = Some(DynresNext { size: (w, h), since: now, due: now + DEBOUNCE });
+        self.dynres_next = Some(DynresNext {
+            size: (w, h),
+            since: now,
+            due: now + DEBOUNCE,
+        });
         Ok(())
     }
 
@@ -2383,7 +2600,10 @@ impl Agent {
             // anyone asked to see (xrandr --off shrinks the screen to its
             // minimum), and the screen settles with its output on
             if next.since.elapsed() < SETTLE {
-                self.dynres_next = Some(DynresNext { due: Instant::now() + DEBOUNCE, ..next });
+                self.dynres_next = Some(DynresNext {
+                    due: Instant::now() + DEBOUNCE,
+                    ..next
+                });
             } else {
                 self.settle_at = Some(Instant::now());
             }
@@ -2412,7 +2632,11 @@ impl Agent {
         }
         let keys: Vec<u32> = {
             let s = self.server.screen.lock().unwrap();
-            s.outputs.iter().filter(|o| o.is_wayland()).map(|o| o.wl_name).collect()
+            s.outputs
+                .iter()
+                .filter(|o| o.is_wayland())
+                .map(|o| o.wl_name)
+                .collect()
         };
         if keys.len() != 1 {
             return Err(format!(
@@ -2468,14 +2692,20 @@ impl Agent {
             return Ok(true); // nothing to turn on
         };
         let c = randr::get_crtc_info(&self.conn, crtc, res.config_timestamp)?.reply()?;
-        Ok(c.mode != 0 && !c.outputs.is_empty() && (c.x, c.y, c.width, c.height) == (0, 0, self.width, self.height))
+        Ok(c.mode != 0
+            && !c.outputs.is_empty()
+            && (c.x, c.y, c.width, c.height) == (0, 0, self.width, self.height))
     }
 
     /// After other clients' RandR changes: the screen goes back to the
     /// desktop's size (Xvfb: its fixed size) unless the desktop took the
     /// client's, and an output left off is turned back on.
     fn settle(&mut self) -> Result<(), AnyError> {
-        let target = if self.resizable { self.desktop_size() } else { self.fixed };
+        let target = if self.resizable {
+            self.desktop_size()
+        } else {
+            self.fixed
+        };
         if target.0 == 0 || target.1 == 0 {
             return Ok(());
         }
@@ -2484,7 +2714,11 @@ impl Agent {
                 "xvfb: the screen is {}x{} but {} {}x{}; putting it back",
                 self.width,
                 self.height,
-                if self.resizable { "the desktop is" } else { "Xvfb's size is" },
+                if self.resizable {
+                    "the desktop is"
+                } else {
+                    "Xvfb's size is"
+                },
                 target.0,
                 target.1
             );
@@ -2519,7 +2753,11 @@ impl Agent {
                     height_in_millimeters: mm(*h),
                     // the one output goes with the first monitor, so RandR
                     // doesn't add an automatic one for it beside ours
-                    outputs: if i == 0 { res.outputs.first().copied().into_iter().collect() } else { Vec::new() },
+                    outputs: if i == 0 {
+                        res.outputs.first().copied().into_iter().collect()
+                    } else {
+                        Vec::new()
+                    },
                 },
             )?;
             self.monitor_atoms.push(atom);
@@ -2652,7 +2890,10 @@ impl Agent {
             self.conn.flush()?;
         }
         if !now.is_empty() {
-            crate::log!("released {} key(s)/button(s) a disconnected X client was holding", now.len());
+            crate::log!(
+                "released {} key(s)/button(s) a disconnected X client was holding",
+                now.len()
+            );
         }
         if !lingered.is_empty() {
             crate::log!(
@@ -2690,7 +2931,9 @@ impl Agent {
             }
         }
         if released > 0 {
-            crate::log!("xvfb: released {released} key(s)/button(s) held by a client that went away");
+            crate::log!(
+                "xvfb: released {released} key(s)/button(s) held by a client that went away"
+            );
         }
         Ok(())
     }
@@ -2748,15 +2991,36 @@ impl Agent {
     /// any desktop layout. Left as it is when the layout isn't known.
     fn publish_rules_names(&self) {
         use x11rb::protocol::xproto::{AtomEnum, PropMode};
-        let rules = self.server.keymap.lock().unwrap().as_ref().and_then(|t| t.xkb.rules.clone());
+        let rules = self
+            .server
+            .keymap
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|t| t.xkb.rules.clone());
         let Some(r) = rules else {
-            crate::vlog!("xvfb: the desktop's layout has no known rules names; _XKB_RULES_NAMES left as it is");
+            crate::vlog!(
+                "xvfb: the desktop's layout has no known rules names; _XKB_RULES_NAMES left as it is"
+            );
             return;
         };
         let result = (|| -> Result<(), AnyError> {
-            let atom = self.conn.intern_atom(false, crate::bridge::x11::xkb::RULES_NAMES_PROPERTY.as_bytes())?.reply()?.atom;
+            let atom = self
+                .conn
+                .intern_atom(
+                    false,
+                    crate::bridge::x11::xkb::RULES_NAMES_PROPERTY.as_bytes(),
+                )?
+                .reply()?
+                .atom;
             self.conn
-                .change_property8(PropMode::REPLACE, self.root, atom, AtomEnum::STRING, &r.property())?
+                .change_property8(
+                    PropMode::REPLACE,
+                    self.root,
+                    atom,
+                    AtomEnum::STRING,
+                    &r.property(),
+                )?
                 .check()?;
             Ok(())
         })();
@@ -2787,7 +3051,12 @@ fn run_xkbcomp(keymap: &str, display: u32, xauthority: &Path) -> io::Result<()> 
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("can't run xkbcomp (install x11-xkb-utils): {e}")))?;
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("can't run xkbcomp (install x11-xkb-utils): {e}"),
+            )
+        })?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let source = keymap.to_owned();
     // a writer thread: xkbcomp may fill its stderr before it has read all of
@@ -2798,7 +3067,9 @@ fn run_xkbcomp(keymap: &str, display: u32, xauthority: &Path) -> io::Result<()> 
         // stdin drops here: xkbcomp sees the end of the source
     });
     let out = child.wait_with_output()?;
-    let wrote = writer.join().unwrap_or_else(|_| Err(io::Error::other("keymap writer panicked")));
+    let wrote = writer
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("keymap writer panicked")));
     if !out.status.success() {
         // (a write error then is just xkbcomp having quit early)
         let why = String::from_utf8_lossy(&out.stderr)
@@ -2806,7 +3077,10 @@ fn run_xkbcomp(keymap: &str, display: u32, xauthority: &Path) -> io::Result<()> 
             .take(4)
             .collect::<Vec<_>>()
             .join(" | ");
-        return Err(io::Error::other(format!("xkbcomp failed ({}): {why}", out.status)));
+        return Err(io::Error::other(format!(
+            "xkbcomp failed ({}): {why}",
+            out.status
+        )));
     }
     wrote
 }
@@ -2901,8 +3175,9 @@ mod tests {
     }
 
     use super::{
-        AGENT_RESTARTS, AGENT_RESTART_WINDOW, Auth, Failures, PrivateDir, XVNC_SOCKET, include_keymap, mkdtemp,
-        one_layout, remove_stale_private_dirs, remove_stale_rfb_sockets, xauth_entry,
+        AGENT_RESTART_WINDOW, AGENT_RESTARTS, Auth, Failures, PrivateDir, XVNC_SOCKET,
+        include_keymap, mkdtemp, one_layout, remove_stale_private_dirs, remove_stale_rfb_sockets,
+        xauth_entry,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
@@ -2910,7 +3185,10 @@ mod tests {
     #[test]
     fn authority_file_is_private_and_well_formed() {
         let dir = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlbridge-test-XXXXXX")).unwrap());
-        assert_eq!(std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         let a = Auth::create(&dir.0).unwrap();
         let b = Auth::create(&mkdtemp(&dir.0.join("b-XXXXXX")).unwrap()).unwrap();
         assert_ne!(a.cookie, b.cookie, "a fresh cookie each time");
@@ -2935,7 +3213,8 @@ mod tests {
         let _spawning = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::net::UnixListener;
         use std::process::Command;
-        let base = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlbridge-test-sweep-XXXXXX")).unwrap());
+        let base =
+            PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlbridge-test-sweep-XXXXXX")).unwrap());
         let mut done = Command::new("true").spawn().unwrap();
         let dead = done.id();
         done.wait().unwrap();
@@ -2957,16 +3236,24 @@ mod tests {
         let _listening = UnixListener::bind(answering.join(XVNC_SOCKET)).unwrap();
         // not ours: another name, a plain file, a link to a directory
         let other = mk("xwlbridge-ui-abcdef".into());
-        let plain = base.0.join(format!("xwlbridge-{}-zzzzzz", dead + 3_000_000));
+        let plain = base
+            .0
+            .join(format!("xwlbridge-{}-zzzzzz", dead + 3_000_000));
         std::fs::write(&plain, b"").unwrap();
         let target = mk("elsewhere".into());
-        let link = base.0.join(format!("xwlbridge-{}-yyyyyy", dead + 4_000_000));
+        let link = base
+            .0
+            .join(format!("xwlbridge-{}-yyyyyy", dead + 4_000_000));
         std::os::unix::fs::symlink(&target, &link).unwrap();
         remove_stale_private_dirs(&base.0);
         assert!(!gone.exists());
         assert!(!gone_xvnc.exists());
         for kept in [&alive, &own, &answering, &other, &plain, &link, &target] {
-            assert!(std::fs::symlink_metadata(kept).is_ok(), "{} kept", kept.display());
+            assert!(
+                std::fs::symlink_metadata(kept).is_ok(),
+                "{} kept",
+                kept.display()
+            );
         }
         assert!(target.join("Xauthority").exists());
         let _ = live.kill();
@@ -3015,9 +3302,15 @@ mod tests {
         let mut f = Failures::default();
         let t0 = Instant::now();
         for i in 0..AGENT_RESTARTS {
-            assert!(f.record(t0 + Duration::from_secs(i as u64)), "failure {i} may restart");
+            assert!(
+                f.record(t0 + Duration::from_secs(i as u64)),
+                "failure {i} may restart"
+            );
         }
-        assert!(!f.record(t0 + Duration::from_secs(10)), "one too many within the window");
+        assert!(
+            !f.record(t0 + Duration::from_secs(10)),
+            "one too many within the window"
+        );
         // once the earlier ones are out of the window, restarting is allowed again
         assert!(f.record(t0 + AGENT_RESTART_WINDOW + Duration::from_secs(20)));
     }
@@ -3026,7 +3319,10 @@ mod tests {
     fn one_layout_is_picked_out() {
         let s = "pc+us+de(nodeadkeys):2+us:3+inet(evdev)+group(alts_toggle)";
         assert_eq!(one_layout(s, 0), "pc+us+inet(evdev)+group(alts_toggle)");
-        assert_eq!(one_layout(s, 1), "pc+de(nodeadkeys)+inet(evdev)+group(alts_toggle)");
+        assert_eq!(
+            one_layout(s, 1),
+            "pc+de(nodeadkeys)+inet(evdev)+group(alts_toggle)"
+        );
         assert_eq!(one_layout(s, 2), "pc+us+inet(evdev)+group(alts_toggle)");
         // past the last layout: wraps, as xkb does
         assert_eq!(one_layout(s, 4), one_layout(s, 1));
@@ -3034,7 +3330,10 @@ mod tests {
         assert_eq!(one_layout("pc+us+inet(evdev)", 0), "pc+us+inet(evdev)");
         assert_eq!(one_layout("pc+us+inet(evdev)", 1), "pc+us+inet(evdev)");
         // a per-layout option part goes with its layout
-        assert_eq!(one_layout("pc+us+ru:2+level3(ralt_switch):2", 1), "pc+ru+level3(ralt_switch)");
+        assert_eq!(
+            one_layout("pc+us+ru:2+level3(ralt_switch):2", 1),
+            "pc+ru+level3(ralt_switch)"
+        );
         assert_eq!(one_layout("pc+us+ru:2+level3(ralt_switch):2", 0), "pc+us");
     }
 

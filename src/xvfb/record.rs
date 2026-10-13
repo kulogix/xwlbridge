@@ -46,7 +46,8 @@ use x11rb::rust_connection::RustConnection;
 use super::attrib::{self, Class, Fake, Ledger, Rules, Who};
 use super::motion::{Motion, MotionLog};
 use crate::bridge::input::{
-    BUTTON_PRESS, BUTTON_RELEASE, InputPolicy, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY, ONE_SHOT, linger_due,
+    BUTTON_PRESS, BUTTON_RELEASE, InputPolicy, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY, ONE_SHOT,
+    linger_due,
 };
 
 /// XTest's FakeInput minor opcode.
@@ -149,7 +150,11 @@ impl Holds {
     /// Whether a live client holds what `r` releases.
     fn live(&self, (type_, detail): Release) -> bool {
         self.clients.values().any(|h| {
-            if type_ == KEY_RELEASE { h.keys.contains(&detail) } else { h.buttons.contains(&detail) }
+            if type_ == KEY_RELEASE {
+                h.keys.contains(&detail)
+            } else {
+                h.buttons.contains(&detail)
+            }
         })
     }
 
@@ -213,7 +218,10 @@ impl Holds {
 
     /// When the next lingering hold is due to go up, if any lingers.
     pub fn next_due(&self) -> Option<Instant> {
-        self.orphans.values().filter_map(|&left| self.due(left)).min()
+        self.orphans
+            .values()
+            .filter_map(|&left| self.due(left))
+            .min()
     }
 
     /// How many departed clients' holds are down (lingering or persisting).
@@ -266,13 +274,23 @@ struct Classifier {
 
 impl Classifier {
     fn new(a: Attrib) -> Classifier {
-        let conn = a
-            .lookup
-            .filter(|c| x11rb::protocol::res::query_version(c, 1, 2).ok().and_then(|r| r.reply().ok()).is_some());
+        let conn = a.lookup.filter(|c| {
+            x11rb::protocol::res::query_version(c, 1, 2)
+                .ok()
+                .and_then(|r| r.reply().ok())
+                .is_some()
+        });
         if conn.is_none() {
-            crate::warning!("xvfb: can't look up X clients' programs (X-Resource 1.2); no client counts as an engine helper or a desktop driver");
+            crate::warning!(
+                "xvfb: can't look up X clients' programs (X-Resource 1.2); no client counts as an engine helper or a desktop driver"
+            );
         }
-        Classifier { conn, rules: a.rules, agent_base: a.agent_base, known: HashMap::new() }
+        Classifier {
+            conn,
+            rules: a.rules,
+            agent_base: a.agent_base,
+            known: HashMap::new(),
+        }
     }
 
     fn who(&mut self, base: u32) -> Arc<Who> {
@@ -280,10 +298,18 @@ impl Classifier {
             return w.clone();
         }
         let who = if base == self.agent_base {
-            Who { base, class: Class::Agent, name: "xwlbridge".into(), program: String::new(), pid: None }
+            Who {
+                base,
+                class: Class::Agent,
+                name: "xwlbridge".into(),
+                program: String::new(),
+                pid: None,
+            }
         } else {
             let pid = self.conn.as_ref().and_then(|c| attrib::client_pid(c, base));
-            let names = pid.map(crate::bridge::injectors::process_names).unwrap_or_default();
+            let names = pid
+                .map(crate::bridge::injectors::process_names)
+                .unwrap_or_default();
             let class = self.rules.classify(&names);
             let name = match (names.first(), pid) {
                 (Some(n), Some(p)) => format!("{n}, pid {p}"),
@@ -293,7 +319,13 @@ impl Classifier {
             // all its names: an interpreter's script tells it from other
             // scripts of the same interpreter
             let program = names.join("/");
-            Who { base, class, name, program, pid }
+            Who {
+                base,
+                class,
+                name,
+                program,
+                pid,
+            }
         };
         let who = Arc::new(who);
         self.known.insert(base, who.clone());
@@ -340,10 +372,16 @@ pub fn run(
     };
     let range = Range {
         // the agent's markers
-        core_requests: Range8 { first: NO_OPERATION, last: NO_OPERATION },
+        core_requests: Range8 {
+            first: NO_OPERATION,
+            last: NO_OPERATION,
+        },
         core_replies: none8,
         ext_requests: ExtRange {
-            major: Range8 { first: xtest, last: xtest },
+            major: Range8 {
+                first: xtest,
+                last: xtest,
+            },
             minor: Range16 {
                 first: FAKE_INPUT.into(),
                 last: FAKE_INPUT.into(),
@@ -362,7 +400,10 @@ pub fn run(
         core_requests: core,
         ext_requests: match ext {
             Some(major) => ExtRange {
-                major: Range8 { first: major, last: major },
+                major: Range8 {
+                    first: major,
+                    last: major,
+                },
                 minor: Range16 {
                     first: minor.into(),
                     last: minor.into(),
@@ -381,12 +422,27 @@ pub fn run(
     // requests then overflow it, which XTest's range ahead of this one did.
     // (XTest's range has a core request too now, NoOperation: two core and two
     // extension intervals, in a list sized for four.)
-    let ranges = [reads_of(Range8 { first: GET_IMAGE, last: GET_IMAGE }, shm, SHM_GET_IMAGE), range];
+    let ranges = [
+        reads_of(
+            Range8 {
+                first: GET_IMAGE,
+                last: GET_IMAGE,
+            },
+            shm,
+            SHM_GET_IMAGE,
+        ),
+        range,
+    ];
     let ctx = conn.generate_id()?;
     // each request comes with the server time it was handled at
     let header = record::HType::FROM_CLIENT_TIME;
-    conn.record_create_context(ctx, header.into(), &[record::CS::ALL_CLIENTS.into()], &ranges)?
-        .check()?;
+    conn.record_create_context(
+        ctx,
+        header.into(),
+        &[record::CS::ALL_CLIENTS.into()],
+        &ranges,
+    )?
+    .check()?;
     let agent_base = attrib.agent_base;
     let ledger = attrib.ledger.clone();
     let mut classifier = Classifier::new(attrib);
@@ -413,7 +469,11 @@ pub fn run(
                 let mut read_root = false;
                 let now = Instant::now();
                 for_each_request(&r.data, little, timed, |op, minor, body, time| {
-                    if op == xtest && minor == FAKE_INPUT && body.len() >= 2 && fake_delay(body, little) != 0 {
+                    if op == xtest
+                        && minor == FAKE_INPUT
+                        && body.len() >= 2
+                        && fake_delay(body, little) != 0
+                    {
                         // a delayed FakeInput: the server sleeps for `time` ms
                         // and then runs the request again with no delay, which
                         // RECORD reports again, in its real place among the
@@ -429,10 +489,27 @@ pub fn run(
                         if let Some(m) = fake_motion(body, little) {
                             motions.push(m);
                         }
-                        let i16_at = |b: &[u8]| (if little { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }) as i16;
-                        let (x, y) = if body.len() >= 24 { (i16_at(&body[20..]), i16_at(&body[22..])) } else { (0, 0) };
+                        let i16_at = |b: &[u8]| {
+                            (if little {
+                                u16::from_le_bytes([b[0], b[1]])
+                            } else {
+                                u16::from_be_bytes([b[0], b[1]])
+                            }) as i16
+                        };
+                        let (x, y) = if body.len() >= 24 {
+                            (i16_at(&body[20..]), i16_at(&body[22..]))
+                        } else {
+                            (0, 0)
+                        };
                         let who = classifier.who(r.xid_base);
-                        ledger.push(Fake { who, type_: body[0], detail: body[1], x, y, time });
+                        ledger.push(Fake {
+                            who,
+                            type_: body[0],
+                            detail: body[1],
+                            x,
+                            y,
+                            time,
+                        });
                     } else if op == NO_OPERATION {
                         if r.xid_base == agent_base {
                             ledger.marker();
@@ -472,7 +549,11 @@ pub fn run(
                     if who.class == Class::Helper {
                         // its input never reaches the desktop, and it isn't
                         // reading yet: nothing to start the session for
-                        crate::vlog!("xvfb: engine helper {:#x} ({}) connected; not starting capture for it", r.xid_base, who.name);
+                        crate::vlog!(
+                            "xvfb: engine helper {:#x} ({}) connected; not starting capture for it",
+                            r.xid_base,
+                            who.name
+                        );
                     } else if idle.idle(&who.program, std::time::Instant::now()) {
                         crate::vlog!(
                             "xvfb: client {:#x} ({}) connected while capture is stopped; not starting it: \
@@ -483,7 +564,10 @@ pub fn run(
                             IdlePrograms::WINDOW.as_secs()
                         );
                     } else {
-                        crate::vlog!("xvfb: client {:#x} connected while capture is stopped; starting it", r.xid_base);
+                        crate::vlog!(
+                            "xvfb: client {:#x} connected while capture is stopped; starting it",
+                            r.xid_base
+                        );
                         reads.framebuffer.prefetch();
                         prefetched.insert(r.xid_base, (who.program.clone(), who.pid));
                     }
@@ -550,8 +634,13 @@ impl IdlePrograms {
     const MAX: usize = 4096;
 
     fn recent(&mut self, program: &str, now: std::time::Instant) -> usize {
-        let Some(q) = self.runs.get_mut(program) else { return 0 };
-        while q.front().is_some_and(|&t| now.duration_since(t) > Self::WINDOW) {
+        let Some(q) = self.runs.get_mut(program) else {
+            return 0;
+        };
+        while q
+            .front()
+            .is_some_and(|&t| now.duration_since(t) > Self::WINDOW)
+        {
             q.pop_front();
         }
         q.len()
@@ -632,7 +721,13 @@ fn fake_motion(body: &[u8], little: bool) -> Option<Motion> {
     if body.len() < 24 || body[0] != MOTION_NOTIFY {
         return None;
     }
-    let i16_at = |b: &[u8]| (if little { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }) as i16;
+    let i16_at = |b: &[u8]| {
+        (if little {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        }) as i16
+    };
     Some(Motion {
         relative: body[1] != 0,
         x: i16_at(&body[20..]),
@@ -651,7 +746,11 @@ fn reads_pixels(op: u8, minor: u8, shm: Option<u8>) -> bool {
 
 fn u32_at(b: &[u8], little: bool) -> u32 {
     let a = [b[0], b[1], b[2], b[3]];
-    if little { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
+    if little {
+        u32::from_le_bytes(a)
+    } else {
+        u32::from_be_bytes(a)
+    }
 }
 
 /// Calls `f(major, minor, body, time)` for each request in `data`, a run of
@@ -659,8 +758,19 @@ fn u32_at(b: &[u8], little: bool) -> u32 {
 /// byte (an extension's minor opcode), `body` what follows the header, `time`
 /// the server time RECORD put before the request if `timed` (in our byte
 /// order), else 0.
-fn for_each_request(mut data: &[u8], little: bool, timed: bool, mut f: impl FnMut(u8, u8, &[u8], u32)) {
-    let u16_at = |b: &[u8]| if little { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) };
+fn for_each_request(
+    mut data: &[u8],
+    little: bool,
+    timed: bool,
+    mut f: impl FnMut(u8, u8, &[u8], u32),
+) {
+    let u16_at = |b: &[u8]| {
+        if little {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        }
+    };
     loop {
         let mut time = 0;
         if timed {
@@ -722,7 +832,10 @@ mod tests {
         h.input(1, BUTTON_PRESS, 1, t);
         h.input(2, KEY_PRESS, 50, t); // shared
         let later = ms(t, 5000);
-        assert_eq!(h.died(1, later), Some(vec![(KEY_RELEASE, 38), (BUTTON_RELEASE, 1)]));
+        assert_eq!(
+            h.died(1, later),
+            Some(vec![(KEY_RELEASE, 38), (BUTTON_RELEASE, 1)])
+        );
         assert_eq!(h.died(2, later), Some(vec![(KEY_RELEASE, 50)]));
         assert_eq!(h.died(3, later), None);
         assert_eq!((h.orphans(), h.next_due()), (0, None));
@@ -747,7 +860,11 @@ mod tests {
         let mut h = holds(false, 1000);
         h.started(1, t);
         h.input(1, KEY_PRESS, SHIFT, t);
-        assert_eq!(h.died(1, ms(t, 2)), Some(vec![]), "nothing released at once");
+        assert_eq!(
+            h.died(1, ms(t, 2)),
+            Some(vec![]),
+            "nothing released at once"
+        );
         assert_eq!(h.next_due(), Some(ms(t, 1002)));
         assert!(h.expire(ms(t, 400)).is_empty());
         h.input(2, KEY_PRESS, 17, ms(t, 416));
@@ -775,7 +892,10 @@ mod tests {
         assert_eq!(h.died(1, t), Some(vec![]));
         h.input(AGENT, KEY_RELEASE, 99, ms(t, 900)); // not a client's input
         assert!(h.expire(ms(t, 999)).is_empty());
-        assert_eq!(h.expire(ms(t, 1000)), vec![(KEY_RELEASE, 38), (BUTTON_RELEASE, 1)]);
+        assert_eq!(
+            h.expire(ms(t, 1000)),
+            vec![(KEY_RELEASE, 38), (BUTTON_RELEASE, 1)]
+        );
         // busy other clients keep a hold down, up to the cap
         h.started(2, ms(t, 1990));
         h.input(2, KEY_PRESS, 38, ms(t, 2000));
@@ -834,7 +954,11 @@ mod tests {
         p.input(1, KEY_PRESS, SHIFT, t);
         p.input(2, BUTTON_PRESS, 1, t);
         assert_eq!(p.died(1, ms(t, 1)), Some(vec![]));
-        assert_eq!(p.died(2, ms(t, 60_000)), Some(vec![]), "even a long-lived client's");
+        assert_eq!(
+            p.died(2, ms(t, 60_000)),
+            Some(vec![]),
+            "even a long-lived client's"
+        );
         assert_eq!((p.orphans(), p.next_due()), (2, None));
         assert!(p.expire(ms(t, 3_600_000)).is_empty());
         p.input(3, KEY_RELEASE, SHIFT, ms(t, 3_600_000));
@@ -987,7 +1111,10 @@ mod tests {
         be.resize(36, 0);
         let mut seen = fake_inputs(&le.repeat(2), true, 140);
         seen.extend(fake_inputs(&be, false, 140));
-        assert_eq!(seen, vec![(KEY_PRESS, 38), (KEY_PRESS, 38), (KEY_PRESS, 39)]);
+        assert_eq!(
+            seen,
+            vec![(KEY_PRESS, 38), (KEY_PRESS, 38), (KEY_PRESS, 39)]
+        );
     }
 
     #[test]
@@ -1020,12 +1147,22 @@ mod tests {
 
     /// An XTest FakeInput request as libXtst sends it (xXTestFakeInputReq).
     fn fake_motion_req(little: bool, relative: bool, x: i16, y: i16, big: bool) -> Vec<u8> {
-        let w16 = |v: u16| if little { v.to_le_bytes() } else { v.to_be_bytes() };
+        let w16 = |v: u16| {
+            if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
         let mut r = vec![140u8, 2];
         if big {
             // BIG-REQUESTS form: length 0, then the length in 32-bit words
             r.extend_from_slice(&w16(0));
-            r.extend_from_slice(&if little { 10u32.to_le_bytes() } else { 10u32.to_be_bytes() });
+            r.extend_from_slice(&if little {
+                10u32.to_le_bytes()
+            } else {
+                10u32.to_be_bytes()
+            });
         } else {
             r.extend_from_slice(&w16(9));
         }
@@ -1042,7 +1179,10 @@ mod tests {
     fn motions_in(data: &[u8], little: bool) -> Vec<Motion> {
         let mut seen = Vec::new();
         for_each_request(data, little, false, |op, minor, body, _| {
-            if op == 140 && minor == FAKE_INPUT && let Some(m) = fake_motion(body, little) {
+            if op == 140
+                && minor == FAKE_INPUT
+                && let Some(m) = fake_motion(body, little)
+            {
                 seen.push(m);
             }
         });
@@ -1058,8 +1198,16 @@ mod tests {
                 assert_eq!(
                     motions_in(&data, little),
                     vec![
-                        Motion { relative: false, x: 400, y: 300 },
-                        Motion { relative: true, x: -100, y: -50 },
+                        Motion {
+                            relative: false,
+                            x: 400,
+                            y: 300
+                        },
+                        Motion {
+                            relative: true,
+                            x: -100,
+                            y: -50
+                        },
                     ],
                     "little {little} big {big}"
                 );
@@ -1081,7 +1229,16 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                (140, FAKE_INPUT, 1234, Some(Motion { relative: false, x: -5, y: 700 })),
+                (
+                    140,
+                    FAKE_INPUT,
+                    1234,
+                    Some(Motion {
+                        relative: false,
+                        x: -5,
+                        y: 700
+                    })
+                ),
                 (NO_OPERATION, 0, 99, None)
             ]
         );

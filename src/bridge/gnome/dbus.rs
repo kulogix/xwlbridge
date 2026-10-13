@@ -85,11 +85,23 @@ pub(super) fn flag(props: &HashMap<String, OwnedValue>, key: &str) -> bool {
 /// loaded (libmutter-N is mutter N + 32: 14 is 46, 18 is 50). Its D-Bus API
 /// versions don't move between releases, but its bugs do.
 pub fn mutter_major(conn: &Connection) -> Option<u32> {
-    let bus = Proxy::new(conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus").ok()?;
+    let bus = Proxy::new(
+        conn,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .ok()?;
     let pid: u32 = bus.call("GetConnectionUnixProcessID", &(SC,)).ok()?;
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     maps.split(|c: char| c == '/' || c.is_whitespace())
-        .filter_map(|f| f.strip_prefix("libmutter-")?.split(".so").next()?.parse::<u32>().ok())
+        .filter_map(|f| {
+            f.strip_prefix("libmutter-")?
+                .split(".so")
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
         .next()
         .map(|soname| soname + 32)
 }
@@ -101,10 +113,18 @@ pub const LOCKSCREEN_EXTENSION: &str = "xwlbridge-lockscreen@xwlbridge";
 /// it isn't installed (or the shell can't be asked), else gnome-shell's
 /// `ExtensionState` number (1 = active).
 pub fn extension_state(conn: &Connection, uuid: &str) -> Option<u32> {
-    let p = Proxy::new(conn, "org.gnome.Shell", "/org/gnome/Shell", "org.gnome.Shell.Extensions").ok()?;
+    let p = Proxy::new(
+        conn,
+        "org.gnome.Shell",
+        "/org/gnome/Shell",
+        "org.gnome.Shell.Extensions",
+    )
+    .ok()?;
     let info: HashMap<String, OwnedValue> = p.call("GetExtensionInfo", &(uuid,)).ok()?;
     let state = info.get("state")?;
-    f64::try_from(state.try_clone().ok()?).ok().map(|v| v as u32)
+    f64::try_from(state.try_clone().ok()?)
+        .ok()
+        .map(|v| v as u32)
 }
 
 /// Reads the current monitor layout. Mirrored monitors share one logical
@@ -118,10 +138,7 @@ pub fn display_state(conn: &Connection) -> zbus::Result<Vec<Monitor>> {
         HashMap<String, OwnedValue>,
     ) = dc.call("GetCurrentState", &())?;
     // layout-mode 2 = physical (logical coordinates are physical pixels)
-    let physical_layout = props
-        .get("layout-mode")
-        .and_then(|v| u32::try_from(v).ok())
-        == Some(2);
+    let physical_layout = props.get("layout-mode").and_then(|v| u32::try_from(v).ok()) == Some(2);
     let mut out = Vec::new();
     for (x, y, scale, transform, primary, mons, _) in logical {
         let Some((connector, ..)) = mons.first() else {
@@ -210,14 +227,26 @@ mod offered_modes_tests {
         ];
         let got = offered_modes(&modes, 0);
         assert_eq!(got.len(), 3, "nothing an X screen can't be");
-        assert_eq!((got[0].width, got[0].height, got[0].refresh_mhz), (1920, 1080, 60_000));
+        assert_eq!(
+            (got[0].width, got[0].height, got[0].refresh_mhz),
+            (1920, 1080, 60_000)
+        );
         assert!(got[0].preferred && !got[0].current && !got[0].interlaced);
-        assert_eq!((got[1].width, got[1].height, got[1].refresh_mhz), (1280, 720, 59_940));
+        assert_eq!(
+            (got[1].width, got[1].height, got[1].refresh_mhz),
+            (1280, 720, 59_940)
+        );
         assert!(got[1].current && !got[1].preferred);
         assert!(got[2].interlaced);
         // turned 90 degrees (transform 1) or 270 flipped (7): portrait sizes
         for t in [1, 3, 5, 7] {
-            assert_eq!((offered_modes(&modes, t)[1].width, offered_modes(&modes, t)[1].height), (720, 1280));
+            assert_eq!(
+                (
+                    offered_modes(&modes, t)[1].width,
+                    offered_modes(&modes, t)[1].height
+                ),
+                (720, 1280)
+            );
         }
         assert_eq!(offered_modes(&modes, 2)[1].width, 1280);
     }
@@ -278,7 +307,11 @@ pub enum Signal {
 /// act on. One subscription instead of one per session, so sessions coming
 /// and going leave no blocked watcher threads behind, and nothing emitted
 /// during `Start` can race a late subscription.
-pub fn spawn_signal_pump(conn: &Connection, tx: Sender<Signal>, wake: Arc<Wake>) -> zbus::Result<()> {
+pub fn spawn_signal_pump(
+    conn: &Connection,
+    tx: Sender<Signal>,
+    wake: Arc<Wake>,
+) -> zbus::Result<()> {
     let rule = zbus::MatchRule::builder()
         .msg_type(MsgType::Signal)
         .path_namespace("/org/gnome/Mutter")?
@@ -356,7 +389,11 @@ pub fn spawn_signal_pump(conn: &Connection, tx: Sender<Signal>, wake: Arc<Wake>)
 
 /// Forwards gnome-shell's lock-screen changes. A separate subscription: the
 /// screen shield lives under `/org/gnome/ScreenSaver`, not mutter's namespace.
-fn spawn_screensaver_pump(conn: &Connection, tx: Sender<Signal>, wake: Arc<Wake>) -> zbus::Result<()> {
+fn spawn_screensaver_pump(
+    conn: &Connection,
+    tx: Sender<Signal>,
+    wake: Arc<Wake>,
+) -> zbus::Result<()> {
     let rule = zbus::MatchRule::builder()
         .msg_type(MsgType::Signal)
         .path("/org/gnome/ScreenSaver")?
@@ -438,7 +475,10 @@ impl Session {
 
         let sc = Proxy::new(conn, SC, "/org/gnome/Mutter/ScreenCast", SC)?;
         let mut sc_opts: HashMap<&str, Value> = HashMap::new();
-        sc_opts.insert("remote-desktop-session-id", Value::from(session_id.as_str()));
+        sc_opts.insert(
+            "remote-desktop-session-id",
+            Value::from(session_id.as_str()),
+        );
         sc_opts.insert("disable-animations", Value::Bool(disable_animations));
         let sc_path: OwnedObjectPath = sc.call("CreateSession", &(sc_opts,))?;
         let scs = Proxy::new(conn, SC, sc_path.as_str(), SC_SESSION)?;
@@ -542,7 +582,11 @@ pub fn connection_lost(e: &zbus::Error) -> bool {
 
 /// Waits up to `limit` for something to own mutter's remote-desktop name,
 /// checking every `every`. True once it is owned.
-pub fn wait_for_rd(conn: &Connection, limit: std::time::Duration, every: std::time::Duration) -> bool {
+pub fn wait_for_rd(
+    conn: &Connection,
+    limit: std::time::Duration,
+    every: std::time::Duration,
+) -> bool {
     let until = std::time::Instant::now() + limit;
     loop {
         if rd_available(conn) {
