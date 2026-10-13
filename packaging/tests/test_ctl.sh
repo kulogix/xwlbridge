@@ -265,6 +265,7 @@ check "  ...app-grid entry" grep -qx "Exec=$H2/.local/bin/xwlbridge-ctl --realvn
 out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H2/.local/share/xwlbridge/uninstall.sh" --purge 2>&1); rc=$?
 check "uninstall.sh --purge rc 0" test $rc -eq 0
 after=$(cd "$H2" && find . | sort)
+[ "$before" = "$after" ] || { echo "--- HOME difference (before vs after) for: ...HOME exactly as before the install"; diff <(echo "$before") <(echo "$after"); env | grep -E "^XDG_|^TMPDIR=|^HOME=" | sed "s/^/env: /"; }
 check "  ...HOME exactly as before the install" test "$before" = "$after"
 
 # a user whose RealVNC settings already choose the port: left to RealVNC
@@ -278,6 +279,7 @@ check "  ...RealVNC's file untouched" test "$(cat "$H3/.vnc/config.d/vncserver-x
 mkdir -p "$H3/.cache/xwlbridge"; : >"$H3/.cache/xwlbridge/xwlbridge-uihook-0123456789abcdef.so"
 HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H3/.local/share/xwlbridge/uninstall.sh" --purge >/dev/null 2>&1
 after=$(cd "$H3" && find . | sort)
+[ "$before" = "$after" ] || { echo "--- HOME difference (before vs after) for: ...uninstall --purge: HOME as before (hook cache dir removed, RealVNC settings kept)"; diff <(echo "$before") <(echo "$after"); env | grep -E "^XDG_|^TMPDIR=|^HOME=" | sed "s/^/env: /"; }
 check "  ...uninstall --purge: HOME as before (hook cache dir removed, RealVNC settings kept)" test "$before" = "$after"
 # --purge without the before-list keeps ~/.vnc entirely (it cannot tell the user's files from RealVNC's new ones)
 H6=$T/home6; mkdir -p "$H6/.vnc/config.d"; printf 'Password=x\n' >"$H6/.vnc/config.d/vncserver-x11"
