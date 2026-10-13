@@ -2829,6 +2829,12 @@ fn include_keymap(text: &str, group: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Held by the tests that spawn processes while they bind sockets: a child
+    /// forked by one test holds the other's listening socket until it execs, and
+    /// a connect() in that window is answered, so the socket seemed alive (the
+    /// sweep tests failed now and then when they ran in parallel).
+    static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn the_root_selection_keeps_the_focus_events() {
         // -engine xwayland's stop_xwayland_commits selects on the root again;
@@ -2927,6 +2933,7 @@ mod tests {
 
     #[test]
     fn only_dead_bridges_private_dirs_are_removed() {
+        let _spawning = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::net::UnixListener;
         use std::process::Command;
         let base = PrivateDir(mkdtemp(&std::env::temp_dir().join("xwlbridge-test-sweep-XXXXXX")).unwrap());
@@ -2969,6 +2976,7 @@ mod tests {
 
     #[test]
     fn only_dead_bridges_rfb_sockets_are_removed() {
+        let _spawning = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::unix::net::UnixListener;
         use std::process::Command;
         let dir = std::env::temp_dir().join(format!("xwlbridge-test-stale-{}", std::process::id()));
