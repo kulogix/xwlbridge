@@ -145,9 +145,26 @@ class Reader:
                 err('scan', repr(ex))
         for wid in list(self.windows):
             if wid not in seen:
+                # GTK 4 drops its window from the application's children for a moment while a popover comes or
+                # goes (measured on GNOME 50: the entry's "opens popup"); reporting it gone made the proxy forget the
+                # window and lose every focus event until the next scan.
+                # Gone means gone: the object no longer answers, or says it is defunct.
+                if self.alive(self.objs.get(wid)):
+                    err('scan', f'window {wid} missing from its application but alive: kept')
+                    continue
                 del self.windows[wid]
                 out(t='window-gone', id=wid)
         return True
+
+    @staticmethod
+    def alive(o):
+        if o is None:
+            return False
+        try:
+            o.get_extents(Atspi.CoordType.WINDOW)    # a live call (role and states may come from libatspi's cache)
+            return not o.get_state_set().contains(Atspi.StateType.DEFUNCT)
+        except Exception:
+            return False
 
     # ---- nodes ----------------------------------------------------------------------------------------------------
     def info(self, o, parent, idx):

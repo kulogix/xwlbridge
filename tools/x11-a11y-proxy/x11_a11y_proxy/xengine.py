@@ -270,6 +270,17 @@ class Engine:
                 self.damage_cb(ev.drawable.id if hasattr(ev.drawable, 'id') else ev.drawable)
             return
         if t == X.CreateNotify:
+            # A new top-level: give its client the reverse master as ClientPointer now, before it maps. GTK 4,
+            # Chromium and Qt focus themselves with a core XSetInputFocus as their window maps; on the core keyboard
+            # the bridge takes that focus back, the app sees FocusOut and stays inactive (GTK 4, Chromium: keys then
+            # do nothing) — measured. With the reverse master as ClientPointer their core
+            # focus request moves the reverse keyboard instead. (The bridge's -showwindows does the same.)
+            try:
+                if ev.parent.id == self.root.id and not ev.override:
+                    self.set_client_pointer(ev.window.id)
+                    self.d.flush()
+            except AttributeError:
+                pass
             return
         if t == X.MapNotify:
             wid = ev.window.id
@@ -386,6 +397,19 @@ class Engine:
             self.d.sync()
         except xerror.XError as ex:
             self.log('xengine: focus', t, ex)
+
+    def refocus(self, t):
+        """As focus(), but through an empty focus first, so a client that dropped its own focus state (GTK 4 after a
+        core FocusOut it took for its own) gets a FocusIn again: focusing the window that already has the reverse
+        keyboard's focus generates no event at all (measured)."""
+        if self.reverse:
+            try:
+                _XISetFocus(display=self.d.display, opcode=self.xi_opcode, focus=X.NONE, time=X.CurrentTime,
+                            deviceid=self.reverse[1])
+                self.d.sync()
+            except xerror.XError as ex:
+                self.log('xengine: refocus', t, ex)
+        self.focus(t)
 
     def unfocus(self):
         """No app window has our keyboard any more (only matters without the reverse master: the core keyboard also

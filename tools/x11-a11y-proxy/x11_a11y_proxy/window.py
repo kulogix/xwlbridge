@@ -402,7 +402,7 @@ class ProxyWindow:
                 self.refocus_t = hist
                 if len(hist) <= 5:
                     self.log('app window deactivated while active on GNOME: X focus again', hex(self.top.id))
-                    GLib.timeout_add(100, lambda: (self.win.is_active() and self.engine.focus(self.top)) and False)
+                    GLib.timeout_add(100, lambda: (self.win.is_active() and self.engine.refocus(self.top)) and False)
             return
         live = self.toolkit.startswith('chromium')
         if k == 'focus' and not ev.get('_held'):
