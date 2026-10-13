@@ -162,8 +162,30 @@ impl EventSink {
     /// compositor layout switch leaves clients with a stale keycode->keysym
     /// table, typing the wrong characters. MappingNotify is unmaskable, hence
     /// every client rather than a selection.
-    pub fn keyboard_mapping_changed(&self, first_keycode: u8, count: u8) {
+    ///
+    /// Clients using XKB (every Xlib client) first get what Xorg sends when it
+    /// loads a keymap: XkbNewKeyboardNotify, on which Xlib reloads its whole
+    /// copy, and XkbMapNotify for the components they selected (the new
+    /// keymap has `xkb_types` key types). The core event alone would have
+    /// Xlib re-read only the keysyms, whose type indices may then point past
+    /// the types it still has from the old keymap.
+    pub fn keyboard_mapping_changed(&self, first_keycode: u8, count: u8, xkb_types: u8) {
+        let xkb_event = EXTENSIONS
+            .lookup(crate::bridge::x11::xkb::NAME.as_bytes())
+            .map(|e| e.first_event);
+        let time = server_time_ms();
         self.each_live(|c| {
+            if let Some(first_event) = xkb_event {
+                use crate::bridge::x11::xkb::{map_notify, new_keyboard_notify};
+                let (nkn, map) = c.xkb_details();
+                let events = [
+                    new_keyboard_notify(first_event, nkn, time),
+                    map_notify(first_event, map, xkb_types, time),
+                ];
+                for mut e in events.into_iter().flatten() {
+                    c.send_event_bytes(&mut e);
+                }
+            }
             for request in [xproto::Mapping::KEYBOARD, xproto::Mapping::MODIFIER] {
                 send(
                     c,

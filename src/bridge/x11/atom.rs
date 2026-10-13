@@ -36,6 +36,8 @@ pub const XA_PRIMARY: u32 = 1;
 
 pub const XA_INTEGER: u32 = 19;
 
+pub const XA_STRING: u32 = 31;
+
 impl Default for Atoms {
     fn default() -> Self {
         let by_name = PREDEFINED_ATOMS
@@ -59,6 +61,20 @@ impl Default for Atoms {
 }
 
 impl Atoms {
+    /// The predefined atoms, plus with `xkb` the ones an X server with
+    /// XKEYBOARD creates itself: setxkbmap looks `_XKB_RULES_NAMES` up with
+    /// only_if_exists, so it has to be there before anyone interns it.
+    pub fn new(xkb: bool) -> Self {
+        let mut atoms = Self::default();
+        if xkb {
+            atoms.intern(
+                crate::bridge::x11::xkb::RULES_NAMES_PROPERTY.as_bytes(),
+                false,
+            );
+        }
+        atoms
+    }
+
     pub fn intern(&mut self, name: &[u8], only_if_exists: bool) -> u32 {
         if let Some(&id) = self.by_name.get(name) {
             return id;

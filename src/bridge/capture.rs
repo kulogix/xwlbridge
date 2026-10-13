@@ -7,7 +7,7 @@
 //! conversion.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, PoisonError, RwLock};
 use std::time::Instant;
 
 use x11rb_protocol::protocol::xproto::Rectangle;
@@ -23,8 +23,18 @@ pub const XRGB: ChannelMap = [0, 1, 2];
 
 #[derive(Default)]
 pub struct Framebuffer {
-    inner: Mutex<Fb>,
+    /// Readers (X clients' GetImage) share it; capture takes it exclusively.
+    /// A mutex here let a client reading back-to-back starve capture.
+    inner: RwLock<Fb>,
     last_read_ms: AtomicU64, // `now_ms()` of the last read, 0 if never read
+    /// `now_ms()` when an X client that read the screen
+    /// last went away (`-linger`), 0 if none has.
+    last_oneshot_ms: AtomicU64,
+    /// `now_ms()` when a client last connected to a stock engine while
+    /// capture was stopped (`-coldconnect start`), 0 if none has.
+    last_prefetch_ms: AtomicU64,
+    /// Whether `inner` is the desktop as it is now (on-demand capture).
+    pub fresh: crate::bridge::fresh::Freshness,
 }
 
 #[derive(Default)]
@@ -34,10 +44,12 @@ struct Fb {
     data: Vec<u8>,
 }
 
-/// Milliseconds since the first call: a cheap monotonic clock for the read gate.
+/// Milliseconds since the first call, plus one: a cheap monotonic clock for the
+/// read gate. Never 0, which means "never read": the very first read (often the
+/// first call) would otherwise not count, and capture wouldn't start for it.
 fn now_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 impl Framebuffer {
@@ -47,15 +59,69 @@ impl Framebuffer {
         last != 0 && now_ms().saturating_sub(last) < ms
     }
 
+    /// A client that read the screen went away: one-shot
+    /// tools come in bursts, so the backend keeps capture up a while
+    /// (`-linger`) for the next one.
+    pub fn note_oneshot(&self) {
+        self.last_oneshot_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    pub fn oneshot_within(&self, ms: u64) -> bool {
+        let last = self.last_oneshot_ms.load(Ordering::Relaxed);
+        last != 0 && now_ms().saturating_sub(last) <= ms
+    }
+
+    /// A client connected to a stock engine while capture is stopped
+    /// (`-coldconnect start`): start capture now, so it is up by the time the
+    /// client reads, without counting as a read (a client that never reads
+    /// keeps it only briefly). `wake` tells the backend.
+    #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
+    pub fn prefetch(&self) {
+        self.last_prefetch_ms.store(now_ms(), Ordering::Relaxed);
+        if !self.fresh.is_live() {
+            self.fresh.wake_backend();
+        }
+    }
+
+    /// Before a read: if capture is stopped, starts it and waits (at most
+    /// `limit`) for its first frame, so the reader gets the desktop as it is
+    /// rather than black or an old picture.
+    pub fn await_fresh(&self, limit: std::time::Duration) -> crate::bridge::fresh::Wait {
+        if limit.is_zero() || !self.fresh.would_wait() {
+            return crate::bridge::fresh::Wait::NotNeeded;
+        }
+        self.last_read_ms.store(now_ms(), Ordering::Relaxed);
+        self.fresh.wake_backend();
+        self.fresh.wait(limit)
+    }
+
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    pub fn prefetch_within(&self, ms: u64) -> bool {
+        let last = self.last_prefetch_ms.load(Ordering::Relaxed);
+        last != 0 && now_ms().saturating_sub(last) < ms
+    }
+
     /// When the last read happened, for pacing no-damage capture to the rate the
     /// client actually polls. 0 if never read.
     pub fn last_read_ms(&self) -> u64 {
         self.last_read_ms.load(Ordering::Relaxed)
     }
 
+    /// Overwrites the framebuffer through `f(width, height, pixels)` (XRGB rows
+    /// of `width * 4` bytes): for pictures the backend draws itself, such as
+    /// what is shown while the desktop can't be captured. The caller reports
+    /// the damage.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    pub fn paint(&self, f: impl FnOnce(u32, u32, &mut [u8])) {
+        let mut fb = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let (w, h) = (fb.width, fb.height);
+        f(w, h, &mut fb.data);
+    }
+
     /// Resizes the virtual screen, clearing it if the size changed.
     pub fn ensure(&self, width: u32, height: u32) {
-        let mut fb = self.inner.lock().unwrap();
+        let mut fb = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         if fb.width != width || fb.height != height {
             fb.width = width;
             fb.height = height;
@@ -96,7 +162,7 @@ impl Framebuffer {
         chan: ChannelMap,
     ) -> (Option<Rectangle>, u64, u64) {
         let t0 = Instant::now();
-        let mut fb = self.inner.lock().unwrap();
+        let mut fb = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let wait_ns = t0.elapsed().as_nanos() as u64;
         let t1 = Instant::now();
         let bbox = if transform == Transform::Normal {
@@ -130,6 +196,116 @@ impl Framebuffer {
         (bbox, wait_ns, t1.elapsed().as_nanos() as u64)
     }
 
+    /// Copies only the given rectangles of an untransformed output buffer into
+    /// the framebuffer, under one lock: the path for compositors that report
+    /// damage with each frame (so nothing needs comparing). `rects` are
+    /// buffer-local `(x, y, width, height)` and are clipped to the buffer; the
+    /// buffer sits at `(ox, oy)` in the framebuffer. Returns
+    /// `(lock_wait_ns, work_ns)`.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_rects(
+        &self,
+        ox: i32,
+        oy: i32,
+        src_width: u32,
+        src_height: u32,
+        src_stride: u32,
+        src: &[u8],
+        rects: &[(u32, u32, u32, u32)],
+        chan: ChannelMap,
+    ) -> (u64, u64) {
+        let t0 = Instant::now();
+        let mut fb = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let wait_ns = t0.elapsed().as_nanos() as u64;
+        let t1 = Instant::now();
+        for &(x, y, w, h) in rects {
+            let (x1, y1) = ((x + w).min(src_width), (y + h).min(src_height));
+            if x1 <= x || y1 <= y {
+                continue;
+            }
+            let start = y as usize * src_stride as usize + x as usize * 4;
+            let Some(sub) = src.get(start..) else { continue };
+            blit_rows(
+                &mut fb,
+                ox + x as i32,
+                oy + y as i32,
+                x1 - x,
+                y1 - y,
+                src_stride,
+                sub,
+                false,
+                false,
+                chan,
+            );
+        }
+        (wait_ns, t1.elapsed().as_nanos() as u64)
+    }
+
+    /// Copies a whole native-order frame into the framebuffer at (`ox`, `oy`),
+    /// but only the 64x64 tiles that differ from what is there, and returns
+    /// those (merged into runs per band, in source coordinates): the damage of
+    /// a stream that carries none, at the price of reading what it replaces.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    pub fn blit_tiles(
+        &self,
+        ox: i32,
+        oy: i32,
+        src_width: u32,
+        src_height: u32,
+        src_stride: u32,
+        src: &[u8],
+    ) -> Vec<(u32, u32, u32, u32)> {
+        const T: u32 = 64;
+        let mut fb = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let (fw, fh) = (fb.width as i32, fb.height as i32);
+        let dst_stride = fb.width as usize * 4;
+        let mut out = Vec::new();
+        for ty in (0..src_height).step_by(T as usize) {
+            let th = T.min(src_height - ty);
+            let mut run: Option<(u32, u32)> = None;
+            for tx in (0..src_width).step_by(T as usize) {
+                let tw = T.min(src_width - tx);
+                // the tile's overlap with the framebuffer, in columns
+                let dx0 = (ox + tx as i32).max(0);
+                let dx1 = (ox + (tx + tw) as i32).min(fw);
+                let mut changed = false;
+                if dx1 > dx0 {
+                    let n = (dx1 - dx0) as usize * 4;
+                    let scol = (dx0 - ox) as usize * 4;
+                    for row in ty..ty + th {
+                        let dy = oy + row as i32;
+                        if dy < 0 || dy >= fh {
+                            continue;
+                        }
+                        let s = row as usize * src_stride as usize + scol;
+                        let d = dy as usize * dst_stride + dx0 as usize * 4;
+                        if s + n > src.len() || d + n > fb.data.len() {
+                            continue;
+                        }
+                        if fb.data[d..d + n] != src[s..s + n] {
+                            fb.data[d..d + n].copy_from_slice(&src[s..s + n]);
+                            changed = true;
+                        }
+                    }
+                }
+                match (changed, run) {
+                    (true, None) => run = Some((tx, tx + tw)),
+                    (true, Some((a, _))) => run = Some((a, tx + tw)),
+                    (false, Some((a, b))) => {
+                        out.push((a, ty, b - a, th));
+                        run = None;
+                    }
+                    (false, None) => {}
+                }
+            }
+            if let Some((a, b)) = run {
+                out.push((a, ty, b - a, th));
+            }
+        }
+        out
+    }
+
     /// [`read_rect_into`](Self::read_rect_into) with a freshly allocated buffer,
     /// for the non-shm `GetImage` path whose reply owns the returned `Vec`.
     pub fn read_rect(&self, x: i32, y: i32, width: u32, height: u32) -> Vec<u8> {
@@ -149,6 +325,13 @@ impl Framebuffer {
     /// the framebuffer and nothing else.
     pub fn read_rect_into(&self, x: i32, y: i32, width: u32, height: u32, dst: &mut [u8]) {
         self.last_read_ms.store(now_ms(), Ordering::Relaxed);
+        self.copy_rect_into(x, y, width, height, dst);
+    }
+
+    /// [`read_rect_into`](Self::read_rect_into) without counting as a read:
+    /// for a consumer that copies *because* of damage (the Xvfb engine's
+    /// agent), which must not keep the capture gate open by itself.
+    pub fn copy_rect_into(&self, x: i32, y: i32, width: u32, height: u32, dst: &mut [u8]) {
         let row_bytes = width as usize * 4;
         // A zero-width rect has no rows at all. X answers such a request with an
         // ordinary reply carrying an empty image rather than an error (checked
@@ -158,7 +341,7 @@ impl Framebuffer {
             return;
         }
         let t0 = Instant::now();
-        let fb = self.inner.lock().unwrap();
+        let fb = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let wait_ns = t0.elapsed().as_nanos() as u64;
         let t1 = Instant::now();
         let stride = fb.width as usize * 4;

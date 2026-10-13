@@ -1,6 +1,6 @@
 [package]
 name = "xwlrvnc"
-version = "0.0.8"
+version = "0.1.0-rc1"
 edition = "2024"
 license = "MIT"
 description = "Fake X server backed by a Wayland display, implementing just enough for RealVNC to work on it"
@@ -11,6 +11,9 @@ repository = "https://github.com/pgaskin/xwlrvnc"
 [dependencies]
 libc = "0.2"
 wayland-client = "0.31.14"
+# the server half of the same crate wayland-client is built on: the private
+# compositor of -engine xwayland (src/xvfb/wlhost.rs)
+wayland-backend = { version = "0.3.15", optional = true }
 wayland-protocols = { version = "0.32.12", features = ["client", "staging", "unstable"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
@@ -23,11 +26,66 @@ x11rb-protocol = { version = "0.13.2", features = [
     "shm",
 ] }
 xkbcommon-rs = { version = "0.1.2", features = ["client", "server"] }
+# GNOME backend (-backend gnome): mutter ScreenCast/RemoteDesktop/DisplayConfig over
+# D-Bus, PipeWire capture and libei input. Off by default so the default build stays
+# pure Rust; enabling it needs pkg-config, libpipewire-0.3-dev, libspa-0.2-dev and
+# libclang at build time, and libpipewire-0.3.so.0 at runtime.
+pipewire = { version = "0.10.1", optional = true }
+zbus = { version = "5.19.0", optional = true, default-features = false, features = ["async-io", "blocking-api"] }
+reis = { version = "0.7.1", optional = true }
+# Xvfb engine (-engine xvfb): a stock Xorg server carries the X protocol, and an
+# agent (an X client of it) mirrors the desktop into it and forwards input back.
+x11rb = { version = "0.13", optional = true, features = ["xinput", "shm", "xfixes", "res", "render", "xtest", "record", "randr", "composite", "damage"] }
+
+[dev-dependencies]
+# XKB replies are encoded by hand (src/bridge/x11/xkb.rs); the tests parse them
+# back with x11rb's xcb-proto-generated XKB code as an independent check.
+x11rb-protocol = { version = "0.13.2", features = ["xkb", "request-parsing", "extra-traits"] }
+
+[features]
+default = []
+gnome = ["dep:pipewire", "dep:zbus", "dep:reis"]
+xvfb = ["dep:x11rb", "dep:wayland-backend"]
 
 # Keep debug symbols in release builds so sampling profilers (samply, perf)
 # resolve our frames. No runtime cost; just a larger binary.
 [profile.release]
 debug = true
 
+# Binaries for packages (packaging/): no debug info, stripped. Build with
+# cargo build --profile dist --features gnome,xvfb
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+
 [workspace]
 exclude = ["dynres"] # can't do the profile options otherwise
+
+# Debian package (optional): packaging/build-deb.sh renders the service and
+# runs cargo-deb with --profile dist --features gnome,xvfb.
+[package.metadata.deb]
+maintainer = "kulogix <908048+kulogix@users.noreply.github.com>"
+copyright = "2026 Patrick Gaskin and contributors"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+depends = "$auto, systemd"
+recommends = "gnome-shell-extension-appindicator"
+suggests = "tigervnc-standalone-server, xvfb"
+extended-description = """\
+X11 bridge that lets RealVNC Server (user mode) and other X11 desktop tools \
+share a GNOME Wayland desktop: mutter's ScreenCast/RemoteDesktop APIs \
+(PipeWire capture, libei input) behind an X display. Includes the per-user \
+systemd service xwlrvnc.service (enable with: systemctl --user enable --now \
+xwlrvnc) and xwlrvnc-ctl (run, doctor, config). RealVNC Server is not \
+included."""
+assets = [
+    ["target/release/xwlrvnc", "usr/bin/", "755"],
+    ["target/packaging/xwlrvnc-ctl", "usr/bin/", "755"],
+    ["target/packaging/xwlrvnc.service", "usr/lib/systemd/user/", "644"],
+    ["target/packaging/xwlrvnc-status.desktop", "usr/share/applications/", "644"],
+    ["packaging/xwlrvnc.conf", "usr/share/xwlrvnc/", "644"],
+    ["packaging/README.md", "usr/share/doc/xwlrvnc/README.packaging.md", "644"],
+    ["README.md", "usr/share/doc/xwlrvnc/", "644"],
+]

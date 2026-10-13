@@ -57,6 +57,14 @@ pub static EXTENSIONS: Extensions = Extensions(&[
         first_event: 90,
         first_error: 155,
     },
+    // handled ahead of `Request::parse`, see `super::xkb` (all XKB events
+    // share one code, told apart by their second byte)
+    ExtDef {
+        name: super::xkb::NAME,
+        major_opcode: super::xkb::MAJOR_OPCODE,
+        first_event: super::xkb::FIRST_EVENT,
+        first_error: super::xkb::FIRST_ERROR,
+    },
 ]);
 
 impl Extensions {

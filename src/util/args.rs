@@ -196,6 +196,7 @@ macro_rules! define_config {
                 rows.push(("-version".to_string(), "show the version and exit".to_string()));
 
                 let mut out = format!("use: {prog} [options] command [args ...]\n");
+                out.push_str(&format!("     {prog} run [-display N] [--] command [args ...]   (an X tool on a running bridge's display; {prog} run -help)\n"));
                 for (opt, desc) in rows {
                     let pad = 45usize.saturating_sub(opt.len()).max(1);
                     out.push_str(&format!("{opt}{}{desc}\n", " ".repeat(pad)));

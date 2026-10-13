@@ -57,7 +57,16 @@ impl State {
         let keyboard = kb.create_keyboard(seat, qh);
         self.server
             .input
-            .set_devices(conn.clone(), pointer, keyboard);
+            .set_devices(
+                Box::new({
+                    let conn = conn.clone();
+                    move || {
+                        let _ = conn.flush();
+                    }
+                }),
+                pointer,
+                keyboard,
+            );
         if let Some((format, fd, size)) = &self.vkbd_keymap {
             self.server.input.set_keymap(*format, fd.as_fd(), *size);
         }
@@ -108,7 +117,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             // track modifier state from it, so chords like Ctrl+C produce
             // `modifiers` updates on the virtual keyboard
             state.server.input.set_modifier_keymap(&text);
+            state.server.set_keymap_text(&text);
             if let Some(table) = crate::bridge::keymap::build(&text) {
+                let xkb_types = table.xkb.types.len() as u8;
                 *state.server.keymap.lock().unwrap() = Some(table);
                 crate::log!("loaded compositor keymap");
                 // tell X clients to re-read the mapping; vncagent caches
@@ -116,10 +127,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 // a compositor layout switch
                 let count =
                     crate::bridge::keymap::MAX_KEYCODE - crate::bridge::keymap::MIN_KEYCODE + 1;
-                state
-                    .server
-                    .events
-                    .keyboard_mapping_changed(crate::bridge::keymap::MIN_KEYCODE, count);
+                state.server.events.keyboard_mapping_changed(
+                    crate::bridge::keymap::MIN_KEYCODE,
+                    count,
+                    xkb_types,
+                );
             }
         }
     }

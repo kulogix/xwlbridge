@@ -14,7 +14,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::os::fd::BorrowedFd;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use wayland_client::Proxy;
 use wayland_client::backend::ObjectId;
@@ -26,11 +26,16 @@ use crate::bridge::clipjobs::{Job, Jobs};
 use crate::bridge::event::{server_time_ms, time_cmp};
 
 /// An offer from either ext-data-control-v1 or zwlr-data-control-v1; the two
-/// expose the same receive/destroy API.
+/// expose the same receive/destroy API. `Token` stands for an offer from a
+/// compositor that has no offer objects (mutter's remote-desktop clipboard):
+/// the backend reads the value itself, so receive/destroy are no-ops and the
+/// token only tells one announcement from the next.
 #[derive(Clone)]
 pub enum DataOffer {
     Ext(ExtDataControlOfferV1),
     Wlr(ZwlrDataControlOfferV1),
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    Token(u64),
     /// A stand-in for the tests, which have no compositor to mint the real
     /// thing.
     #[cfg(test)]
@@ -42,6 +47,7 @@ impl DataOffer {
         match self {
             Self::Ext(o) => o.receive(mime, fd),
             Self::Wlr(o) => o.receive(mime, fd),
+            Self::Token(_) => {}
             #[cfg(test)]
             Self::Fake => {}
         }
@@ -50,6 +56,7 @@ impl DataOffer {
         match self {
             Self::Ext(o) => o.destroy(),
             Self::Wlr(o) => o.destroy(),
+            Self::Token(_) => {}
             #[cfg(test)]
             Self::Fake => {}
         }
@@ -58,6 +65,7 @@ impl DataOffer {
         match self {
             Self::Ext(o) => o.id(),
             Self::Wlr(o) => o.id(),
+            Self::Token(_) => ObjectId::null(),
             #[cfg(test)]
             Self::Fake => unreachable!("a fake offer has no protocol object"),
         }
@@ -67,6 +75,7 @@ impl DataOffer {
         match (self, other) {
             (Self::Ext(a), Self::Ext(b)) => a.id() == b.id(),
             (Self::Wlr(a), Self::Wlr(b)) => a.id() == b.id(),
+            (Self::Token(a), Self::Token(b)) => a == b,
             #[cfg(test)]
             (Self::Fake, Self::Fake) => true,
             _ => false,
@@ -103,7 +112,9 @@ pub const TEXT_MIMES: &[&str] = &[
 /// stays dead until the session restarts.
 pub struct XOwner {
     window: u32,
-    client: Weak<crate::bridge::event::Client>,
+    /// Its connection to our X server, or `None` for a client of an external
+    /// one (`-engine xvfb`), which tells it about losing the selection itself.
+    client: Option<Weak<crate::bridge::event::Client>>,
     /// When it took the selection: its `SetSelectionOwner` time, which with
     /// the window tells this acquisition from a later one by the same window.
     time: u32,
@@ -118,7 +129,8 @@ impl XOwner {
     /// selection you already hold, on a different window, owes you nothing.
     fn owned_by(&self, client: &Arc<crate::bridge::event::Client>) -> bool {
         self.client
-            .upgrade()
+            .as_ref()
+            .and_then(Weak::upgrade)
             .is_some_and(|c| Arc::ptr_eq(&c, client))
     }
 
@@ -131,7 +143,7 @@ impl XOwner {
 
     /// Sends the owner the `SelectionClear` it is owed, if it is still around.
     fn send_clear(&self, selection: u32, timestamp: u32) {
-        let Some(client) = self.client.upgrade() else {
+        let Some(client) = self.client.as_ref().and_then(Weak::upgrade) else {
             return;
         };
         crate::cliplog!("SelectionClear to window {:#x} at {timestamp}", self.window);
@@ -323,6 +335,7 @@ impl Effects {
                 n.selection_timestamp,
             );
         }
+        server.clipboard.poke();
     }
 }
 
@@ -377,6 +390,12 @@ struct SelState {
     /// when an owner goes away (`dix/selection.c` clears the client and window
     /// and leaves the time alone).
     last_changed: u32,
+    /// When the owner last changed, on the monotonic clock: what a copy made
+    /// on the X side while the compositor couldn't hear of it is ordered by
+    /// against the compositor's own changes (see [`x_value_since`]).
+    ///
+    /// [`x_value_since`]: Clipboard::x_value_since
+    changed: Option<std::time::Instant>,
     /// Announcements the compositor still owes us, oldest first. It announces
     /// the source we published exactly as it would any other app's, so
     /// without this the X owner we just recorded looks superseded. It outlives
@@ -400,6 +419,7 @@ impl SelState {
     fn enter(&mut self, sel: Sel, why: &str, owner: Owner) -> Owner {
         crate::cliplog!("{sel:?}: {} -> {why} -> {owner}", self.owner);
         self.generation = self.generation.wrapping_add(1);
+        self.changed = Some(std::time::Instant::now());
         std::mem::replace(&mut self.owner, owner)
     }
 
@@ -432,6 +452,9 @@ impl SelState {
 #[derive(Default)]
 pub struct Clipboard {
     inner: Mutex<Inner>,
+    /// Told after every applied transition: how an agent driving an external
+    /// X server (`-engine xvfb`) hears that it has something to do.
+    watcher: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Everything the compositor has to be told, on its way to the Wayland
     /// thread. Held here rather than beside it in [`Server`](crate::bridge::Server)
     /// so that the transitions below can post without a second handle.
@@ -519,6 +542,102 @@ impl Clipboard {
     /// else posts to it).
     pub fn jobs(&self) -> &Jobs {
         &self.jobs
+    }
+
+    /// Calls `f` after every applied transition, from whichever thread
+    /// applied it.
+    #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
+    pub fn set_watcher(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.watcher.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+    }
+
+    /// Removes the watcher (its agent is gone). Once this returns, no call of
+    /// it is in progress, and none follows.
+    #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
+    pub fn clear_watcher(&self) {
+        let f = self.watcher.lock().unwrap_or_else(PoisonError::into_inner).take();
+        drop(f);
+    }
+
+    fn poke(&self) {
+        if let Some(f) = self.watcher.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            f();
+        }
+    }
+
+    /// An ownership generation, for a watcher to tell whether `sel` changed
+    /// since it last looked.
+    #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
+    pub fn generation(&self, sel: Sel) -> u64 {
+        self.inner.lock().unwrap().sel(sel).generation
+    }
+
+    /// A client of an external X server took `sel` on `window`: that server
+    /// already decided it (and told the previous owner), so there is no
+    /// staleness to judge. Returns the time to fetch its value under, which
+    /// [`x_fetched`](Self::x_fetched) checks against.
+    #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
+    pub fn x_took_external(&self, sel: Sel, window: u32) -> (Effects, u32) {
+        let mut g = self.inner.lock().unwrap();
+        let time = g.next_timestamp();
+        let owner = Owner::X(XOwner {
+            window,
+            client: None,
+            time,
+            data: None,
+        });
+        let prev = g.sel_mut(sel).enter(sel, "an x client took it", owner);
+        g.changed_at(sel, time);
+        let fx = Effects {
+            at: time,
+            destroy: prev.into_offer().into_iter().collect(),
+            ..Effects::default()
+        };
+        (fx, time)
+    }
+
+    /// The external X server's owner of `sel` went away (or gave it up):
+    /// nobody owns it now, and what we published for it is withdrawn.
+    #[cfg_attr(not(feature = "xvfb"), allow(dead_code))]
+    pub fn x_external_gone(&self, sel: Sel) -> Option<Effects> {
+        {
+            let mut g = self.inner.lock().unwrap();
+            let state = g.sel_mut(sel);
+            if !matches!(&state.owner, Owner::X(o) if o.client.is_none()) {
+                return None;
+            }
+            state.enter(sel, "its owner went away", Owner::None);
+        }
+        self.withdraw(sel);
+        Some(Effects::default())
+    }
+
+    /// The value an X client owns `sel` with, and when it took it, if
+    /// ownership changed since generation `since` (`None`: at all), for a
+    /// compositor connection that starts now and should be handed it unless
+    /// the compositor's own selection is newer (GNOME's clipboard exists only
+    /// with a session, so it can miss an X client's copy entirely).
+    #[allow(dead_code)] // only the gnome backend's clipboard comes and goes
+    pub fn x_value_since(
+        &self,
+        sel: Sel,
+        since: Option<u64>,
+    ) -> Option<(Arc<[u8]>, std::time::Instant)> {
+        let g = self.inner.lock().unwrap();
+        let state = g.sel(sel);
+        if since == Some(state.generation) {
+            return None;
+        }
+        Some((state.owner.x()?.data.clone()?, state.changed?))
+    }
+
+    /// Records that the compositor's selection is now a source of ours with
+    /// the X owner's value, installed along with the connection rather than
+    /// published (so the compositor owes no announcement of it), and so ours
+    /// to withdraw when that owner goes.
+    #[allow(dead_code)]
+    pub fn mark_published(&self, sel: Sel) {
+        self.inner.lock().unwrap().sel_mut(sel).published = true;
     }
 
     /// Records whether the data-control device the Wayland thread bound
@@ -690,7 +809,7 @@ impl Clipboard {
         }
         let owner = Owner::X(XOwner {
             window,
-            client: Arc::downgrade(client),
+            client: Some(Arc::downgrade(client)),
             time,
             data: None,
         });
@@ -965,6 +1084,22 @@ mod tests {
     /// look at.
     fn taken(take: Take) {
         drop(took(take));
+    }
+
+    #[test]
+    fn a_cleared_watcher_is_dropped_and_never_called() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let c = Clipboard::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = calls.clone();
+        c.set_watcher(Box::new(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+        }));
+        c.poke();
+        c.clear_watcher();
+        c.poke();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&calls), 1, "the watcher was dropped");
     }
 
     /// The effects of a transition that must have taken.
@@ -1431,5 +1566,33 @@ mod tests {
         assert!(fx.cleared.is_none(), "no X client lost anything");
         assert_eq!(fx.destroy.len(), 1, "the offer it replaced is spent");
         assert_eq!(c.owner_window(Sel::Clipboard), Some(0x10));
+    }
+
+    #[test]
+    fn an_x_copy_made_while_the_compositor_was_away_is_handed_to_it() {
+        // GNOME's clipboard exists only with a session: none yet
+        let c = Clipboard::default();
+        assert!(c.x_value_since(Sel::Clipboard, None).is_none(), "nobody owns it");
+        let (fx, time) = c.x_took_external(Sel::Clipboard, 0x10);
+        drop(fx);
+        drop(c.x_fetched(Sel::Clipboard, 0x10, time, b"early".to_vec()));
+        let value = |since| c.x_value_since(Sel::Clipboard, since).map(|(d, at)| (d.to_vec(), at));
+        // the first session gets it, with when it was taken ...
+        let before = std::time::Instant::now();
+        let (data, early_at) = value(None).unwrap();
+        assert_eq!(data, b"early");
+        assert!(early_at <= before);
+        // ... and a later one only if it changed since the previous one ended
+        let ended = c.generation(Sel::Clipboard);
+        assert!(value(Some(ended)).is_none());
+        let (fx, time) = c.x_took_external(Sel::Clipboard, 0x11);
+        drop(fx);
+        drop(c.x_fetched(Sel::Clipboard, 0x11, time, b"between".to_vec()));
+        let (data, between_at) = value(Some(ended)).unwrap();
+        assert_eq!(data, b"between");
+        assert!(between_at >= before, "taken after the first: ordered by when it was taken");
+        // a Wayland app's selection is not ours to hand over
+        announced(&c, Sel::Clipboard, &text_mimes());
+        assert!(c.x_value_since(Sel::Clipboard, Some(ended)).is_none());
     }
 }

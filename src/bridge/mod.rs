@@ -5,6 +5,8 @@
 //! crate root is just the runtime harness (CLI, logging, process management,
 //! X-display socket binding, and starting the Wayland connection).
 
+pub mod backend;
+pub mod bell;
 pub mod capture;
 pub mod clipboard;
 pub mod clipjobs;
@@ -12,12 +14,19 @@ pub mod cursor;
 pub mod damage;
 pub mod dynres;
 pub mod event;
+pub mod fresh;
+#[cfg(feature = "gnome")]
+pub mod gnome;
+pub mod injectors;
 pub mod input;
 pub mod keymap;
+#[cfg(feature = "gnome")]
+pub mod placeholder;
 pub mod profile;
 mod server;
 pub mod wayland;
 pub mod x11;
+pub mod xkbdesc;
 
 /// The shared state both protocol sides exchange (see [`server`]).
 pub(crate) use server::Server;

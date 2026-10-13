@@ -31,9 +31,39 @@ pub(crate) struct Server {
     /// X keysym and modifier tables built from the compositor keymap (`None`
     /// until received).
     pub keymap: Mutex<Option<KeyTable>>,
+    /// The compositor keymap itself (xkb text), and a counter bumped on each
+    /// change, for consumers that need the source (the Xvfb engine uploads it).
+    pub keymap_text: Mutex<Option<Arc<str>>>,
+    pub keymap_gen: std::sync::atomic::AtomicU64,
+    /// Which of the keymap's layouts (xkb groups, from 0) the compositor has
+    /// active; the X keyboard is that one alone. Changes bump `keymap_gen`.
+    pub keymap_group: std::sync::atomic::AtomicU32,
+    /// The desktop's Xwayland, when the stock engine's clipboard is relayed
+    /// with it (`-clipboard xwayland`) instead of going through the backend's
+    /// session clipboard. Decided before anything starts, so a session never
+    /// enables the other.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))] // only the gnome backend reads it
+    pub xwayland_clip: Option<crate::uidisplay::UiDisplay>,
 }
 
 impl Server {
+    /// Records a new compositor keymap text (backends call this alongside
+    /// building [`keymap`](Self::keymap)).
+    pub fn set_keymap_text(&self, text: &str) {
+        *self.keymap_text.lock().unwrap() = Some(Arc::from(text));
+        self.keymap_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Records which layout of the keymap is active (see `keymap_group`).
+    #[allow(dead_code)] // only the gnome backend tells layouts apart
+    pub fn set_keymap_group(&self, group: u32) {
+        use std::sync::atomic::Ordering;
+        if self.keymap_group.swap(group, Ordering::AcqRel) != group {
+            self.keymap_gen.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// The atom naming a bridged selection. Every connection sees the same
     /// number for it, so it is also the one to put in an event.
     pub fn selection_atom(&self, sel: Sel) -> u32 {

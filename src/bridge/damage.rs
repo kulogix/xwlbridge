@@ -39,6 +39,17 @@ struct DamageObj {
 #[derive(Default)]
 pub struct DamageSink {
     objects: Mutex<Vec<DamageObj>>,
+    /// Watchers outside our own X server (the Xvfb engine's agent, on behalf
+    /// of the clients of its Xvfb): they count for [`active`](Self::active).
+    external: std::sync::atomic::AtomicBool,
+    /// A consumer outside our own X server (the Xvfb engine's agent) is
+    /// registered: it gets every damage rect through
+    /// [`take_external`](Self::take_external), whatever made capture run (a
+    /// watcher, a client that connected or left a moment ago, `-alwayson`),
+    /// so its root never lags the desktop while a session runs.
+    external_sink: std::sync::atomic::AtomicBool,
+    external_rects: Mutex<Vec<Rectangle>>,
+    external_wake: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl DamageSink {
@@ -59,7 +70,7 @@ impl DamageSink {
 
     /// Whether any client is watching the screen. Gates the capture loop.
     pub fn active(&self) -> bool {
-        self.objects
+        self.external.load(std::sync::atomic::Ordering::Relaxed) || self.objects
             .lock()
             .unwrap()
             .iter()
@@ -99,6 +110,35 @@ impl DamageSink {
         std::mem::take(&mut o.region)
     }
 
+    /// Marks an external watcher present or gone; see the `external` field.
+    #[allow(dead_code)] // only the xvfb engine watches from outside
+    pub fn set_external(&self, watching: bool, wake: Option<Box<dyn Fn() + Send>>) {
+        self.external.store(watching, std::sync::atomic::Ordering::Relaxed);
+        if wake.is_some() {
+            *self.external_wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = wake;
+            self.external_sink.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The external watcher is gone for good (the agent stopped): it no longer
+    /// counts as watching, its wake is dropped (no later damage calls it) and
+    /// its pending damage is discarded. Once this returns, no call of the old
+    /// wake is in progress.
+    #[allow(dead_code)]
+    pub fn clear_external(&self) {
+        self.external.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.external_sink.store(false, std::sync::atomic::Ordering::Relaxed);
+        let wake = self.external_wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        self.external_rects.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        drop(wake);
+    }
+
+    /// The damage accumulated for the external watcher since the last call.
+    #[allow(dead_code)]
+    pub fn take_external(&self) -> Vec<Rectangle> {
+        std::mem::take(&mut *self.external_rects.lock().unwrap())
+    }
+
     /// Feeds a new screen-damage region, in root coordinates, to every object.
     pub fn add_damage(&self, new: &[Rectangle], geom: (u16, u16)) {
         let new: Vec<Rectangle> = new
@@ -108,6 +148,24 @@ impl DamageSink {
             .collect();
         if new.is_empty() {
             return;
+        }
+        if self.external_sink.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut ext = self.external_rects.lock().unwrap();
+            ext.extend_from_slice(&new);
+            if ext.len() > 256 {
+                // too fragmented to be worth tracking: the whole screen
+                ext.clear();
+                ext.push(Rectangle { x: 0, y: 0, width: geom.0, height: geom.1 });
+            }
+            drop(ext);
+            if let Some(wake) = self
+                .external_wake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                wake();
+            }
         }
         let mut objs = self.objects.lock().unwrap();
         objs.retain(|o| !o.client.is_dead());
@@ -192,4 +250,37 @@ fn send_notify(o: &DamageObj, level: u8, area: Rectangle, geometry: Rectangle) {
 /// `Rectangle` is not `PartialEq`, so compare bounding boxes as tuples.
 fn tuple(r: Rectangle) -> (i16, i16, u16, u16) {
     (r.x, r.y, r.width, r.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_cleared_external_watcher_is_neither_active_nor_woken() {
+        let sink = DamageSink::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        sink.set_external(false, Some(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        })));
+        let r = [Rectangle { x: 0, y: 0, width: 4, height: 4 }];
+        assert!(!sink.active());
+        sink.add_damage(&r, (64, 64));
+        // not watching, but capture runs (something else started it): the
+        // agent still gets the damage, so its root stays current
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a registered agent gets damage while not watching");
+        assert_eq!(sink.take_external().len(), 1);
+        sink.set_external(true, None);
+        assert!(sink.active());
+        sink.add_damage(&r, (64, 64));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        sink.clear_external();
+        assert!(!sink.active(), "a stopped agent no longer counts as watching");
+        assert!(sink.take_external().is_empty());
+        sink.add_damage(&r, (64, 64));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "its wake is never called again");
+        assert_eq!(Arc::strong_count(&calls), 1, "and was dropped");
+    }
 }

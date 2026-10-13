@@ -19,15 +19,17 @@ use super::selection::{Fetch, IncrStep, Selection};
 use super::targets;
 use super::window::Windows;
 use super::xfixes::Regions;
+use super::xkb;
 use super::{ROOT_COLORMAP, ROOT_DEPTH, ROOT_VISUAL, ROOT_WINDOW};
 use crate::bridge::Server;
 use crate::bridge::clipboard::{MAX_SELECTION_BYTES, Sel, Take, Value};
 use crate::bridge::clipjobs::{Job, PendingConversion};
 use crate::bridge::event::Client;
-use crate::bridge::x11::atom::{XA_INTEGER, XA_PRIMARY};
+use crate::bridge::x11::atom::{XA_INTEGER, XA_PRIMARY, XA_STRING};
 use crate::bridge::x11::ext::EXTENSIONS;
 use crate::bridge::x11::randr as randr_screen;
 use crate::bridge::x11::{CLIENT_RESOURCE_ID_BASE, SELECTION_FETCH_WINDOW};
+use crate::bridge::xkbdesc::Desc;
 
 /// How many property names the fetch ring cycles through, per selection. A
 /// property that comes round again while the fetch that had it is still out
@@ -62,8 +64,11 @@ pub struct Connection {
     reader: BufReader<UnixStream>,
     client: Arc<Client>,
     server: Arc<Server>,
-    /// Per-connection id (for tracing) and unique resource-id base.
+    /// Per-connection id, never reused: for tracing and input accounting.
     id: u32,
+    /// This connection's resource-id range, once the handshake handed it out;
+    /// free for another connection once this one drops.
+    ids: Option<super::IdRange<'static>>,
     /// Current request sequence number.
     seq: u16,
     /// Stored window properties for fake windows (i.e., clipboard/WM).
@@ -87,6 +92,56 @@ pub struct Connection {
     regions: Regions,
     /// Per-window selected event masks (for PropertyNotify routing + diagnostics).
     windows: Windows,
+    /// XKB `PerClientFlags` the client set (kept and reported, nothing more).
+    xkb_flags: u32,
+    /// XKB minor opcodes this client has already had a warning logged for
+    /// (refused, unknown or malformed requests, keymap loads): one line per
+    /// client and request, so a client can't grow the log at request rate.
+    xkb_warned: [u64; 4],
+    /// Spare keycodes this client put keysyms on and is holding down, and
+    /// the compositor keys pressed for them (shared with the stock engines'
+    /// agent: [`keymap::Synth`](crate::bridge::keymap::Synth)).
+    synth: crate::bridge::keymap::Synth,
+    /// Whether a refused `ChangeKeyboardMapping` was logged for this client.
+    mapping_refusal_logged: bool,
+    /// The client is an engine helper (`-xtesthelpers`): its XTest drives
+    /// windows on this display, never the desktop, so it is dropped. Its
+    /// program, for the log, until logged.
+    engine_helper: Option<String>,
+    helper_logged: bool,
+    /// It read the screen: when it goes, capture lingers for the next
+    /// one-shot screenshot (`-linger`).
+    active: bool,
+    /// When the client connected: one gone within a second is a one-shot
+    /// injector, whose held keys linger (see `Input::client_gone`).
+    since: std::time::Instant,
+}
+
+/// The pid of the process at the other end of a unix socket.
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED fills in a ucred, and we pass its size
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+/// The program of an engine helper at the other end of `stream`, if it is one.
+fn engine_helper(stream: &UnixStream, server: &Server) -> Option<String> {
+    let rules = server.config.xtest_rules();
+    if !rules.has_helpers() {
+        return None;
+    }
+    let names = crate::bridge::injectors::process_names(peer_pid(stream)?);
+    (rules.classify(&names) == crate::bridge::injectors::Class::Helper).then(|| names.join("/"))
 }
 
 impl Connection {
@@ -95,11 +150,13 @@ impl Connection {
         static NEXT_ID: AtomicU32 = AtomicU32::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let client = Client::new(stream.try_clone()?)?;
+        let engine_helper = engine_helper(&stream, &server);
         Ok(Self {
             reader: BufReader::new(stream),
             client,
             server,
             id,
+            ids: None,
             seq: 0,
             properties: Arc::default(),
             selection: Selection::default(),
@@ -107,6 +164,14 @@ impl Connection {
             shm: Shm::default(),
             regions: Regions::default(),
             windows: Windows::default(),
+            xkb_flags: 0,
+            xkb_warned: [0; 4],
+            synth: Default::default(),
+            active: false,
+            mapping_refusal_logged: false,
+            engine_helper,
+            helper_logged: false,
+            since: std::time::Instant::now(),
         })
     }
 
@@ -154,10 +219,18 @@ impl Connection {
         // Consume and ignore auth data.
         let mut auth = vec![0u8; pad4(name_len) + pad4(data_len)];
         self.reader.read_exact(&mut auth)?;
-        // Unique, non-overlapping resource-id base per connection (mask is
-        // 0x1fffff = 21 bits, so space each base 0x200000 apart above 0x400000).
-        let base = CLIENT_RESOURCE_ID_BASE + self.id * 0x0020_0000;
-        let bytes = setup(self.server.geometry(), base);
+        // A resource-id range no other live connection holds; with every one
+        // taken, refuse the client as Xorg does rather than hand out a shared
+        // range or ids outside X's 29 bits.
+        let Some(ids) = super::ID_RANGES.take() else {
+            let max = super::MAX_CLIENTS;
+            crate::warning!("refusing an X client: all {max} client slots are in use");
+            self.client
+                .write_setup(&setup_failed(b"Maximum number of clients reached"))?;
+            return Err(io::Error::other("too many X clients"));
+        };
+        let bytes = setup(self.server.geometry(), ids.base());
+        self.ids = Some(ids);
         self.client.write_setup(&bytes)
     }
 
@@ -168,6 +241,13 @@ impl Connection {
             minor_opcode: raw.minor_opcode,
             remaining_length: raw.remaining_length,
         };
+        if major == xkb::MAJOR_OPCODE {
+            if self.server.config.xkb() {
+                return self.dispatch_xkb(major, minor, &raw.body);
+            }
+            // `-noxkb`: as a server without the extension answers its opcode
+            return self.send_error(xproto::REQUEST_ERROR, major, u16::from(minor));
+        }
         let mut fds: Vec<RawFdContainer> = Vec::new();
         let req = match Request::parse(header, &raw.body, &mut fds, &EXTENSIONS) {
             Ok(req) => req,
@@ -229,9 +309,15 @@ impl Connection {
             // --- extensions ---
             Request::QueryExtension(r) => {
                 // Hide DAMAGE when disabled so clients fall back to polling.
-                let e = EXTENSIONS
-                    .lookup(&r.name)
-                    .filter(|e| self.server.config.damage() || e.name != "DAMAGE");
+                let e = EXTENSIONS.lookup(&r.name).filter(|e| self.advertised(e));
+                if self.server.config.xtrace {
+                    warning!(
+                        "xtrace: [c{}] QueryExtension {:?} -> {}",
+                        self.id,
+                        String::from_utf8_lossy(&r.name),
+                        if e.is_some() { "present" } else { "absent" }
+                    );
+                }
                 self.reply(&xproto::QueryExtensionReply {
                     sequence: 0,
                     length: 0,
@@ -245,7 +331,7 @@ impl Connection {
                 let names = EXTENSIONS
                     .0
                     .iter()
-                    .filter(|e| self.server.config.damage() || e.name != "DAMAGE")
+                    .filter(|e| self.advertised(e))
                     .map(|e| xproto::Str {
                         name: e.name.as_bytes().to_vec(),
                     })
@@ -485,10 +571,23 @@ impl Connection {
             // --- keyboard / pointer mapping ---
             Request::GetKeyboardMapping(r) => {
                 let (per, keysyms) = match self.server.keymap.lock().unwrap().as_ref() {
-                    Some(table) => (
-                        crate::bridge::keymap::SYMS_PER,
-                        crate::bridge::keymap::mapping_slice(&table.syms, r.first_keycode, r.count),
-                    ),
+                    // laid out as Xorg's with XKB, as before it without
+                    Some(table) => {
+                        let (per, syms) = if self.server.config.xkb() {
+                            (table.per, &table.syms)
+                        } else {
+                            (crate::bridge::keymap::LEGACY_PER, &table.legacy)
+                        };
+                        (
+                            per,
+                            crate::bridge::keymap::mapping_slice(
+                                syms,
+                                per,
+                                r.first_keycode,
+                                r.count,
+                            ),
+                        )
+                    }
                     // No compositor keymap yet: report one NoSymbol per keycode.
                     None => (1u8, vec![0u32; r.count as usize]),
                 };
@@ -498,6 +597,7 @@ impl Connection {
                     keysyms,
                 })?;
             }
+            Request::ChangeKeyboardMapping(r) => self.change_keyboard_mapping(&r)?,
             Request::GetModifierMapping(_) => {
                 let keycodes = self
                     .server
@@ -522,13 +622,14 @@ impl Connection {
                 })?;
             }
             Request::GetScreenSaver(_) => {
+                let s = super::saver::get();
                 self.reply(&xproto::GetScreenSaverReply {
                     sequence: 0,
                     length: 0,
-                    timeout: 0,
-                    interval: 0,
-                    prefer_blanking: xproto::Blanking::NOT_PREFERRED,
-                    allow_exposures: xproto::Exposures::NOT_ALLOWED,
+                    timeout: s.timeout as u16,
+                    interval: s.interval as u16,
+                    prefer_blanking: s.prefer_blanking,
+                    allow_exposures: s.allow_exposures,
                 })?;
             }
             Request::GetFontPath(_) => {
@@ -601,6 +702,17 @@ impl Connection {
             }
             // --- screen capture ---
             Request::GetImage(r) => {
+                // A rectangle larger than the whole screen can only be a bad
+                // request (X answers BadMatch for one outside the drawable);
+                // refusing it keeps one client from making us allocate up to
+                // 16 GiB for its reply. Slightly-off rectangles (a read racing
+                // a resize) are still served, zero-filled as before.
+                let geom = self.server.geometry();
+                let screen = u64::from(geom.width).max(1) * u64::from(geom.height).max(1);
+                if u64::from(r.width) * u64::from(r.height) > screen {
+                    return self.send_error(xproto::MATCH_ERROR, major, u16::from(minor));
+                }
+                self.await_fresh();
                 let data = self.server.framebuffer.read_rect(
                     r.x.into(),
                     r.y.into(),
@@ -620,6 +732,7 @@ impl Connection {
                 // Read straight into the client's shared segment (vncagent
                 // reads the whole screen this way ~20/sec).
                 let image_size = r.width as usize * r.height as usize * 4;
+                self.await_fresh();
                 if let Some(seg) = self.shm.segment(r.shmseg) {
                     let off = (r.offset as usize).min(seg.size);
                     let n = image_size.min(seg.size - off);
@@ -641,6 +754,33 @@ impl Connection {
                     visual: ROOT_VISUAL,
                     size: image_size as u32,
                 })?;
+            }
+            Request::ShmCreateSegment(r) => {
+                // MIT-SHM 1.2, which ShmQueryVersion advertises: the server
+                // makes the segment and hands the client an fd for it
+                // (imlib2, so scrot, asks this first; without it, it fell
+                // back to GetImage)
+                if r.size == 0 || r.size > super::mit_shm::MAX_CREATED_SEGMENT {
+                    let code = if r.size == 0 {
+                        xproto::VALUE_ERROR
+                    } else {
+                        xproto::ALLOC_ERROR
+                    };
+                    return self.send_error_value(code, r.size, major, u16::from(minor));
+                }
+                match self.shm.create(r.shmseg, r.size as usize) {
+                    Ok(fd) => {
+                        // reply, nfd = 1, no data beyond the 32 bytes
+                        let mut buf = [0u8; 32];
+                        buf[0] = 1;
+                        buf[1] = 1;
+                        self.client.send_reply_fd(self.seq, &mut buf, fd)?;
+                    }
+                    Err(e) => {
+                        crate::warning!("can't create a {}-byte shared segment: {e}", r.size);
+                        return self.send_error(xproto::ALLOC_ERROR, major, u16::from(minor));
+                    }
+                }
             }
             Request::ShmCreatePixmap(_) | Request::ShmAttachFd(_) => {}
             Request::QueryBestSize(r) => {
@@ -734,6 +874,36 @@ impl Connection {
                     length: 0,
                 })?;
             }
+            // ... and so does letting go of them
+            Request::UngrabPointer(_)
+            | Request::UngrabKeyboard(_)
+            | Request::ChangeActivePointerGrab(_)
+            | Request::AllowEvents(_) => {}
+            // Passive grabs (hotkey daemons: xbindkeys, sxhkd; push-to-talk)
+            // are accepted and never fire: the desktop's keys and buttons
+            // don't come through this server. Answering BadImplementation
+            // killed them at start-up instead.
+            Request::GrabKey(_)
+            | Request::UngrabKey(_)
+            | Request::GrabButton(_)
+            | Request::UngrabButton(_) => {}
+
+            // --- bell and screen saver (the desktop's to do) ---
+            Request::Bell(_) => crate::bridge::bell::ring(),
+            Request::SetScreenSaver(r) => {
+                if let Err(value) = super::saver::set(
+                    r.timeout,
+                    r.interval,
+                    r.prefer_blanking,
+                    r.allow_exposures,
+                ) {
+                    return self.send_error_value(xproto::VALUE_ERROR, value, major, 0);
+                }
+            }
+            Request::ForceScreenSaver(_) => {
+                // no-op: the desktop's own idle handling decides, and there
+                // is no saver here to start or reset (see `saver`)
+            }
 
             // --- XTest: the whole point ---
             Request::XtestGetVersion(_) => {
@@ -751,11 +921,7 @@ impl Connection {
                     length: 0,
                 })?;
             }
-            Request::XtestFakeInput(r) => {
-                self.server
-                    .input
-                    .fake_input(r.type_, r.detail, r.root_x, r.root_y);
-            }
+            Request::XtestFakeInput(r) => self.fake_input(&r),
             Request::XtestGrabControl(_) => {}
 
             // --- extension version negotiation ---
@@ -918,15 +1084,7 @@ impl Connection {
                 })?;
             }
             Request::RandrGetOutputPrimary(_) => {
-                let output = self
-                    .server
-                    .screen
-                    .lock()
-                    .unwrap()
-                    .output_ids()
-                    .first()
-                    .copied()
-                    .unwrap_or(0);
+                let output = self.server.screen.lock().unwrap().primary_output();
                 self.reply(&randr::GetOutputPrimaryReply {
                     sequence: 0,
                     length: 0,
@@ -937,18 +1095,38 @@ impl Connection {
                 self.reply(&randr::GetCrtcGammaSizeReply {
                     sequence: 0,
                     length: 0,
-                    size: 256,
+                    size: randr_screen::GAMMA_SIZE,
                 })?;
             }
-            Request::RandrGetCrtcGamma(_) => {
-                let ramp: Vec<u16> = (0..256).map(|i| (i * 65535 / 255) as u16).collect();
+            Request::RandrGetCrtcGamma(r) => {
+                let [red, green, blue] = self.server.screen.lock().unwrap().gamma(r.crtc);
                 self.reply(&randr::GetCrtcGammaReply {
                     sequence: 0,
                     length: 0,
-                    red: ramp.clone(),
-                    green: ramp.clone(),
-                    blue: ramp,
+                    red,
+                    green,
+                    blue,
                 })?;
+            }
+            Request::RandrSetCrtcGamma(r) => {
+                // kept to be read back, never applied: the desktop owns the
+                // colours (night light), see `Screen::set_gamma`
+                let result = self
+                    .server
+                    .screen
+                    .lock()
+                    .unwrap()
+                    .set_gamma(r.crtc, &r.red, &r.green, &r.blue);
+                match result {
+                    Ok(()) => {}
+                    Err(randr_screen::GammaError::Size) => {
+                        return self.send_error(xproto::MATCH_ERROR, major, u16::from(minor));
+                    }
+                    Err(randr_screen::GammaError::UnknownCrtc) => {
+                        let code = randr_error(randr::BAD_CRTC_ERROR);
+                        return self.send_error_value(code, r.crtc, major, u16::from(minor));
+                    }
+                }
             }
             Request::RandrGetCrtcTransform(_) => {
                 self.reply(&randr::GetCrtcTransformReply {
@@ -1000,13 +1178,35 @@ impl Connection {
                 })?;
             }
             Request::RandrGetMonitors(_) => {
-                let timestamp = self.server.screen.lock().unwrap().timestamp;
+                // Xorg's automatic monitors: one per active output, named
+                // after it, the primary output's marked primary
+                let (timestamp, mons) = {
+                    let s = self.server.screen.lock().unwrap();
+                    (s.timestamp, s.monitors())
+                };
+                let monitors: Vec<randr::MonitorInfo> = {
+                    let mut atoms = self.server.atoms.lock().unwrap();
+                    mons.iter()
+                        .map(|m| randr::MonitorInfo {
+                            name: atoms.intern(&m.name, false),
+                            primary: m.primary,
+                            automatic: true,
+                            x: m.x,
+                            y: m.y,
+                            width: m.width,
+                            height: m.height,
+                            width_in_millimeters: m.mm_width,
+                            height_in_millimeters: m.mm_height,
+                            outputs: vec![m.output_id],
+                        })
+                        .collect()
+                };
                 self.reply(&randr::GetMonitorsReply {
                     sequence: 0,
                     length: 0,
                     timestamp,
-                    n_outputs: 0,
-                    monitors: vec![],
+                    n_outputs: monitors.len() as u32,
+                    monitors,
                 })?;
             }
             Request::RandrCreateMode(r) => {
@@ -1279,6 +1479,7 @@ impl Connection {
             Request::MapWindow(_) | Request::ConfigureWindow(_) | Request::UnmapWindow(_) => {
                 // no-op: we don't support windows
             }
+            Request::WarpPointer(r) => self.warp_pointer(&r),
             Request::GrabServer(_) | Request::UngrabServer(_) => {
                 // no-op: there are no other clients to freeze out of a
                 // reconfiguration (xrandr and vncagent bracket their RandR
@@ -1287,6 +1488,24 @@ impl Connection {
             Request::CreateGC(_) | Request::ChangeGC(_) | Request::FreeGC(_) => {
                 // no-op: we don't support drawing
             }
+            // Offscreen pixmaps and drawing into them: accepted and dropped like
+            // the GC requests above. RealVNC 6.11's vncserverui is a GTK 2 app,
+            // and GTK aborts on any X error, so an error here takes down the
+            // process that also routes RealVNC's clipboard.
+            Request::CreatePixmap(_)
+            | Request::FreePixmap(_)
+            | Request::PutImage(_)
+            | Request::CopyArea(_)
+            | Request::CopyPlane(_)
+            | Request::PolyPoint(_)
+            | Request::PolyLine(_)
+            | Request::PolySegment(_)
+            | Request::PolyRectangle(_)
+            | Request::PolyArc(_)
+            | Request::FillPoly(_)
+            | Request::PolyFillRectangle(_)
+            | Request::PolyFillArc(_)
+            | Request::ClearArea(_) => {}
             Request::OpenFont(_) => {
                 // no-op: we don't support fonts
             }
@@ -1324,9 +1543,14 @@ impl Connection {
             value_len: 0,
             value: vec![],
         };
+        // worked out before taking the properties lock, which it would nest
+        // the atom and keymap locks inside
+        let rules = self.xkb_rules_property(r.window, r.property);
         let mut properties = self.properties.lock().unwrap();
-        let Some(p) = properties.get(r.window, r.property) else {
-            return (empty, false);
+        let (p, synthesized) = match (properties.get(r.window, r.property), &rules) {
+            (Some(p), _) => (p, false),
+            (None, Some(rules)) => (rules, true),
+            (None, None) => return (empty, false),
         };
         // a type mismatch (with a specific type asked for) reports what the
         // property is, with no value and nothing deleted
@@ -1355,11 +1579,307 @@ impl Connection {
             value_len: (value.len() / unit) as u32,
             value,
         };
-        let deleted = r.delete && bytes_after == 0;
+        let deleted = r.delete && bytes_after == 0 && !synthesized;
         if deleted {
             properties.remove(r.window, r.property);
         }
         (reply, deleted)
+    }
+
+    /// `WarpPointer`. The pointer is the desktop's, so warping it moves it, as
+    /// an XTest motion would (`xdotool mousemove`), through the same input
+    /// path (`-viewonly` and the pointer-ownership policy apply): to
+    /// `dst_x,dst_y` in `dst_window`, or by that offset with no `dst_window`.
+    /// Every window of this server sits at the root's origin with the root's
+    /// size (`GetGeometry`, `TranslateCoordinates`), so window coordinates
+    /// are root coordinates. With a `src_window`, the move happens only if
+    /// the pointer is inside the given rectangle of it (a width or height of
+    /// 0 reaching to the window's edge), as X specifies.
+    fn warp_pointer(&self, r: &xproto::WarpPointerRequest) {
+        if r.src_window != 0 {
+            let p = self.server.cursor.snapshot();
+            if !warp_source_holds(r, (p.x, p.y), self.server.geometry()) {
+                return;
+            }
+        }
+        let relative = u8::from(r.dst_window == 0);
+        self.server.input.fake_input(
+            self.id,
+            xproto::MOTION_NOTIFY_EVENT,
+            relative,
+            r.dst_x,
+            r.dst_y,
+        );
+    }
+
+    /// `ChangeKeyboardMapping`: keysyms on spare keycodes (ones the
+    /// compositor keyboard leaves empty), as xdotool, x11vnc and pynput put
+    /// a keysym they can't find there to type it; pressing one types the
+    /// keysym where the compositor keyboard has it ([`Self::fake_input`]).
+    /// Changing a keycode the compositor uses is refused (BadImplementation):
+    /// its keyboard can't be changed from X.
+    fn change_keyboard_mapping(
+        &mut self,
+        r: &xproto::ChangeKeyboardMappingRequest,
+    ) -> io::Result<()> {
+        let major = xproto::CHANGE_KEYBOARD_MAPPING_REQUEST;
+        let last = usize::from(r.first_keycode) + usize::from(r.keycode_count);
+        if r.first_keycode < crate::bridge::keymap::MIN_KEYCODE
+            || last > usize::from(crate::bridge::keymap::MAX_KEYCODE) + 1
+            || r.keysyms_per_keycode == 0
+        {
+            return self.send_error_value(
+                xproto::VALUE_ERROR,
+                u32::from(r.first_keycode),
+                major,
+                0,
+            );
+        }
+        let legacy = !self.server.config.xkb();
+        let result = match self.server.keymap.lock().unwrap().as_mut() {
+            Some(table) => table
+                .change_mapping(r.first_keycode, r.keysyms_per_keycode, &r.keysyms, legacy)
+                .map(|changed| changed.then(|| table.xkb.types.len() as u8)),
+            // no keyboard yet: every keycode is spare, but nothing types
+            None => Ok(None),
+        };
+        match result {
+            Ok(Some(xkb_types)) => {
+                self.server.events.keyboard_mapping_changed(
+                    r.first_keycode,
+                    r.keycode_count,
+                    xkb_types,
+                );
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(crate::bridge::keymap::MappingRefused::InUse(kc)) => {
+                if !std::mem::replace(&mut self.mapping_refusal_logged, true) {
+                    crate::warning!(
+                        "[c{}] client asked to change keycode {kc}, which the compositor keyboard \
+                         uses; it can't be changed from X, sent BadImplementation (not logged again \
+                         for this client)",
+                        self.id
+                    );
+                }
+                self.send_error(xproto::IMPLEMENTATION_ERROR, major, 0)
+            }
+        }
+    }
+
+    /// A screen read while capture is stopped starts it and waits for its
+    /// first frame (`-coldwait`), so a one-shot reader (scrot, xwd, Java's
+    /// Robot) gets the desktop as it is, not black or an old picture. Only
+    /// this client waits; its later reads find capture running.
+    fn await_fresh(&mut self) {
+        use crate::bridge::fresh::Wait;
+        self.active = true;
+        match self.server.framebuffer.await_fresh(self.server.config.coldwait()) {
+            Wait::NotNeeded => {}
+            Wait::Fresh(d) => crate::vlog!("[c{}] screen read held {} ms until capture was live", self.id, d.as_millis()),
+            Wait::TimedOut => crate::warning!(
+                "[c{}] capture didn't start within {} ms; answering a screen read with the last frame",
+                self.id,
+                self.server.config.coldwait().as_millis()
+            ),
+        }
+    }
+
+    /// An XTest event. A key on a spare keycode the client put a keysym on
+    /// becomes that keysym's key on the compositor keyboard, with the
+    /// modifiers its level needs held around it (or, for a keysym only
+    /// another layout has, that layout's key as part of a shortcut), the way
+    /// [`keymap::Synth`](crate::bridge::keymap::Synth) and
+    /// [`KeyTable::plan`](crate::bridge::keymap::KeyTable::plan) decide for
+    /// every engine; everything else goes through as it is.
+    fn fake_input(&mut self, r: &xtest::FakeInputRequest) {
+        if let Some(name) = &self.engine_helper {
+            if !std::mem::replace(&mut self.helper_logged, true) {
+                crate::log!(
+                    "input from X client {} ({name}) stays on this display: \
+                     it drives windows here (an engine helper, -xtesthelpers)",
+                    self.id
+                );
+            }
+            return;
+        }
+        let input = self.server.input.clone();
+        let press = r.type_ == xproto::KEY_PRESS_EVENT;
+        if press || r.type_ == xproto::KEY_RELEASE_EVENT {
+            let id = self.id;
+            let shortcut = press && input.shortcut_held_or_queued();
+            // (Input never takes the keymap lock, so holding it across
+            // `holds` can't deadlock)
+            let keymap = self.server.keymap.lock().unwrap();
+            let events = self.synth.key(
+                press,
+                r.detail,
+                || keymap.as_ref()?.overrides.get(&r.detail)?.first().copied(),
+                |m| input.holds(id, m),
+                keymap.as_ref(),
+                shortcut,
+                &format_args!("[c{id}]"),
+            );
+            drop(keymap);
+            if let Some(events) = events {
+                for (down, kc) in events {
+                    let type_ = if down { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT };
+                    input.fake_input(self.id, type_, kc, 0, 0);
+                }
+                return;
+            }
+        }
+        input.fake_input(self.id, r.type_, r.detail, r.root_x, r.root_y);
+    }
+
+    /// Whether `QueryExtension`/`ListExtensions` show the extension: DAMAGE
+    /// and XKEYBOARD can be turned off (`-nodamage`, `-noxkb`).
+    fn advertised(&self, e: &super::ext::ExtDef) -> bool {
+        (self.server.config.damage() || e.name != "DAMAGE")
+            && (self.server.config.xkb() || e.name != xkb::NAME)
+    }
+
+    /// The XKB description served: the compositor keymap's, or until there is
+    /// one, a keyboard with no keysyms (as the core mapping then has).
+    fn xkb_desc(&self) -> Arc<Desc> {
+        if let Some(table) = self.server.keymap.lock().unwrap().as_ref() {
+            return table.xkb.clone();
+        }
+        static NO_KEYMAP: std::sync::OnceLock<Arc<Desc>> = std::sync::OnceLock::new();
+        NO_KEYMAP
+            .get_or_init(|| Arc::new(Desc::without_keymap(&DEFAULT_MODIFIER_MAP)))
+            .clone()
+    }
+
+    /// The root window's `_XKB_RULES_NAMES` (rules, model, layout, variant,
+    /// options), which an X server with XKB publishes and `setxkbmap -query`
+    /// and `-print` read: derived from the compositor keymap, never stored.
+    fn xkb_rules_property(&self, window: u32, property: u32) -> Option<Property> {
+        if window != ROOT_WINDOW || !self.server.config.xkb() {
+            return None;
+        }
+        if self.atom_name(property)?.as_slice() != xkb::RULES_NAMES_PROPERTY.as_bytes() {
+            return None;
+        }
+        let rules = self.xkb_desc().rules.clone()?;
+        Some(Property {
+            type_: XA_STRING,
+            format: 8,
+            data: rules.property(),
+        })
+    }
+
+    /// Whether a warning about XKB request `minor` is still to be logged for
+    /// this client (true the first time only).
+    fn xkb_warn_once(&mut self, minor: u8) -> bool {
+        let (word, bit) = (usize::from(minor / 64), 1u64 << (minor % 64));
+        let first = self.xkb_warned[word] & bit == 0;
+        self.xkb_warned[word] |= bit;
+        first
+    }
+
+    /// An XKEYBOARD request (see [`xkb`]).
+    fn dispatch_xkb(&mut self, major: u8, minor: u8, body: &[u8]) -> io::Result<()> {
+        let Some(req) = xkb::parse(minor, body) else {
+            if self.xkb_warn_once(minor) {
+                crate::warning!(
+                    "[c{}] failed to parse XKB request {} ({major}.{minor}), sent BadLength \
+                     (not logged again for this client)",
+                    self.id,
+                    xkb::request_name(minor)
+                );
+            }
+            return self.send_error(xproto::LENGTH_ERROR, major, u16::from(minor));
+        };
+        if self.server.config.xtrace {
+            warning!(
+                "xtrace: [c{}] {major}.{minor}: Xkb{} {req:?}",
+                self.id,
+                xkb::request_name(minor)
+            );
+        }
+        let desc = self.xkb_desc();
+        let reply = match req {
+            xkb::Request::UseExtension { .. } => xkb::use_extension(),
+            xkb::Request::SelectEvents(select) => {
+                self.client.select_xkb(&select);
+                return Ok(());
+            }
+            xkb::Request::GetState => xkb::get_state(),
+            xkb::Request::GetControls => xkb::get_controls(&desc),
+            xkb::Request::GetMap(r) => xkb::get_map(&desc, &r),
+            xkb::Request::GetCompatMap {
+                groups,
+                all,
+                first,
+                count,
+            } => xkb::get_compat_map(groups, all, first, count),
+            xkb::Request::GetIndicatorState => xkb::get_indicator_state(),
+            xkb::Request::GetIndicatorMap { which } => xkb::get_indicator_map(&desc, which),
+            xkb::Request::GetNamedIndicator { indicator } => {
+                let name = self.atom_name(indicator);
+                let name = name.as_deref().and_then(|n| std::str::from_utf8(n).ok());
+                xkb::get_named_indicator(&desc, indicator, name)
+            }
+            xkb::Request::GetNames { which } => {
+                let mut intern = |name: &str| self.intern(name.as_bytes());
+                xkb::get_names(&desc, which, &mut intern)
+            }
+            xkb::Request::GetGeometry { name } => xkb::get_geometry(name),
+            xkb::Request::PerClientFlags { change, value } => {
+                self.xkb_flags = xkb::per_client_value(self.xkb_flags, change, value);
+                xkb::per_client_flags(self.xkb_flags)
+            }
+            xkb::Request::ListComponents => xkb::list_components(),
+            xkb::Request::GetKbdByName { load } => {
+                if load && self.xkb_warn_once(minor) {
+                    crate::warning!(
+                        "[c{}] client asked to load a new XKB keymap; the keyboard is the \
+                         compositor's, so nothing is loaded (not logged again for this client)",
+                        self.id
+                    );
+                }
+                xkb::get_kbd_by_name()
+            }
+            xkb::Request::GetDeviceInfo {
+                first_button,
+                n_buttons,
+            } => xkb::get_device_info(first_button, n_buttons),
+            xkb::Request::SetDebuggingFlags => xkb::set_debugging_flags(),
+            xkb::Request::Ignored(m) => {
+                // XkbBell (GTK's gdk_display_beep, xkbbell) rings like the
+                // core Bell, unless it asks for the event only (eventOnly,
+                // request byte 12)
+                if m == xkb::op::BELL && body.get(8) == Some(&0) {
+                    crate::bridge::bell::ring();
+                }
+                return Ok(());
+            }
+            xkb::Request::Refused(m) => {
+                if self.xkb_warn_once(m) {
+                    crate::warning!(
+                        "[c{}] client asked to change the keyboard with Xkb{}; it is the \
+                         compositor's (read-only), sent BadImplementation (not logged again for \
+                         this client)",
+                        self.id,
+                        xkb::request_name(m)
+                    );
+                }
+                return self.send_error(xproto::IMPLEMENTATION_ERROR, major, u16::from(minor));
+            }
+            xkb::Request::Unknown(m) => {
+                if self.xkb_warn_once(m) {
+                    crate::fixme!(
+                        "[c{}] unknown XKB request {major}.{m}, sent BadRequest (not logged again \
+                         for this client)",
+                        self.id
+                    );
+                }
+                return self.send_error(xproto::REQUEST_ERROR, major, u16::from(minor));
+            }
+        };
+        let mut buf = xkb::finish(reply);
+        self.client.send_reply(self.seq, &mut buf)
     }
 
     /// `RRSetCrtcConfig`. Disabling a CRTC, or giving it a mode the output is
@@ -2023,6 +2543,12 @@ impl Drop for Connection {
         // X reverts a closing client's selections to nobody; the rest of the
         // display hears about it, this client no longer can
         self.selection_owner_gone(None, xfixes::SelectionEvent::SELECTION_CLIENT_CLOSE);
+        // and nothing it was pressing stays pressed (unless -xtestpersist,
+        // or for a while if it was a one-shot client)
+        self.server.input.client_gone(self.id, self.since.elapsed());
+        if self.active {
+            self.server.framebuffer.note_oneshot();
+        }
     }
 }
 
@@ -2176,10 +2702,29 @@ pub fn build_reply(reply: &impl Serialize) -> Vec<u8> {
     buf
 }
 
+/// Serializes a refused connection's setup reply (status Failed + reason),
+/// for a little-endian client.
+pub fn setup_failed(reason: &[u8]) -> Vec<u8> {
+    let reason = &reason[..reason.len().min(255)];
+    let mut buf = vec![0, reason.len() as u8];
+    buf.extend_from_slice(&11u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&((pad4(reason.len()) / 4) as u16).to_le_bytes());
+    buf.extend_from_slice(reason);
+    buf.resize(8 + pad4(reason.len()), 0);
+    buf
+}
+
 /// Serializes the setup reply (status byte + version + length + body) for a
 /// single TrueColor 24-bit screen of the given size. `resource_id_base` must be
 /// unique per connection so clients don't allocate colliding IDs.
 pub fn setup(geom: Geometry, resource_id_base: u32) -> Vec<u8> {
+    debug_assert!(
+        resource_id_base >= CLIENT_RESOURCE_ID_BASE
+            && u64::from(resource_id_base) + u64::from(super::CLIENT_RESOURCE_ID_MASK)
+                < 0x2000_0000,
+        "a range from ID_RANGES: above the server's ids, within 29 bits"
+    );
     let visual = Visualtype {
         visual_id: ROOT_VISUAL,
         class: VisualClass::TRUE_COLOR,
@@ -2217,7 +2762,7 @@ pub fn setup(geom: Geometry, resource_id_base: u32) -> Vec<u8> {
         length: 0, // patched below
         release_number: 0,
         resource_id_base,
-        resource_id_mask: 0x001f_ffff,
+        resource_id_mask: super::CLIENT_RESOURCE_ID_MASK,
         motion_buffer_size: 256,
         maximum_request_length: 65535,
         image_byte_order: ImageOrder::LSB_FIRST,
@@ -2252,6 +2797,13 @@ pub fn setup(geom: Geometry, resource_id_base: u32) -> Vec<u8> {
     let length = ((buf.len() - 8) / 4) as u16;
     buf[6..8].copy_from_slice(&length.to_le_bytes());
     buf
+}
+
+/// The error code of RandR's error `n` (`randr::BAD_*_ERROR`) on this server.
+fn randr_error(n: u8) -> u8 {
+    EXTENSIONS
+        .lookup(randr::X11_EXTENSION_NAME.as_bytes())
+        .map_or(xproto::IMPLEMENTATION_ERROR, |e| e.first_error + n)
 }
 
 /// A failed `GetOutputInfo` reply for an unknown output id.
@@ -2352,6 +2904,28 @@ fn pad4(n: usize) -> usize {
     (n + 3) & !3
 }
 
+/// `WarpPointer`'s source condition for a request with a `src_window`: the
+/// pointer is inside the rectangle `src_x,src_y` `src_width`x`src_height` of
+/// that window (here: of the screen, where every window is), a width or
+/// height of 0 meaning "to the window's edge".
+fn warp_source_holds(
+    r: &xproto::WarpPointerRequest,
+    pointer: (i16, i16),
+    screen: crate::util::Geometry,
+) -> bool {
+    let span = |origin: i16, len: u16, limit: u16| {
+        let start = i32::from(origin);
+        let end = if len == 0 {
+            i32::from(limit)
+        } else {
+            start + i32::from(len)
+        };
+        start..end
+    };
+    span(r.src_x, r.src_width, screen.width).contains(&i32::from(pointer.0))
+        && span(r.src_y, r.src_height, screen.height).contains(&i32::from(pointer.1))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -2393,6 +2967,44 @@ mod tests {
         peer.read_exact(&mut buf).expect("no event was sent");
         let (notify, _) = xproto::SelectionNotifyEvent::try_parse(&buf[..]).unwrap();
         notify
+    }
+
+    #[test]
+    fn warp_pointer_source_rectangle() {
+        let screen = crate::util::Geometry {
+            width: 1280,
+            height: 720,
+        };
+        let warp = |x: i16, y: i16, w: u16, h: u16| xproto::WarpPointerRequest {
+            src_window: ROOT_WINDOW,
+            dst_window: 0,
+            src_x: x,
+            src_y: y,
+            src_width: w,
+            src_height: h,
+            dst_x: 200,
+            dst_y: 200,
+        };
+        // inside, on the near edges, and past the far edges (exclusive)
+        assert!(warp_source_holds(&warp(0, 0, 10, 10), (5, 5), screen));
+        assert!(warp_source_holds(&warp(5, 5, 1, 1), (5, 5), screen));
+        assert!(!warp_source_holds(&warp(0, 0, 1, 1), (100, 100), screen));
+        assert!(!warp_source_holds(&warp(0, 0, 10, 10), (10, 5), screen));
+        assert!(!warp_source_holds(&warp(0, 0, 10, 10), (5, 10), screen));
+        // 0 reaches to the window's (= the screen's) edge
+        assert!(warp_source_holds(
+            &warp(100, 100, 0, 0),
+            (1279, 719),
+            screen
+        ));
+        assert!(!warp_source_holds(&warp(100, 100, 0, 0), (99, 719), screen));
+        assert!(!warp_source_holds(&warp(0, 0, 0, 0), (1280, 0), screen));
+        // a rectangle reaching past i16 doesn't wrap
+        assert!(warp_source_holds(
+            &warp(i16::MAX - 1, 0, u16::MAX, 0),
+            (i16::MAX, 3),
+            screen
+        ));
     }
 
     #[test]
