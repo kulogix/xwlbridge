@@ -14,6 +14,11 @@
 #                                      the same for xwlbridge.service: the bridge alone (-nowrap)
 #                                      on display :N (setting `display`), for X11 tools; `show`
 #                                      prints the display
+#   xwlbridge-ctl --realvnc ...        the same for xwlbridge-realvnc.service. Without either
+#                                      flag, doctor, status, logs, start, stop, restart and show
+#                                      follow the enabled service: xwlbridge.service when only
+#                                      it is enabled (an install without RealVNC Server), else
+#                                      xwlbridge-realvnc.service
 #   xwlbridge-ctl migrate [--dry-run] [--no-start]
 #                                      take over an xwlrvnc install: stop and disable
 #                                      xwlrvnc.service, copy its settings, enable xwlbridge-realvnc.service
@@ -32,6 +37,8 @@ UNIT_REALVNC=xwlbridge-realvnc.service
 UNIT_DISPLAY=xwlbridge.service
 MODE=realvnc          # --display: display
 UNIT=$UNIT_REALVNC
+CTL=$PROG             # how hints name this command: "xwlbridge-ctl --display" for the display service
+MODE_FOLLOWED=0       # 1: no --display/--realvnc, and only xwlbridge.service is enabled
 EX_CONFIG=78
 EX_TEMPFAIL=75
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
@@ -596,6 +603,7 @@ cmd_doctor() {
   # judge the command with the environment the service gets (the user manager's), e.g. from ssh
   local sdisp; sdisp=$(session_env DISPLAY); local DISPLAY=$sdisp
   [ $D_JSON -eq 1 ] || printf 'xwlbridge doctor (%s, %s)\n' "$(ctl_version)" "$(date '+%F %T')"
+  [ $D_JSON -eq 1 ] || [ $MODE_FOLLOWED -eq 0 ] || printf 'checking %s, the enabled service (%s --realvnc doctor checks %s)\n' "$UNIT" "$PROG" "$UNIT_REALVNC"
 
   # -------------------------------------------------------------- session
   section "GNOME session"
@@ -904,19 +912,19 @@ cmd_doctor() {
   nres=$(sed -n 's/^NRestarts=//p' <<<"$props"); result=$(sed -n 's/^Result=//p' <<<"$props")
   since=$(sed -n 's/^ActiveEnterTimestamp=//p' <<<"$props"); mainpid=$(sed -n 's/^MainPID=//p' <<<"$props")
   if [ "$loadst" != loaded ]; then
-    report warn service.unit "$UNIT is not installed for this user (${loadst:-no systemd user manager})" "Install with install.sh, or run in a terminal: $PROG run"
+    report warn service.unit "$UNIT is not installed for this user (${loadst:-no systemd user manager})" "Install with install.sh, or run in a terminal: $CTL run"
   else
     if [ "$enabled" = enabled ]; then report ok service.enabled "$UNIT is enabled (starts with your GNOME session)"
-    else report warn service.enabled "$UNIT is ${enabled:-not enabled}" "$PROG enable"; fi
+    else report warn service.enabled "$UNIT is ${enabled:-not enabled}" "$CTL enable"; fi
     case $active in
       active) report ok service.active "$UNIT is running (pid $mainpid, since ${since:-?}; restarts: ${nres:-0})";;
-      activating) report warn service.active "$UNIT is $active/$sub (restarts: ${nres:-0}, last result: ${result:-?})" "$PROG logs";;
-      failed) report fail service.active "$UNIT failed (result: ${result:-?}; restarts: ${nres:-0})" "$PROG logs   then: $PROG restart";;
-      *) report warn service.active "$UNIT is ${active:-?}" "$PROG start";;
+      activating) report warn service.active "$UNIT is $active/$sub (restarts: ${nres:-0}, last result: ${result:-?})" "$CTL logs";;
+      failed) report fail service.active "$UNIT failed (result: ${result:-?}; restarts: ${nres:-0})" "$CTL logs   then: $CTL restart";;
+      *) report warn service.active "$UNIT is ${active:-?}" "$CTL start";;
     esac
     local errs
     errs=$(t5 journalctl --user -u "$UNIT" -b -p warning --no-pager -o cat -n 200 2>/dev/null | grep -vE '^-- ' | grep -cE '.' || true)
-    [ "${errs:-0}" -gt 0 ] && report info service.journal "$errs warning line(s) from $UNIT this boot ($PROG logs)"
+    [ "${errs:-0}" -gt 0 ] && report info service.journal "$errs warning line(s) from $UNIT this boot ($CTL logs)"
   fi
 
   if [ $D_JSON -eq 1 ]; then
@@ -1080,11 +1088,27 @@ cmd_migrate() {
   return 0
 }
 
-usage() { sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# Without --display or --realvnc, the commands that look at or act on a running
+# service follow the enabled one: xwlbridge.service when it is enabled and
+# xwlbridge-realvnc.service is not (install.sh without RealVNC Server).
+follow_enabled_unit() {
+  [ "$(t5 systemctl --user is-enabled "$UNIT_REALVNC" 2>/dev/null)" = enabled ] && return 0
+  [ "$(t5 systemctl --user is-enabled "$UNIT_DISPLAY" 2>/dev/null)" = enabled ] || return 0
+  MODE=display; UNIT=$UNIT_DISPLAY; CTL="$PROG --display"; MODE_FOLLOWED=1
+}
 
 main() {
-  if [ "${1:-}" = --display ] || [ "${1:-}" = -d ]; then MODE=display; UNIT=$UNIT_DISPLAY; shift; fi
+  local explicit=0
+  case ${1:-} in
+    --display|-d) MODE=display; UNIT=$UNIT_DISPLAY; CTL="$PROG --display"; explicit=1; shift;;
+    --realvnc|-r) explicit=1; shift;;
+  esac
   local cmd=${1:-help}; shift || true
+  case $cmd in
+    doctor|check|status|logs|start|stop|restart|reset-failed|show) [ $explicit -eq 1 ] || follow_enabled_unit;;
+  esac
   case $cmd in
     run) cmd_run "$@";;
     command) cmd_command "$@";;

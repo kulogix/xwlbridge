@@ -139,7 +139,7 @@ ICON=preferences-desktop-remote-desktop
 put 0644 "$SRC/xwlbridge-status.desktop.in" "$APPDIR/xwlbridge-status.desktop" "s|@BINDIR@|$(esc "$BINDIR")|g; s|@ICON@|$(esc "$ICON")|g"
 say "installed $BINDIR/xwlbridge, $BINDIR/xwlbridge-ctl, $UNIT, $UNIT_DISPLAY, $APPDIR/xwlbridge-status.desktop"
 
-# ------------------------------------------------------------- an xwlrvnc install (the name before 0.1.0)
+# ------------------------------------------------------------- an xwlrvnc install (a pre-release package of this fork, named xwlrvnc before 0.1.0)
 MIGRATED=0
 if [ ! -f "$CFG" ] && { [ -f "$CONF_HOME/xwlrvnc/xwlrvnc.conf" ] || [ -f "$UNITDIR/xwlrvnc.service" ]; }; then
   say "found an xwlrvnc install: taking it over (xwlbridge-ctl migrate)"

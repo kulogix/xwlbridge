@@ -181,13 +181,13 @@ check "no-new-privs + uidisplay=none -> vncserver-x11-core directly" grep -q -- 
 
 # ---- RealVNC's own settings: realvnc-get, and the doctor's port / IP filter
 mkdir -p "$HOME/.vnc/config.d"
-printf '%s\n' '_AnlLastConnTime=1' 'RfbPort=5911' 'IpClientAddresses=+192.168.1.0/255.255.255.0,+127.0.0.1,-' 'Authentication=VncAuth' 'Password=0123456789abcdef' >"$HOME/.vnc/config.d/vncserver-x11"
+printf '%s\n' '_AnlLastConnTime=1' 'RfbPort=5910' 'IpClientAddresses=+192.168.1.0/255.255.255.0,+127.0.0.1,-' 'Authentication=VncAuth' 'Password=0123456789abcdef' >"$HOME/.vnc/config.d/vncserver-x11"
 conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "rfb_port=realvnc"
-check "realvnc-get RfbPort" test "$(PATH="$T/empty:$SYS" "$C" realvnc-get RfbPort)" = 5911
+check "realvnc-get RfbPort" test "$(PATH="$T/empty:$SYS" "$C" realvnc-get RfbPort)" = 5910
 check "realvnc-get unset parameter -> exit 1" bash -c '! PATH="$1" "$2" realvnc-get DesktopName >/dev/null' _ "$T/empty:$SYS" "$C"
 if command -v python3 >/dev/null; then
   PATH="$T/empty:$SYS" "$C" doctor --json >"$T/doctor_rv.json" 2>/dev/null
-  check "doctor: port 5911 from RealVNC's own settings" python3 -c 'import json,sys; d={c["id"]:c for c in json.load(open(sys.argv[1]))["checks"]}; c=d["realvnc.rfb_port"]; assert "port 5911" in c["summary"] and "vncserver-x11" in c["summary"], c' "$T/doctor_rv.json"
+  check "doctor: port 5910 from RealVNC's own settings" python3 -c 'import json,sys; d={c["id"]:c for c in json.load(open(sys.argv[1]))["checks"]}; c=d["realvnc.rfb_port"]; assert "port 5910" in c["summary"] and "vncserver-x11" in c["summary"], c' "$T/doctor_rv.json"
   check "doctor: IP filter reported" python3 -c 'import json,sys; d={c["id"]:c for c in json.load(open(sys.argv[1]))["checks"]}; c=d["realvnc.ip_filter"]; assert c["status"]=="ok" and "+192.168.1.0/255.255.255.0" in c["summary"], c' "$T/doctor_rv.json"
   check "doctor: VncAuth with a password" python3 -c 'import json,sys; d={c["id"]:c for c in json.load(open(sys.argv[1]))["checks"]}; c=d["realvnc.auth"]; assert c["status"]=="ok" and "VncAuth" in c["summary"], c' "$T/doctor_rv.json"
   check "doctor never prints the password hash" bash -c '! grep -q 0123456789abcdef "$1"' _ "$T/doctor_rv.json"
@@ -212,7 +212,7 @@ check "doctor never executed a decoy" test ! -e "$MARK"
 # ---- one RealVNC user-mode server per user: another one running -> run exits 75 (retried), doctor fails
 mkdir -p "$T/other"
 printf '#!/bin/sh\nsleep 30\n' >"$T/other/vncserver-x11-core"; chmod 755 "$T/other/vncserver-x11-core"
-"$T/other/vncserver-x11-core" -RfbPort=5911 & OTHER=$!
+"$T/other/vncserver-x11-core" -RfbPort=5910 & OTHER=$!
 sleep 0.3
 conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5"
 out=$(PATH="$T/empty:$SYS" "$C" run 2>"$T/err"); rc=$?
@@ -261,19 +261,19 @@ check "  ...unit: a crash restarts, a stop is a success by its status 0 alone" b
   ! grep -qE "^[[:space:]]*SuccessExitStatus[[:space:]]*=" "$1" &&
   ! grep -qE "^[[:space:]]*RestartPreventExitStatus[[:space:]]*=.*\<(143|69|70|137|139)\>" "$1"' _ "$H2/.config/systemd/user/xwlbridge-realvnc.service"
 check "  ...settings 0600" test "$(stat -c %a "$H2/.config/xwlbridge/xwlbridge.conf")" = 600
-check "  ...app-grid entry" grep -qx "Exec=$H2/.local/bin/xwlbridge-ctl show" "$H2/.local/share/applications/xwlbridge-status.desktop"
+check "  ...app-grid entry" grep -qx "Exec=$H2/.local/bin/xwlbridge-ctl --realvnc show" "$H2/.local/share/applications/xwlbridge-status.desktop"
 out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H2/.local/share/xwlbridge/uninstall.sh" --purge 2>&1); rc=$?
 check "uninstall.sh --purge rc 0" test $rc -eq 0
 after=$(cd "$H2" && find . | sort)
 check "  ...HOME exactly as before the install" test "$before" = "$after"
 
-# a user whose RealVNC settings already choose the port (as the host's :5911 setup): left to RealVNC
+# a user whose RealVNC settings already choose the port: left to RealVNC
 H3=$T/home3; mkdir -p "$H3/.vnc/config.d" "$H3/.cache"
-printf '%s\n' 'RfbPort=5911' 'IpClientAddresses=+127.0.0.1,-' >"$H3/.vnc/config.d/vncserver-x11"
+printf '%s\n' 'RfbPort=5910' 'IpClientAddresses=+127.0.0.1,-' >"$H3/.vnc/config.d/vncserver-x11"
 before=$(cd "$H3" && find . | sort)
 out=$(HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start 2>&1); rc=$?
-check "install with RealVNC's own RfbPort -> rfb_port=realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2" && grep -q "RfbPort=5911" <<<"$3"' _ $rc "$H3/.config/xwlbridge/xwlbridge.conf" "$out"
-check "  ...RealVNC's file untouched" test "$(cat "$H3/.vnc/config.d/vncserver-x11")" = "$(printf '%s\n' 'RfbPort=5911' 'IpClientAddresses=+127.0.0.1,-')"
+check "install with RealVNC's own RfbPort -> rfb_port=realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2" && grep -q "RfbPort=5910" <<<"$3"' _ $rc "$H3/.config/xwlbridge/xwlbridge.conf" "$out"
+check "  ...RealVNC's file untouched" test "$(cat "$H3/.vnc/config.d/vncserver-x11")" = "$(printf '%s\n' 'RfbPort=5910' 'IpClientAddresses=+127.0.0.1,-')"
 # the bridge's -uidisplay hook copy (newer bridges: ~/.cache/xwlbridge) is runtime litter of ours
 mkdir -p "$H3/.cache/xwlbridge"; : >"$H3/.cache/xwlbridge/xwlbridge-uihook-0123456789abcdef.so"
 HOME=$H3 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H3/.local/share/xwlbridge/uninstall.sh" --purge >/dev/null 2>&1
@@ -350,7 +350,7 @@ exit 0
 EOS
 chmod 755 "$T/fakemig/systemctl"
 H11=$T/home11; mkdir -p "$H11/.config/xwlrvnc" "$H11/.config/systemd/user"
-printf '%s\n' '# xwlrvnc settings' 'engine=xvnc' 'rfb_port=5911' 'bridge=/opt/old/bin/xwlrvnc' 'bridge_args=-fps 30' >"$H11/.config/xwlrvnc/xwlrvnc.conf"
+printf '%s\n' '# xwlrvnc settings' 'engine=xvnc' 'rfb_port=5910' 'bridge=/opt/old/bin/xwlrvnc' 'bridge_args=-fps 30' >"$H11/.config/xwlrvnc/xwlrvnc.conf"
 : >"$H11/.config/systemd/user/xwlrvnc.service"
 mig() { HOME=$1 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$2 PATH="$T/fakemig:$T/empty:$SYS" "$C" migrate "${@:3}"; }
 F11=$T/f11; mkdir -p "$F11/st"; echo loaded >"$F11/st/xwlrvnc.service.load"; echo enabled >"$F11/st/xwlrvnc.service.enabled"; echo active >"$F11/st/xwlrvnc.service.active"
@@ -360,7 +360,7 @@ cp "$HERE/../xwlbridge-realvnc.service.in" "$T/pkg/bin/"   # the source-tree lay
 out=$(mig "$H11" "$F11" --no-start 2>&1); rc=$?
 check "migrate rc 0" test $rc -eq 0
 check "  ...stopped and disabled xwlrvnc.service" grep -qx -- "--user disable --now xwlrvnc.service" "$F11/mig.log"
-check "  ...settings copied, the old binary path back to auto" bash -c 'f=$1/.config/xwlbridge/xwlbridge.conf; grep -qx engine=xvnc "$f" && grep -qx rfb_port=5911 "$f" && grep -qx bridge=auto "$f" && grep -qx "bridge_args=-fps 30" "$f" && [ "$(stat -c %a "$f")" = 600 ]' _ "$H11"
+check "  ...settings copied, the old binary path back to auto" bash -c 'f=$1/.config/xwlbridge/xwlbridge.conf; grep -qx engine=xvnc "$f" && grep -qx rfb_port=5910 "$f" && grep -qx bridge=auto "$f" && grep -qx "bridge_args=-fps 30" "$f" && [ "$(stat -c %a "$f")" = 600 ]' _ "$H11"
 check "  ...installed and enabled xwlbridge-realvnc.service" bash -c 'grep -qx -- "--user enable xwlbridge-realvnc.service" "$1/mig.log" && grep -q "xwlbridge-ctl run" "$2/.config/systemd/user/xwlbridge-realvnc.service"' _ "$F11" "$H11"
 check "  ...the old settings file is kept" test -f "$H11/.config/xwlrvnc/xwlrvnc.conf"
 check "  ...the migrated settings are valid" bash -c 'HOME=$1 XDG_CONFIG_HOME= PATH="$2" "$3" config show >/dev/null 2>&1' _ "$H11" "$T/empty:$SYS" "$C"
@@ -375,6 +375,31 @@ printf '%s\n' 'engine=builtin' 'rfb_port=realvnc' >"$H13/.config/xwlrvnc/xwlrvnc
 echo loaded >"$F13/st/xwlrvnc.service.load"; echo enabled >"$F13/st/xwlrvnc.service.enabled"
 out=$(HOME=$H13 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$F13 PATH="$T/fakemig:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start 2>&1); rc=$?
 check "install.sh over xwlrvnc: migrated (settings kept, old unit disabled, realvnc unit enabled)" bash -c '[ $1 -eq 0 ] && grep -qx rfb_port=realvnc "$2/.config/xwlbridge/xwlbridge.conf" && grep -qx -- "--user disable --now xwlrvnc.service" "$3/mig.log" && grep -qx -- "--user enable xwlbridge-realvnc.service" "$3/mig.log"' _ $rc "$H13" "$F13"
+
+# ---- no --display/--realvnc: doctor, status, logs, start/stop/restart and show follow the enabled service
+F14=$T/f14; mkdir -p "$F14/st"; echo enabled >"$F14/st/xwlbridge.service.enabled"
+conf "engine=builtin" "display=20" "server=/nonexistent/vncserver-x11"
+follow() { FAKE_DIR=$1 PATH="$T/fakemig:$T/empty:$SYS" "$C" "${@:2}"; }
+: >"$F14/mig.log"; follow "$F14" status >/dev/null 2>&1
+check "only xwlbridge.service enabled: status -> xwlbridge.service" grep -qx -- "--user --no-pager status xwlbridge.service" "$F14/mig.log"
+: >"$F14/mig.log"; follow "$F14" restart >/dev/null 2>&1
+check "  ...restart -> xwlbridge.service" grep -qx -- "--user restart xwlbridge.service" "$F14/mig.log"
+: >"$F14/mig.log"; follow "$F14" enable >/dev/null 2>&1
+check "  ...enable is not followed (xwlbridge-realvnc.service)" grep -qx -- "--user enable xwlbridge-realvnc.service" "$F14/mig.log"
+rm -f "$F14/st/xwlbridge-realvnc.service.enabled"   # the fake enabled it
+: >"$F14/mig.log"; follow "$F14" --realvnc status >/dev/null 2>&1
+check "  ...--realvnc status -> xwlbridge-realvnc.service" grep -qx -- "--user --no-pager status xwlbridge-realvnc.service" "$F14/mig.log"
+if command -v python3 >/dev/null; then
+  follow "$F14" doctor --json >"$T/doctor_follow.json" 2>/dev/null
+  check "  ...doctor checks the display service (no RealVNC checks)" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); ids=[c["id"] for c in d["checks"]]; assert not [i for i in ids if i.startswith("realvnc.") or i=="gnome.appindicator"], ids; assert any(c["id"]=="bridge.config" and "display=20" in c["summary"] for c in d["checks"])' "$T/doctor_follow.json"
+  out=$(follow "$F14" doctor 2>/dev/null)
+  check "  ...doctor says which service it checks" grep -q "checking xwlbridge.service, the enabled service" <<<"$out"
+  follow "$F14" --realvnc doctor --json >"$T/doctor_rv.json" 2>/dev/null
+  check "  ...--realvnc doctor runs the RealVNC checks" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert [c for c in d["checks"] if c["id"].startswith("realvnc.")]' "$T/doctor_rv.json"
+  echo enabled >"$F14/st/xwlbridge-realvnc.service.enabled"
+  follow "$F14" doctor --json >"$T/doctor_both.json" 2>/dev/null
+  check "both services enabled: doctor checks xwlbridge-realvnc.service" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert [c for c in d["checks"] if c["id"].startswith("realvnc.")]' "$T/doctor_both.json"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 [ $FAILN -eq 0 ]
