@@ -170,6 +170,27 @@ conf "engine=builtin" "uidisplay=:5" "server=$T/rvnc/vncserver-x11" 'bridge_args
 PATH="$T/empty:$SYS" "$C" --realvnc command >/dev/null 2>"$T/err"; rc=$?
 check "effective uidisplay override preserves builtin UI safety checks" test "$rc" -eq 78
 
+# ---- cfg_bridge_args' value-consuming case pattern must match src/config.rs
+# (a value()/choice() option missing from that hardcoded list makes the bridge_args
+# scan stop early, silently skipping overrides that follow)
+CFG_SRC=$HERE/../../src/config.rs
+rust_opts=$(awk '/^[[:space:]]+[a-z_][a-z0-9_]*:[^=]*=[[:space:]]*(value|choice)\(/ { line = $0; sub(/^[[:space:]]+/, "", line); sub(/:.*/, "", line); print line }' "$CFG_SRC" | LC_ALL=C sort -u)
+ctl_opts=$(awk '/^cfg_bridge_args\(\) \{/ { f = 1; next } !f { next } /case \$name in/ { c = 1; next } c && /^[[:space:]]*-/ { line = $0; sub(/^[[:space:]]+/, "", line); sub(/\)[[:space:]]*$/, "", line); n = split(line, a, "|"); for (i = 1; i <= n; i++) { sub(/^-/, "", a[i]); gsub(/[[:space:]]/, "", a[i]); if (a[i] != "") print a[i] } exit }' "$CTL" | LC_ALL=C sort -u)
+if [ -z "$rust_opts" ] || [ -z "$ctl_opts" ]; then
+  bad "option lists: extracted from src/config.rs and cfg_bridge_args" "src/config.rs: [${rust_opts:-empty}]" "xwlbridge-ctl: [${ctl_opts:-empty}]"
+else
+  extra_cfg=$(comm -23 <(printf '%s\n' "$rust_opts") <(printf '%s\n' "$ctl_opts"))
+  extra_ctl=$(comm -13 <(printf '%s\n' "$rust_opts") <(printf '%s\n' "$ctl_opts"))
+  if [ -z "$extra_cfg" ] && [ -z "$extra_ctl" ]; then
+    ok "cfg_bridge_args consumes a value for exactly the value()/choice() options of src/config.rs"
+  else
+    extra_cfg=${extra_cfg//$'\n'/, }; extra_ctl=${extra_ctl//$'\n'/, }
+    bad "cfg_bridge_args' value-consuming options differ from src/config.rs" \
+      ${extra_cfg:+"in src/config.rs but not in cfg_bridge_args (the scan stops early there): $extra_cfg"} \
+      ${extra_ctl:+"in cfg_bridge_args but not value()/choice() in src/config.rs: $extra_ctl"}
+  fi
+fi
+
 # ---- engine guard
 base=("server=$T/rvnc/vncserver-x11" "uidisplay=:5")
 conf "engine=auto" "${base[@]}"
