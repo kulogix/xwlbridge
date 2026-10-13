@@ -17,6 +17,7 @@ fi
 # CARGO_TARGET_DIR points elsewhere. Extra arguments go to cargo-deb (cargo arguments after --, e.g. -- --offline).
 mkdir -p target/packaging
 sed "s|@BINDIR@|/usr/bin|g" packaging/xwlbridge-realvnc.service.in >target/packaging/xwlbridge-realvnc.service
+sed "s|@BINDIR@|/usr/bin|g" packaging/xwlbridge.service.in >target/packaging/xwlbridge.service
 sed "s|@VERSION@|$VERSION|g" packaging/xwlbridge-ctl >target/packaging/xwlbridge-ctl
 chmod 0755 target/packaging/xwlbridge-ctl
 sed "s|@BINDIR@|/usr/bin|g; s|@ICON@|preferences-desktop-remote-desktop|g" packaging/xwlbridge-status.desktop.in >target/packaging/xwlbridge-status.desktop

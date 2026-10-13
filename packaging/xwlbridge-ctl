@@ -1,14 +1,22 @@
 #!/bin/bash
-# xwlbridge-ctl: run, check and configure RealVNC Server on the GNOME (Wayland)
-# desktop through the xwlbridge X11 bridge.
+# xwlbridge-ctl: run, check and configure the xwlbridge X11 bridge on the GNOME
+# (Wayland) desktop: RealVNC Server on the bridge (xwlbridge-realvnc.service),
+# or the bridge's X display alone for X11 tools (xwlbridge.service, --display).
 #
-#   xwlbridge-ctl run                  start the bridge + RealVNC (what the service runs)
+#   xwlbridge-ctl run                  start the bridge + RealVNC (what xwlbridge-realvnc.service runs)
 #   xwlbridge-ctl command              print the command `run` would start
 #   xwlbridge-ctl doctor [--json]      check prerequisites and the running service
 #   xwlbridge-ctl config [show|path|get KEY|set KEY VALUE|unset KEY|edit]
 #   xwlbridge-ctl status|logs [-f]|start|stop|restart|enable|disable
 #   xwlbridge-ctl show                 bring up RealVNC's status window on the desktop
 #   xwlbridge-ctl realvnc-get NAME     RealVNC's own value of a parameter (its config files)
+#   xwlbridge-ctl --display run|command|doctor|status|logs|start|stop|restart|enable|disable|show
+#                                      the same for xwlbridge.service: the bridge alone (-nowrap)
+#                                      on display :N (setting `display`), for X11 tools; `show`
+#                                      prints the display
+#   xwlbridge-ctl migrate [--dry-run] [--no-start]
+#                                      take over an xwlrvnc install: stop and disable
+#                                      xwlrvnc.service, copy its settings, enable xwlbridge-realvnc.service
 #   xwlbridge-ctl version
 #
 # Settings: ~/.config/xwlbridge/xwlbridge.conf (else /etc/xwlbridge/xwlbridge.conf, else
@@ -20,7 +28,10 @@ set -u
 
 PROG=xwlbridge-ctl
 CTL_VERSION="@VERSION@"
-UNIT=xwlbridge-realvnc.service
+UNIT_REALVNC=xwlbridge-realvnc.service
+UNIT_DISPLAY=xwlbridge.service
+MODE=realvnc          # --display: display
+UNIT=$UNIT_REALVNC
 EX_CONFIG=78
 EX_TEMPFAIL=75
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
@@ -31,11 +42,11 @@ die() { local rc=$1; shift; say "$*"; exit "$rc"; }
 
 # ---------------------------------------------------------------- configuration
 
-CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge)
+CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display)
 declare -A CFG=(
   [engine]=auto [capture]=area [uidisplay]=auto [server]=vncserver-x11 [rfb_port]=5900
   [server_log]=30 [server_args]="" [log]=normal [bridge_args]="" [xvnc]=auto [xvfb]=auto
-  [backend]=gnome [bridge]=auto
+  [backend]=gnome [bridge]=auto [display]=auto
 )
 CFG_FILE=""
 CFG_ERRORS=()
@@ -75,7 +86,12 @@ cfg_load() {
 }
 
 cfg_validate() {
-  case ${CFG[engine]} in auto|builtin|xvnc|xvfb) ;; *) CFG_ERRORS+=("engine: '${CFG[engine]}' is not auto, builtin, xvnc or xvfb");; esac
+  case ${CFG[engine]} in auto|builtin|xvnc|xvfb|xwayland) ;; *) CFG_ERRORS+=("engine: '${CFG[engine]}' is not auto, builtin, xvnc, xvfb or xwayland");; esac
+  if [ "${CFG[display]}" != auto ]; then
+    if [[ ! ${CFG[display]} =~ ^:?[0-9]{1,4}$ ]] || (( 10#${CFG[display]#:} < 1 )); then
+      CFG_ERRORS+=("display: '${CFG[display]}' is not auto or a display number such as 20")
+    fi
+  fi
   case ${CFG[capture]} in area|monitor) ;; *) CFG_ERRORS+=("capture: '${CFG[capture]}' is not area or monitor");; esac
   [[ ${CFG[uidisplay]} =~ ^(auto|none|[[:alnum:]._-]*:[0-9]+(\.[0-9]+)?)$ ]] || CFG_ERRORS+=("uidisplay: '${CFG[uidisplay]}' is not auto, none or an X display such as :0")
   case ${CFG[backend]} in gnome|wlr|auto) ;; *) CFG_ERRORS+=("backend: '${CFG[backend]}' is not gnome, wlr or auto");; esac
@@ -237,8 +253,22 @@ build_command() {
       ENGINE_BIN=$(find_xvfb 3>/dev/null) || {
         ERR="engine=xvfb but no usable Xvfb${refusals:+ (refused: ${refusals//$'\n'/; })}: sudo apt install xvfb"
         return $EX_CONFIG; };;
+    xwayland) ;;   # the bridge finds and checks Xwayland itself
   esac
   ENGINE=$engine
+  local w
+  if [ "$MODE" = display ]; then
+    # the bridge's X display alone, for X11 tools (xwlbridge.service): no VNC server, no RealVNC UI
+    CMD=("$bridge")
+    case ${CFG[log]} in quiet) CMD+=(-quiet);; verbose) CMD+=(-verbose);; esac
+    [ "${CFG[backend]}" = auto ] || CMD+=(-backend "${CFG[backend]}")
+    CMD+=(-engine "$engine")
+    [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
+    [ "${CFG[display]}" = auto ] || CMD+=(-display "$((10#${CFG[display]#:}))")
+    while IFS= read -r -d '' w; do CMD+=("$w"); done < <(split_words "${CFG[bridge_args]}")
+    CMD+=(-nowrap)
+    return 0
+  fi
   case ${CFG[server]} in
     */*) server=${CFG[server]};;
     *) server=$(command -v -- "${CFG[server]}" 2>/dev/null) || { ERR="${CFG[server]} not found on PATH (is RealVNC Server installed?)"; return $EX_CONFIG; };;
@@ -277,7 +307,6 @@ build_command() {
   # DISPLAY takes RealVNC's windows to it by default
   CMD+=(-uidisplay "$ui")
 
-  local w
   while IFS= read -r -d '' w; do CMD+=("$w"); done < <(split_words "${CFG[bridge_args]}")
 
   # Under NoNewPrivileges (the service's hardening) RealVNC's set-uid launcher
@@ -354,8 +383,8 @@ cmd_run() {
   cfg_load
   build_command; local rc=$?
   [ $rc -eq 0 ] || die "$rc" "$ERR"
-  local others
-  others=$(other_usermode_servers)
+  local others=""
+  [ "$MODE" = display ] || others=$(other_usermode_servers)
   if [ -n "$others" ]; then
     # EX_TEMPFAIL: the service retries (back-off up to 2 min) and takes over once it is gone
     say "another RealVNC Server in user mode is already running for $(id -un); RealVNC allows one per user. Stop it (this service then starts by itself):"
@@ -445,7 +474,7 @@ ensure_config_file() {
 
 default_of() {
   case $1 in
-    engine|xvnc|xvfb|uidisplay|bridge) echo auto;; capture) echo area;; server) echo vncserver-x11;;
+    engine|xvnc|xvfb|uidisplay|bridge|display) echo auto;; capture) echo area;; server) echo vncserver-x11;;
     rfb_port) echo 5900;; server_log) echo 30;; log) echo normal;; backend) echo gnome;; *) echo "";;
   esac
 }
@@ -639,7 +668,11 @@ cmd_doctor() {
   if [ ${#CFG_ERRORS[@]} -gt 0 ]; then
     report fail bridge.config "${CFG_FILE}: ${#CFG_ERRORS[@]} error(s)" "${CFG_ERRORS[@]}"
   else
-    report ok bridge.config "settings: ${CFG_FILE:-built-in defaults} (engine=${CFG[engine]} capture=${CFG[capture]} uidisplay=${CFG[uidisplay]} rfb_port=${CFG[rfb_port]:-(empty)})"
+    if [ "$MODE" = display ]; then
+      report ok bridge.config "settings: ${CFG_FILE:-built-in defaults} (engine=${CFG[engine]} capture=${CFG[capture]} display=${CFG[display]})"
+    else
+      report ok bridge.config "settings: ${CFG_FILE:-built-in defaults} (engine=${CFG[engine]} capture=${CFG[capture]} uidisplay=${CFG[uidisplay]} rfb_port=${CFG[rfb_port]:-(empty)})"
+    fi
   fi
 
   # -------------------------------------------------------------- engines
@@ -664,6 +697,8 @@ cmd_doctor() {
     report fail engine.selected "${ERR:-cannot build the command}"
   fi
 
+  local port=""
+  if [ "$MODE" = realvnc ]; then
   # -------------------------------------------------------------- RealVNC
   section "RealVNC Server"
   local srv core rver pkgv lic licrc auth enc pw
@@ -797,10 +832,13 @@ cmd_doctor() {
     fi
   fi
 
+  fi   # MODE=realvnc
+
   # -------------------------------------------------------------- GNOME settings
   section "GNOME integration"
   local ext info st
   info=""; ext=""
+  if [ "$MODE" = realvnc ]; then
   # (gnome-extensions talks to the running shell; without one it would only D-Bus-activate a helper)
   [ -n "$shell_run" ] && for ext in ubuntu-appindicators@ubuntu.com appindicatorsupport@rgcjonas.gmail.com; do
     info=$(t5 gnome-extensions info "$ext" 2>/dev/null) && break
@@ -831,6 +869,7 @@ cmd_doctor() {
         "This service does not need it: it uses mutter's remote-desktop API directly. GNOME shows its screen-sharing indicator while a viewer watches."
     fi
   fi
+  fi   # MODE=realvnc
   if [ "$(t5 systemctl is-active gnome-remote-desktop.service 2>/dev/null)" = active ]; then
     report info gnome.remote_login "GNOME Remote Login (system gnome-remote-desktop, RDP) is active; no conflict with VNC"
   fi
@@ -898,6 +937,39 @@ ctl_version() {
   printf 'xwlbridge-ctl %s' "$v"
 }
 
+# The displays of running bridges, from their registry ($XDG_RUNTIME_DIR/xwlbridge-displays, which
+# `xwlbridge run` reads too): "N pid" per live entry.
+live_displays() {
+  local dir=${XDG_RUNTIME_DIR:-}/xwlbridge-displays f pid
+  [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$dir" ] || return 0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    case ${f##*/} in *[!0-9]*) continue;; esac
+    read -r pid _ <"$f" 2>/dev/null || continue
+    [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && printf '%s %s\n' "${f##*/}" "$pid"
+  done
+}
+
+cmd_show_display() {
+  cfg_load
+  local mainpid line n=0
+  mainpid=$(systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null)
+  while read -r line; do
+    [ -n "$line" ] || continue
+    n=$((n + 1))
+    if [ -n "$mainpid" ] && [ "$mainpid" != 0 ] && [ "${line#* }" = "$mainpid" ]; then
+      printf 'DISPLAY=:%s   (%s)\n' "${line%% *}" "$UNIT"
+    else
+      printf 'DISPLAY=:%s   (bridge pid %s)\n' "${line%% *}" "${line#* }"
+    fi
+  done < <(live_displays)
+  if [ $n -eq 0 ]; then
+    say "no bridge display is running (start one: $PROG --display start)"
+    return 1
+  fi
+  say "run an X11 tool on it with: xwlbridge run -- COMMAND   (or DISPLAY=:N COMMAND)"
+}
+
 cmd_show() {
   # RealVNC's own "vncserver-x11 -showstatus" asks a running user-mode server
   # (through its control socket) to show its status window, which -uidisplay
@@ -919,9 +991,97 @@ cmd_show() {
   [ $rc -eq 0 ] || [ $rc -eq 5 ] || die "$rc" "$srv -showstatus failed ($rc)"
 }
 
-usage() { sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; }
+# ---------------------------------------------------------------- migrate from xwlrvnc
+
+# Takes over a per-user install of xwlrvnc (this project's name before 0.1.0):
+# stops and disables xwlrvnc.service, copies ~/.config/xwlrvnc/xwlrvnc.conf to
+# ~/.config/xwlbridge/xwlbridge.conf (unless that exists), and enables (and,
+# inside a graphical session, starts) xwlbridge-realvnc.service, which does what
+# xwlrvnc.service did. xwlrvnc's files stay where they are: its uninstall.sh
+# removes them (keep ~/.vnc: it is RealVNC's). Idempotent.
+cmd_migrate() {
+  local dry=0 start=1 a
+  for a in "$@"; do
+    case $a in --dry-run|-n) dry=1;; --no-start) start=0;; *) die 2 "usage: $PROG migrate [--dry-run] [--no-start]";; esac
+  done
+  local conf_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  local old_cfg=$conf_home/xwlrvnc/xwlrvnc.conf new_cfg old_unit=xwlrvnc.service
+  new_cfg=$(user_config_path)
+  local have_sd=0 old_load="" old_enabled="" old_active="" found=0
+  if t5 systemctl --user show-environment >/dev/null 2>&1; then
+    have_sd=1
+    old_load=$(systemctl --user show -p LoadState --value "$old_unit" 2>/dev/null)
+    old_enabled=$(systemctl --user is-enabled "$old_unit" 2>/dev/null)
+    old_active=$(systemctl --user is-active "$old_unit" 2>/dev/null)
+    [ "$old_load" = loaded ] && found=1
+  fi
+  [ -f "$old_cfg" ] && found=1
+  if [ $found = 0 ]; then say "no xwlrvnc install found (no $old_unit, no $old_cfg): nothing to migrate"; return 0; fi
+  run() { if [ $dry = 1 ]; then say "would run: $*"; return 1; else "$@"; fi; }
+  say "xwlrvnc install: unit ${old_load:-unknown} (${old_enabled:-?}, ${old_active:-?}), settings ${old_cfg}$([ -f "$old_cfg" ] || echo ' (none)')"
+
+  # 1. the old service: stopped and disabled (a running viewer disconnects; it reconnects to the new one)
+  if [ $have_sd = 1 ] && [ "$old_load" = loaded ]; then
+    if [ "$old_active" = active ] || [ "$old_active" = activating ] || [ "$old_enabled" = enabled ]; then
+      run systemctl --user disable --now "$old_unit" && say "stopped and disabled $old_unit"
+    fi
+  fi
+
+  # 2. the settings: same keys and meaning; a path to the old binary goes back to auto
+  if [ -f "$old_cfg" ]; then
+    if [ -f "$new_cfg" ]; then
+      say "keeping $new_cfg (exists); $old_cfg not copied"
+    elif [ $dry = 1 ]; then
+      say "would copy $old_cfg -> $new_cfg"
+    else
+      ( umask 077; mkdir -p -- "${new_cfg%/*}" ) || die 1 "cannot create ${new_cfg%/*}"
+      local tmp; tmp=$(mktemp "${new_cfg}.XXXXXX") || exit 1
+      { printf '# copied from %s by %s migrate on %s\n' "$old_cfg" "$PROG" "$(date -u +%FT%TZ)"
+        sed -E 's#^([[:space:]]*bridge[[:space:]]*=.*/)xwlrvnc[[:space:]]*$#bridge=auto#; s#xwlrvnc#xwlbridge#g' -- "$old_cfg"; } >"$tmp"
+      chmod 600 "$tmp"; mv -f -- "$tmp" "$new_cfg"
+      say "copied settings: $old_cfg -> $new_cfg"
+    fi
+    if [ $dry = 0 ]; then
+      cfg_load
+      [ ${#CFG_ERRORS[@]} -eq 0 ] || say "the copied settings have errors (fix with $PROG config edit): ${CFG_ERRORS[*]}"
+    fi
+  fi
+
+  # 3. the new service
+  if [ $have_sd = 0 ]; then
+    say "no systemd user manager: run '$PROG migrate' again from your session to switch the services"; return 0
+  fi
+  if [ "$(systemctl --user show -p LoadState --value "$UNIT_REALVNC" 2>/dev/null)" != loaded ]; then
+    local t="$SELF_DIR/$UNIT_REALVNC.in"
+    if [ -f "$t" ]; then
+      local udir=$conf_home/systemd/user
+      if [ $dry = 1 ]; then say "would install $udir/$UNIT_REALVNC from $t"
+      else
+        mkdir -p -- "$udir" && sed "s|@BINDIR@|$SELF_DIR|g" -- "$t" >"$udir/$UNIT_REALVNC" && systemctl --user daemon-reload \
+          && say "installed $udir/$UNIT_REALVNC"
+      fi
+    else
+      die 1 "$UNIT_REALVNC is not installed: run xwlbridge's install.sh (or install the package) first, then $PROG migrate"
+    fi
+  fi
+  if [ "$old_enabled" = enabled ] || [ "$old_active" = active ] || [ "$old_load" != loaded ]; then
+    run systemctl --user enable "$UNIT_REALVNC" >/dev/null 2>&1 && say "enabled $UNIT_REALVNC"
+  else
+    say "$old_unit was not enabled: $UNIT_REALVNC left disabled ($PROG enable)"
+  fi
+  if [ $start = 1 ] && [ "$(systemctl --user is-active graphical-session.target 2>/dev/null)" = active ] && \
+     { [ "$old_active" = active ] || [ "$old_enabled" = enabled ]; }; then
+    run systemctl --user restart "$UNIT_REALVNC" && say "started $UNIT_REALVNC"
+  fi
+  local share=${XDG_DATA_HOME:-$HOME/.local/share}/xwlrvnc
+  [ -x "$share/uninstall.sh" ] && say "xwlrvnc's files are still installed; remove them with: $share/uninstall.sh --keep-config"
+  return 0
+}
+
+usage() { sed -n '2,25p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 main() {
+  if [ "${1:-}" = --display ] || [ "${1:-}" = -d ]; then MODE=display; UNIT=$UNIT_DISPLAY; shift; fi
   local cmd=${1:-help}; shift || true
   case $cmd in
     run) cmd_run "$@";;
@@ -931,7 +1091,8 @@ main() {
     status) systemctl --user --no-pager status "$UNIT" "$@";;
     logs) exec journalctl --user -u "$UNIT" -b --no-pager "$@";;
     start|stop|restart|enable|disable|reset-failed) exec systemctl --user "$cmd" "$UNIT" "$@";;
-    show) cmd_show;;
+    show) if [ "$MODE" = display ]; then cmd_show_display; else cmd_show; fi;;
+    migrate) cmd_migrate "$@";;
     realvnc-get)
       [ $# -eq 1 ] || die 2 "usage: $PROG realvnc-get NAME   (e.g. RfbPort, IpClientAddresses, Authentication)"
       cfg_load; v=$(rvnc_param "$1") || true

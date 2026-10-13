@@ -1,6 +1,6 @@
 #!/bin/bash
 # Removes what install.sh installed for the current user: stops and disables the
-# service, deletes the programs, the unit, the settings and runtime files.
+# services, deletes the programs, the unit, the settings and runtime files.
 #
 #   ~/.local/share/xwlbridge/uninstall.sh [--keep-config] [--purge] [--prefix DIR]
 #
@@ -27,17 +27,21 @@ say() { printf '==> %s\n' "$*"; }
 CONF_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 SHARE=$PREFIX/share/xwlbridge
 MANIFEST=$SHARE/manifest
-UNIT=xwlbridge-realvnc.service
+UNITS="xwlbridge-realvnc.service xwlbridge.service"
 [ -f "$MANIFEST" ] || { echo "uninstall.sh: no install found ($MANIFEST missing)" >&2; exit 1; }
 
 # 1. the service
 if systemctl --user show-environment >/dev/null 2>&1; then
-  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 && say "stopped and disabled $UNIT"
-  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+  for UNIT in $UNITS; do
+    systemctl --user disable --now "$UNIT" >/dev/null 2>&1 && say "stopped and disabled $UNIT"
+    systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+  done
 fi
 # a wants-link left by a manual enable with another unit path
-rm -f -- "$CONF_HOME/systemd/user/graphical-session.target.wants/$UNIT" "$CONF_HOME/systemd/user/default.target.wants/$UNIT"
-rm -rf -- "$CONF_HOME/systemd/user/$UNIT.d"
+for UNIT in $UNITS; do
+  rm -f -- "$CONF_HOME/systemd/user/graphical-session.target.wants/$UNIT" "$CONF_HOME/systemd/user/default.target.wants/$UNIT"
+  rm -rf -- "$CONF_HOME/systemd/user/$UNIT.d"
+done
 
 # 2. RealVNC's per-user files that appeared since the first install (--purge)
 if [ $PURGE = 1 ] && [ -d "$HOME/.vnc" ] && [ ! -L "$HOME/.vnc" ] && [ ! -f "$SHARE/vnc-before.list" ]; then

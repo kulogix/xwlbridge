@@ -77,13 +77,15 @@ extended-description = """\
 X11 bridge that lets RealVNC Server (user mode) and other X11 desktop tools \
 share a GNOME Wayland desktop: mutter's ScreenCast/RemoteDesktop APIs \
 (PipeWire capture, libei input) behind an X display. Includes the per-user \
-systemd service xwlbridge-realvnc.service (enable with: systemctl --user enable --now \
-xwlbridge-realvnc) and xwlbridge-ctl (run, doctor, config). RealVNC Server is not \
-included."""
+systemd services xwlbridge-realvnc.service (RealVNC Server on the bridge; \
+systemctl --user enable --now xwlbridge-realvnc) and xwlbridge.service (the \
+bridge display alone, for X11 tools), and xwlbridge-ctl (run, doctor, config, \
+migrate). RealVNC Server is not included."""
 assets = [
     ["target/release/xwlbridge", "usr/bin/", "755"],
     ["target/packaging/xwlbridge-ctl", "usr/bin/", "755"],
     ["target/packaging/xwlbridge-realvnc.service", "usr/lib/systemd/user/", "644"],
+    ["target/packaging/xwlbridge.service", "usr/lib/systemd/user/", "644"],
     ["target/packaging/xwlbridge-status.desktop", "usr/share/applications/", "644"],
     ["packaging/xwlbridge.conf", "usr/share/xwlbridge/", "644"],
     ["packaging/README.md", "usr/share/doc/xwlbridge/README.packaging.md", "644"],

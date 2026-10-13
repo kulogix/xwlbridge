@@ -100,6 +100,27 @@ PATH="$T/empty:$SYS" "$C" config unset rfb_port 2>/dev/null
 check "config unset -> default" test "$(PATH="$T/empty:$SYS" "$C" config get rfb_port)" = 5900
 check "config file mode 0600" test "$(stat -c %a "$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf")" = 600
 
+# ---- the bridge display alone (xwlbridge.service: --display), engine=xwayland
+conf "engine=builtin" "display=20" "server=/nonexistent/vncserver-x11" 'bridge_args=-fps 30'
+out=$(PATH="$T/empty:$SYS" "$C" --display command 2>"$T/err"); rc=$?
+check "--display command: bridge alone on :20 with -nowrap" bash -c '[ $2 -eq 0 ] && grep -q -- "-backend gnome -engine builtin -display 20 -fps 30 -nowrap\$" <<<"$1"' _ "$out" $rc
+check "  ...no VNC server and no -uidisplay (RealVNC not needed)" bash -c '! grep -q -- "vncserver\|-uidisplay\|-RfbPort" <<<"$1"' _ "$out"
+conf "engine=builtin" "display=auto"
+out=$(PATH="$T/empty:$SYS" "$C" --display command 2>/dev/null)
+check "--display with display=auto: the bridge picks the number" bash -c 'grep -q -- "-engine builtin -nowrap\$" <<<"$1" && ! grep -q -- "-display" <<<"$1"' _ "$out"
+conf "display=0x" "engine=builtin"
+PATH="$T/empty:$SYS" "$C" --display command >/dev/null 2>"$T/err"; rc=$?
+check "display=0x -> exit 78" bash -c '[ $1 -eq 78 ] && grep -qF "display: '"'"'0x'"'"' is not auto or a display number" "$2"' _ $rc "$T/err"
+conf "engine=xwayland" "server=$T/rvnc/vncserver-x11" "uidisplay=:5"
+out=$(cmdline "$T/empty:$SYS"); rc=$?
+check "engine=xwayland accepted and passed on" bash -c '[ $2 -eq 0 ] && grep -q -- "-engine xwayland -uidisplay :5 " <<<"$1"' _ "$out" $rc
+
+if command -v python3 >/dev/null; then
+  conf "engine=builtin" "display=20"
+  PATH="$T/empty:$SYS" "$C" --display doctor --json >"$T/doctor_disp.json" 2>/dev/null
+  check "--display doctor: no RealVNC checks, the display setting reported" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); ids=[c["id"] for c in d["checks"]]; assert not [i for i in ids if i.startswith("realvnc.") or i=="gnome.appindicator"], ids; assert any(c["id"]=="bridge.config" and "display=20" in c["summary"] for c in d["checks"])' "$T/doctor_disp.json"
+fi
+
 # ---- engine guard
 base=("server=$T/rvnc/vncserver-x11" "uidisplay=:5")
 conf "engine=auto" "${base[@]}"
@@ -226,7 +247,9 @@ esac
 exit 0
 EOS
 chmod 755 "$T/fakebin/systemctl"
-cp "$HERE/../install.sh" "$HERE/../uninstall.sh" "$HERE/../xwlbridge-realvnc.service.in" "$HERE/../xwlbridge-status.desktop.in" "$HERE/../xwlbridge.conf" "$T/pkg/bin/"
+# RealVNC Server "installed" for install.sh's service choice (realvnc when vncserver-x11 is on PATH)
+printf '#!/bin/sh\nexit 0\n' >"$T/fakebin/vncserver-x11"; chmod 755 "$T/fakebin/vncserver-x11"
+cp "$HERE/../install.sh" "$HERE/../uninstall.sh" "$HERE/../xwlbridge-realvnc.service.in" "$HERE/../xwlbridge.service.in" "$HERE/../xwlbridge-status.desktop.in" "$HERE/../xwlbridge.conf" "$T/pkg/bin/"
 before=$(cd "$H2" && find . | sort)
 out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
 check "install.sh (no root, fake user manager) rc 0" test $rc -eq 0
@@ -292,6 +315,64 @@ out=$(HOME=$T/home4 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin
 check "install --port realvnc" bash -c '[ $1 -eq 0 ] && grep -qx "rfb_port=realvnc" "$2"' _ $rc "$T/home4/.config/xwlbridge/xwlbridge.conf"
 out=$(HOME=$T/home5 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash -c 'mkdir -p "$HOME"; bash "$1" --bin "$2" --port bogus --no-start' _ "$T/pkg/bin/install.sh" "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
 check "install --port bogus -> refused" test $rc -ne 0
+
+# ---- install without RealVNC Server: the display service
+mkdir -p "$T/fakebin_norvnc"; cp "$T/fakebin/systemctl" "$T/fakebin_norvnc/"
+H10=$T/home10; mkdir -p "$H10"; : >"$T/systemctl.log"
+out=$(HOME=$H10 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin_norvnc:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start 2>&1); rc=$?
+check "install without RealVNC -> xwlbridge.service enabled" bash -c '[ $1 -eq 0 ] && grep -qx -- "--user enable xwlbridge.service" "$2" && ! grep -q -- "enable xwlbridge-realvnc.service" "$2"' _ $rc "$T/systemctl.log"
+check "  ...both units installed; the display unit runs --display run" bash -c 'grep -qx "ExecStart=$1/.local/bin/xwlbridge-ctl --display run" "$1/.config/systemd/user/xwlbridge.service" && [ -f "$1/.config/systemd/user/xwlbridge-realvnc.service" ]' _ "$H10"
+HOME=$H10 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin_norvnc:$T/empty:$SYS" bash "$H10/.local/share/xwlbridge/uninstall.sh" >/dev/null 2>&1
+check "  ...uninstall removes both units" bash -c '[ ! -e "$1/.config/systemd/user/xwlbridge.service" ] && [ ! -e "$1/.config/systemd/user/xwlbridge-realvnc.service" ]' _ "$H10"
+
+# ---- migrate: an xwlrvnc install (unit enabled and running, settings) is taken over
+mkdir -p "$T/fakemig"
+cat >"$T/fakemig/systemctl" <<'EOS'
+#!/bin/bash
+# fake `systemctl --user` with state files in $FAKE_DIR/st/<unit>.{load,enabled,active}
+log=$FAKE_DIR/mig.log; echo "$*" >>"$log"; st=$FAKE_DIR/st; mkdir -p "$st"
+get() { cat "$st/$1.$2" 2>/dev/null || echo "$3"; }
+all="$*"; u=${all##* }
+case "$all" in
+  "--user show-environment") echo "WAYLAND_DISPLAY=wayland-0";;
+  "--user show -p LoadState --value "*) get "$u" load not-found;;
+  "--user is-enabled "*) v=$(get "$u" enabled disabled); echo "$v"; [ "$v" = enabled ];;
+  "--user is-active graphical-session.target") echo inactive; exit 3;;
+  "--user is-active "*) v=$(get "$u" active inactive); echo "$v"; [ "$v" = active ];;
+  "--user disable --now "*) echo disabled >"$st/$u.enabled"; echo inactive >"$st/$u.active";;
+  "--user enable "*) echo enabled >"$st/$u.enabled";;
+  "--user daemon-reload") [ -f "$HOME/.config/systemd/user/xwlbridge-realvnc.service" ] && echo loaded >"$st/xwlbridge-realvnc.service.load";;
+  *) ;;
+esac
+exit 0
+EOS
+chmod 755 "$T/fakemig/systemctl"
+H11=$T/home11; mkdir -p "$H11/.config/xwlrvnc" "$H11/.config/systemd/user"
+printf '%s\n' '# xwlrvnc settings' 'engine=xvnc' 'rfb_port=5911' 'bridge=/opt/old/bin/xwlrvnc' 'bridge_args=-fps 30' >"$H11/.config/xwlrvnc/xwlrvnc.conf"
+: >"$H11/.config/systemd/user/xwlrvnc.service"
+mig() { HOME=$1 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$2 PATH="$T/fakemig:$T/empty:$SYS" "$C" migrate "${@:3}"; }
+F11=$T/f11; mkdir -p "$F11/st"; echo loaded >"$F11/st/xwlrvnc.service.load"; echo enabled >"$F11/st/xwlrvnc.service.enabled"; echo active >"$F11/st/xwlrvnc.service.active"
+out=$(mig "$H11" "$F11" --dry-run 2>&1); rc=$?
+check "migrate --dry-run changes nothing" bash -c '[ $1 -eq 0 ] && [ ! -e "$2/.config/xwlbridge" ] && ! grep -qE -- "--user (disable|enable) " "$3/mig.log" && grep -q "would run: systemctl --user disable --now xwlrvnc.service" <<<"$4"' _ $rc "$H11" "$F11" "$out"
+cp "$HERE/../xwlbridge-realvnc.service.in" "$T/pkg/bin/"   # the source-tree layout: the template beside the script
+out=$(mig "$H11" "$F11" --no-start 2>&1); rc=$?
+check "migrate rc 0" test $rc -eq 0
+check "  ...stopped and disabled xwlrvnc.service" grep -qx -- "--user disable --now xwlrvnc.service" "$F11/mig.log"
+check "  ...settings copied, the old binary path back to auto" bash -c 'f=$1/.config/xwlbridge/xwlbridge.conf; grep -qx engine=xvnc "$f" && grep -qx rfb_port=5911 "$f" && grep -qx bridge=auto "$f" && grep -qx "bridge_args=-fps 30" "$f" && [ "$(stat -c %a "$f")" = 600 ]' _ "$H11"
+check "  ...installed and enabled xwlbridge-realvnc.service" bash -c 'grep -qx -- "--user enable xwlbridge-realvnc.service" "$1/mig.log" && grep -q "xwlbridge-ctl run" "$2/.config/systemd/user/xwlbridge-realvnc.service"' _ "$F11" "$H11"
+check "  ...the old settings file is kept" test -f "$H11/.config/xwlrvnc/xwlrvnc.conf"
+check "  ...the migrated settings are valid" bash -c 'HOME=$1 XDG_CONFIG_HOME= PATH="$2" "$3" config show >/dev/null 2>&1' _ "$H11" "$T/empty:$SYS" "$C"
+out=$(mig "$H11" "$F11" --no-start 2>&1); rc=$?
+check "migrate again: keeps the new settings, rc 0" bash -c '[ $1 -eq 0 ] && grep -q "keeping .*xwlbridge.conf (exists)" <<<"$2"' _ $rc "$out"
+H12=$T/home12; mkdir -p "$H12"; F12=$T/f12; mkdir -p "$F12/st"
+out=$(mig "$H12" "$F12" 2>&1); rc=$?
+check "migrate with no xwlrvnc install: nothing to do, rc 0" bash -c '[ $1 -eq 0 ] && grep -q "nothing to migrate" <<<"$2"' _ $rc "$out"
+# install.sh over an xwlrvnc install takes it over once
+H13=$T/home13; mkdir -p "$H13/.config/xwlrvnc" "$H13/.config/systemd/user"; F13=$T/f13; mkdir -p "$F13/st"
+printf '%s\n' 'engine=builtin' 'rfb_port=realvnc' >"$H13/.config/xwlrvnc/xwlrvnc.conf"; : >"$H13/.config/systemd/user/xwlrvnc.service"
+echo loaded >"$F13/st/xwlrvnc.service.load"; echo enabled >"$F13/st/xwlrvnc.service.enabled"
+out=$(HOME=$H13 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$F13 PATH="$T/fakemig:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start 2>&1); rc=$?
+check "install.sh over xwlrvnc: migrated (settings kept, old unit disabled, realvnc unit enabled)" bash -c '[ $1 -eq 0 ] && grep -qx rfb_port=realvnc "$2/.config/xwlbridge/xwlbridge.conf" && grep -qx -- "--user disable --now xwlrvnc.service" "$3/mig.log" && grep -qx -- "--user enable xwlbridge-realvnc.service" "$3/mig.log"' _ $rc "$H13" "$F13"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAILN"
 [ $FAILN -eq 0 ]

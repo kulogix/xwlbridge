@@ -1,0 +1,54 @@
+# systemd user service: the xwlbridge X display alone (no VNC server), for X11
+# screen-capture, remote-desktop and automation tools on the GNOME (Wayland)
+# desktop. Display number: setting `display` in ~/.config/xwlbridge/xwlbridge.conf
+# (xwlbridge-ctl config); which display it is: xwlbridge-ctl --display show;
+# checks: xwlbridge-ctl --display doctor; logs: xwlbridge-ctl --display logs.
+[Unit]
+Description=X11 display mirroring the GNOME desktop (xwlbridge)
+Documentation=https://github.com/kulogix/xwlbridge
+# Runs inside the graphical session (mutter's remote-desktop APIs, PipeWire,
+# Xwayland), starts with it and stops with it.
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+# Back-off restarts below; give up only on a tight crash loop.
+StartLimitIntervalSec=10min
+StartLimitBurst=20
+
+[Service]
+Type=exec
+ExecStart=@BINDIR@/xwlbridge-ctl --display run
+Restart=on-failure
+RestartSec=2s
+RestartSteps=6
+RestartMaxDelaySec=2min
+# 78: settings error (fix them, then xwlbridge-ctl --display restart); 2: usage error
+RestartPreventExitStatus=78 2
+# A stop (systemctl stop, or a logout, which stops graphical-session.target)
+# exits 0: the bridge stops its X server and exits 0, so a logout leaves the
+# unit "inactive", not "failed". Any other status is a failure to restart
+# from, like 69 (X server or desktop lost) and 70 (backend failed).
+KillMode=mixed
+TimeoutStopSec=15s
+SyslogIdentifier=xwlbridge
+
+# Hardening that keeps the session bus, PipeWire, Xwayland and the X sockets
+# in /tmp/.X11-unix reachable (the same set as xwlbridge-realvnc.service).
+UMask=0077
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Runaway guard; the bridge and its X server normally use well under 300 MB.
+MemoryHigh=2G
+MemoryMax=4G
+TasksMax=1024
+# Under memory pressure, lose this before the desktop itself.
+OOMScoreAdjust=100
+
+[Install]
+WantedBy=graphical-session.target
