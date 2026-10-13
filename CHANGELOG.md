@@ -4,6 +4,11 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 
 ## Unreleased
 
+### Changed
+
+- Repeating a single-value command-line option with different values is now an error naming the option and both values. Equal values warn once per option.
+- `xwlbridge-ctl` lets `bridge_args` override generated single-value options in both display and RealVNC modes, without emitting duplicates. `doctor` and config validation warn which settings are overridden and which value is used.
+
 ### Fixed
 
 - TeamViewer's capture process (`TeamViewer_Desktop`) is a default desktop driver: its keys reach the desktop without `-xtestdrivers` naming it (the process is matched by its executable and `argv[0]`; its kernel `comm` is truncated to `TeamViewer_Desk`). Before, its keys stayed on the bridge display unless `-xtestdrivers` named it.

@@ -2,7 +2,7 @@
 
 use x11rb_protocol::protocol::xproto::Rectangle;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Geometry {
     pub width: u16,
     pub height: u16,

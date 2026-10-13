@@ -8,6 +8,12 @@
 //! case-insensitively, and value/flag handling follows the field's kind.
 //! Everything after the first non-option argument (or a `--`) is the command to
 //! run. Values may be given as `-opt value` or `-opt=value`.
+//!
+//! An option that takes a value may be repeated: the same value again is
+//! accepted with a warning (once per option), a different one is a usage error
+//! naming the option and both values. Value types must be `PartialEq` for that
+//! check (values compare as parsed, so `-opt X -opt x` is the same choice for a
+//! case-insensitive `choice`, but not for a `value` such as a path).
 
 /// A fixed-choice option value (an enum), for the `choice` field kind.
 pub trait ArgEnum: Sized + Copy {
@@ -56,51 +62,94 @@ macro_rules! arg_usage {
 
 /// Fetches an option's value: the inline `=value`, else the next argv token.
 macro_rules! take_value {
-    ($inline:ident, $argv:ident, $i:ident, $prog:ident, $field:ident) => {
+    ($inline:ident, $argv:ident, $i:ident, $field:ident) => {
         match $inline.take() {
             ::core::option::Option::Some(v) => v,
             ::core::option::Option::None => {
                 $i += 1;
                 match $argv.get($i).and_then(|a| a.to_str()) {
                     ::core::option::Option::Some(v) => v.to_string(),
-                    ::core::option::Option::None => Self::usage_error(
-                        &$prog,
-                        &format!("option -{} requires a value", opt_name!($field)),
-                    ),
+                    ::core::option::Option::None => {
+                        return ::core::result::Result::Err(format!(
+                            "option -{} requires a value",
+                            opt_name!($field)
+                        ));
+                    }
                 }
             }
         }
     };
 }
 
-/// Applies a parsed option to its field, by kind.
-macro_rules! arg_apply {
-    ($ty:ty, flag, $field:ident, $inline:ident, $argv:ident, $i:ident, $prog:ident) => {
-        $field = true;
-    };
-    ($ty:ty, value, $field:ident, $inline:ident, $argv:ident, $i:ident, $prog:ident, $vn:literal) => {{
-        let raw = take_value!($inline, $argv, $i, $prog, $field);
-        match raw.parse() {
-            ::core::result::Result::Ok(v) => $field = ::core::option::Option::Some(v),
-            ::core::result::Result::Err(_) => Self::usage_error(
-                &$prog,
-                &format!("invalid value {:?} for -{}", raw, opt_name!($field)),
-            ),
+/// The rule a repeated single-value option shares: `same` tells whether the
+/// parsed values agree (evaluated only for a repeat). Disagreement is a usage
+/// error naming the option and both values; agreement warns once per option
+/// and keeps the first value.
+macro_rules! arg_repeat {
+    ($seen:ident, $warnings:ident, $name:expr, $raw:expr, $same:expr) => {{
+        let name = $name;
+        let raw = $raw;
+        match $seen.entry(name.clone()) {
+            ::std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((raw.to_string(), false));
+            }
+            ::std::collections::hash_map::Entry::Occupied(mut e) => {
+                let (prev, warned) = e.get_mut();
+                if !$same {
+                    return ::core::result::Result::Err(format!(
+                        "option -{name} given twice with different values: {prev:?} and {raw:?}"
+                    ));
+                }
+                if !*warned {
+                    *warned = true;
+                    $warnings.push(format!(
+                        "option -{name} given twice with the same value {prev:?}"
+                    ));
+                }
+            }
         }
     }};
-    ($ty:ty, choice, $field:ident, $inline:ident, $argv:ident, $i:ident, $prog:ident, $def:literal) => {{
-        let raw = take_value!($inline, $argv, $i, $prog, $field);
+}
+
+/// Applies a parsed option to its field, by kind. `value` and `choice` options
+/// go through `arg_repeat!`, the one rule for a repeated single-value option.
+macro_rules! arg_apply {
+    ($ty:ty, flag, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident) => {
+        $field = true;
+    };
+    ($ty:ty, value, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident, $vn:literal) => {{
+        let raw = take_value!($inline, $argv, $i, $field);
+        match raw.parse() {
+            ::core::result::Result::Ok(v) => {
+                let same = $field.as_ref() == ::core::option::Option::Some(&v);
+                arg_repeat!($seen, $warnings, opt_name!($field), &raw, same);
+                $field = ::core::option::Option::Some(v);
+            }
+            ::core::result::Result::Err(_) => {
+                return ::core::result::Result::Err(format!(
+                    "invalid value {:?} for -{}",
+                    raw,
+                    opt_name!($field)
+                ));
+            }
+        }
+    }};
+    ($ty:ty, choice, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident, $def:literal) => {{
+        let raw = take_value!($inline, $argv, $i, $field);
         match <$ty as $crate::util::ArgEnum>::from_arg(&raw) {
-            ::core::option::Option::Some(v) => $field = v,
-            ::core::option::Option::None => Self::usage_error(
-                &$prog,
-                &format!(
+            ::core::option::Option::Some(v) => {
+                let same = $field == v;
+                arg_repeat!($seen, $warnings, opt_name!($field), &raw, same);
+                $field = v;
+            }
+            ::core::option::Option::None => {
+                return ::core::result::Result::Err(format!(
                     "invalid value {:?} for -{} (expected one of: {})",
                     raw,
                     opt_name!($field),
                     <$ty as $crate::util::ArgEnum>::VARIANTS.join(", "),
-                ),
-            ),
+                ));
+            }
         }
     }};
 }
@@ -126,7 +175,8 @@ macro_rules! define_config {
 
         impl $name {
             /// Parses the process arguments X11-style, exiting on `-help`,
-            /// `-version`, or a usage error.
+            /// `-version`, or a usage error. The warnings [`Self::parse_args`]
+            /// hands back (a repeated option given the same value) are logged.
             pub fn parse() -> Self {
                 let mut it = std::env::args_os();
                 let prog0 = it.next().unwrap_or_default();
@@ -134,9 +184,31 @@ macro_rules! define_config {
                     .file_name()
                     .map_or_else(|| env!("CARGO_PKG_NAME").to_string(), |s| s.to_string_lossy().into_owned());
                 let argv: Vec<std::ffi::OsString> = it.collect();
+                match Self::parse_args(&prog, &argv) {
+                    Ok((config, warnings)) => {
+                        for w in warnings {
+                            $crate::warning!("{w}");
+                        }
+                        config
+                    }
+                    Err(msg) => Self::usage_error(&prog, &msg),
+                }
+            }
 
+            /// The parser proper: `Err` is a usage error's message, `Ok` the
+            /// configuration and the warnings to log. Exits on `-help` and
+            /// `-version`.
+            pub fn parse_args(
+                prog: &str,
+                argv: &[std::ffi::OsString],
+            ) -> Result<(Self, Vec<String>), String> {
                 $( let mut $field = arg_default!($ty, $kind $(, $karg)?); )*
                 let mut command: Vec<std::ffi::OsString> = Vec::new();
+                // The first raw value each single-value option was given, and
+                // whether its repeat warning has fired (`arg_repeat!`).
+                let mut seen: std::collections::HashMap<String, (String, bool)> =
+                    std::collections::HashMap::new();
+                let mut warnings: Vec<String> = Vec::new();
 
                 let mut i = 0;
                 'next: while i < argv.len() {
@@ -156,7 +228,7 @@ macro_rules! define_config {
                         None => (body.to_ascii_lowercase(), None),
                     };
                     if name == "help" || name == "h" {
-                        print!("{}", Self::help(&prog));
+                        print!("{}", Self::help(prog));
                         std::process::exit(0);
                     }
                     if name == "version" || name == "v" {
@@ -166,16 +238,16 @@ macro_rules! define_config {
                     }
                     $(
                         if name == opt_name!($field) {
-                            arg_apply!($ty, $kind, $field, inline, argv, i, prog $(, $karg)?);
+                            arg_apply!($ty, $kind, $field, inline, argv, i, seen, warnings $(, $karg)?);
                             let _ = &mut inline;
                             i += 1;
                             continue 'next;
                         }
                     )*
-                    Self::usage_error(&prog, &format!("unknown option -{name}"));
+                    return Err(format!("unknown option -{name}"));
                 }
                 command.extend_from_slice(&argv[i..]);
-                Self { $( $field, )* command }
+                Ok((Self { $( $field, )* command }, warnings))
             }
 
             fn usage_error(prog: &str, msg: &str) -> ! {

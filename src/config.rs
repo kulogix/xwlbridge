@@ -427,3 +427,94 @@ impl Config {
         self.dynres && self.outmgr.wants_gnome()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn repeated_engine_with_different_values_is_an_error() {
+        let e = Config::parse_args("xwlbridge", &argv(&["-engine", "xvfb", "-engine", "xvnc"]))
+            .unwrap_err();
+        assert!(e.contains("-engine"), "{e}");
+        assert!(e.contains("xvfb") && e.contains("xvnc"), "{e}");
+    }
+
+    #[test]
+    fn repeated_engine_with_the_same_value_warns_once() {
+        let (c, w) = Config::parse_args(
+            "xwlbridge",
+            &argv(&["-engine", "xvfb", "-engine", "Xvfb", "-engine", "xvfb"]),
+        )
+        .unwrap();
+        assert_eq!(c.engine, EngineType::Xvfb);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("-engine") && w[0].contains("xvfb"),
+            "{}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn repeated_backend_with_different_values_is_an_error() {
+        let e = Config::parse_args(
+            "xwlbridge",
+            &argv(&["-backend", "gnome", "-backend", "wlr"]),
+        )
+        .unwrap_err();
+        assert!(e.contains("-backend"), "{e}");
+        assert!(e.contains("gnome") && e.contains("wlr"), "{e}");
+    }
+
+    #[test]
+    fn repeated_value_with_different_values_is_an_error() {
+        let e =
+            Config::parse_args("xwlbridge", &argv(&["-display", "1", "-display=2"])).unwrap_err();
+        assert!(e.contains("-display"), "{e}");
+        assert!(e.contains('1') && e.contains('2'), "{e}");
+    }
+
+    #[test]
+    fn repeated_value_with_an_equal_value_warns_once() {
+        let (c, w) = Config::parse_args(
+            "xwlbridge",
+            &argv(&["-fps", "30", "-fps", "30", "-fps", "30"]),
+        )
+        .unwrap();
+        assert_eq!(c.fps, Some(30));
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn repeated_string_value_compares_case_sensitively() {
+        let e = Config::parse_args(
+            "xwlbridge",
+            &argv(&["-xserver", "Xvfb", "-xserver", "xvfb"]),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("-xserver") && e.contains("Xvfb") && e.contains("xvfb"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn options_once_and_a_command_stay_as_they_were() {
+        let (c, w) = Config::parse_args(
+            "xwlbridge",
+            &argv(&[
+                "-engine", "xvfb", "-backend", "gnome", "--", "cmd", "-engine",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.engine, EngineType::Xvfb);
+        assert_eq!(c.backend, BackendType::Gnome);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.command, ["cmd", "-engine"].map(std::ffi::OsString::from));
+    }
+}

@@ -60,6 +60,18 @@ python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[
   { echo "test_ctl.sh needs python3 to make a unix socket" >&2; exit 2; }
 cmdline() { PATH=$1 "$C" command 2>"$T/err"; }
 has_arg() { grep -qxF -- "$1" <<<"$2"; }
+command_option() {
+  local command=$1 option=$2 expected=$3 count=0 value="" w i
+  local words=()
+  # command prints shell-quoted argv; these commands contain only test fixtures.
+  eval "words=($command)"
+  for ((i = 1; i < ${#words[@]}; i++)); do
+    w=${words[i]}
+    if [ "${w,,}" = "$option" ]; then count=$((count + 1)); value=${words[i+1]:-}
+    elif [[ ${w,,} == "$option="* ]]; then count=$((count + 1)); value=${w#*=}; fi
+  done
+  [ "$count" -eq 1 ] && [ "$value" = "$expected" ]
+}
 
 # ---- settings
 conf "engine=builtin" "rfb_port=5901" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "server_log=" "log=verbose"
@@ -120,6 +132,43 @@ if command -v python3 >/dev/null; then
   PATH="$T/empty:$SYS" "$C" --display doctor --json >"$T/doctor_disp.json" 2>/dev/null
   check "--display doctor: no RealVNC checks, the display setting reported" python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); ids=[c["id"] for c in d["checks"]]; assert not [i for i in ids if i.startswith("realvnc.") or i=="gnome.appindicator"], ids; assert any(c["id"]=="bridge.config" and "display=20" in c["summary"] for c in d["checks"])' "$T/doctor_disp.json"
 fi
+
+# ---- bridge_args overrides generated single-value options in either mode
+for mode in --display --realvnc; do
+  for args in '-engine xvnc -display=30 -backend wlr -uidisplay :5' '-EnGiNe=xvnc -DiSpLaY 30 -BaCkEnD=wlr -UiDiSpLaY=:5'; do
+    conf "engine=builtin" "backend=gnome" "display=20" "uidisplay=:6" "server=$T/rvnc/vncserver-x11" "bridge_args=$args"
+    out=$(PATH="$T/tiger:$SYS" "$C" "$mode" command 2>"$T/err"); rc=$?
+    check "$mode overrides build successfully: $args" test "$rc" -eq 0
+    for pair in 'engine xvnc' 'display 30' 'backend wlr' 'uidisplay :5'; do
+      check "$mode: exactly one -${pair% *}, user's value" command_option "$out" "-${pair% *}" "${pair#* }"
+    done
+    out=$(PATH="$T/tiger:$SYS" "$C" "$mode" run 2>"$T/err"); rc=$?
+    check "$mode: override selects the verified TigerVNC PATH" bash -c '[ "$1" -eq 0 ] && grep -qxF "XVNC=$2" <<<"$3"' _ "$rc" "$T/tiger/Xtigervnc" "$out"
+  done
+  PATH="$T/tiger:$SYS" "$C" "$mode" doctor >"$T/doctor_override" 2>/dev/null
+  for pair in 'engine builtin' 'backend gnome' 'display 20' 'uidisplay :6'; do
+    check "$mode doctor warns about ${pair% *} and bridge_args precedence" bash -c 'grep -F "[WARN] bridge_args sets -$1 " "$3" | grep -F "overrides setting $1='"'"'$2'"'"'; the bridge_args value is used"' _ "${pair% *}" "${pair#* }" "$T/doctor_override"
+  done
+  PATH="$T/tiger:$SYS" "$C" "$mode" doctor --json >"$T/doctor_override.json" 2>/dev/null
+  check "$mode doctor override warnings in JSON" python3 -c 'import json,sys; c=[c for c in json.load(open(sys.argv[1]))["checks"] if c["id"]=="bridge.args_override"]; assert len(c)==4 and all(x["status"]=="warn" and "bridge_args value is used" in x["summary"] for x in c), c' "$T/doctor_override.json"
+done
+PATH="$T/tiger:$SYS" "$C" config show >/dev/null 2>"$T/err"; rc=$?
+check "config show warns without rejecting overrides" bash -c '[ "$1" -eq 0 ] && grep -qF "warning: bridge_args sets -engine '\''xvnc'\'' and overrides setting engine='\''builtin'\''; the bridge_args value is used" "$2"' _ "$rc" "$T/err"
+PATH="$T/tiger:$SYS" "$C" config set display 21 >/dev/null 2>"$T/err"; rc=$?
+check "config validation warns about overridden settings" bash -c '[ "$1" -eq 0 ] && grep -qF "overrides setting display='\''21'\''; the bridge_args value is used" "$2"' _ "$rc" "$T/err"
+
+conf "engine=builtin" 'bridge_args=-fps "-engine"'
+out=$(PATH="$T/empty:$SYS" "$C" --display command 2>/dev/null)
+check "an option name used as another option's value is not an override" grep -q -- '-engine builtin' <<<"$out"
+conf "engine=builtin" 'bridge_args=wrapped-command -engine xvnc'
+out=$(PATH="$T/empty:$SYS" "$C" --display command 2>/dev/null)
+check "wrapped command arguments are not bridge overrides" grep -q -- '-engine builtin' <<<"$out"
+conf "engine=xvnc" "uidisplay=none" "server=$T/rvnc/vncserver-x11" 'bridge_args=-engine builtin'
+PATH="$T/tiger:$SYS" "$C" --realvnc command >/dev/null 2>"$T/err"; rc=$?
+check "effective engine override preserves builtin UI safety checks" test "$rc" -eq 78
+conf "engine=builtin" "uidisplay=:5" "server=$T/rvnc/vncserver-x11" 'bridge_args=-uidisplay none'
+PATH="$T/empty:$SYS" "$C" --realvnc command >/dev/null 2>"$T/err"; rc=$?
+check "effective uidisplay override preserves builtin UI safety checks" test "$rc" -eq 78
 
 # ---- engine guard
 base=("server=$T/rvnc/vncserver-x11" "uidisplay=:5")

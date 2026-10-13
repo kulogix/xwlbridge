@@ -57,6 +57,9 @@ declare -A CFG=(
 )
 CFG_FILE=""
 CFG_ERRORS=()
+CFG_WARNINGS=()
+BRIDGE_ARGS=()
+declare -A BRIDGE_OVERRIDES=()
 
 user_config_path() { printf '%s\n' "${XWLBRIDGE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/xwlbridge/xwlbridge.conf}"; }
 
@@ -118,6 +121,7 @@ cfg_validate() {
   for k in server_args bridge_args; do
     split_words "${CFG[$k]}" >/dev/null || CFG_ERRORS+=("$k: unbalanced quotes")
   done
+  cfg_bridge_args
 }
 
 # Splits a value into words like a shell would (quotes, backslashes), without
@@ -125,6 +129,31 @@ cfg_validate() {
 split_words() {
   [ -n "$(trim "$1")" ] || return 0
   printf '%s\n' "$1" | xargs -r printf '%s\0' 2>/dev/null
+}
+
+# Find settings-controlled options using the bridge parser's option spelling
+# and value consumption rules; never interpret arguments to a wrapped command.
+cfg_bridge_args() {
+  BRIDGE_ARGS=(); BRIDGE_OVERRIDES=(); CFG_WARNINGS=()
+  local w name value key i
+  while IFS= read -r -d '' w; do BRIDGE_ARGS+=("$w"); done < <(split_words "${CFG[bridge_args]}")
+  for ((i = 0; i < ${#BRIDGE_ARGS[@]}; i++)); do
+    w=${BRIDGE_ARGS[i]}
+    [[ $w == -* && $w != - && $w != -- ]] || break
+    name=${w%%=*}; name=${name,,}
+    case $name in
+      -display|-displayfd|-backend|-engine|-xserver|-screen|-clipboard|-outmgr|-cursor|-pwrmgr|-seat|-geometry|-fps|-xtestgrace|-pointerowner|-xtesthelpers|-xtestdrivers|-warm|-linger|-coldconnect|-coldwait|-xwayland|-uidisplay)
+        if [[ $w == *=* ]]; then value=${w#*=}
+        else i=$((i + 1)); value=${BRIDGE_ARGS[i]:-}; fi
+        case $name in
+          -engine|-backend|-display|-uidisplay) BRIDGE_OVERRIDES[${name#-}]=$value;;
+        esac;;
+    esac
+  done
+  for key in engine backend display uidisplay; do
+    [[ -v BRIDGE_OVERRIDES[$key] ]] || continue
+    CFG_WARNINGS+=("bridge_args sets -$key '${BRIDGE_OVERRIDES[$key]}' and overrides setting $key='${CFG[$key]}'; the bridge_args value is used")
+  done
 }
 
 # ---------------------------------------------------------------- X server engines
@@ -252,9 +281,10 @@ rfb_port_number() {
 # the reason in ERR on a configuration error, EX_TEMPFAIL when the desktop's X
 # display that RealVNC's windows need is not there (yet).
 build_command() {
-  CMD=(); NOTES=(); ERR=""; ENGINE=""; ENGINE_BIN=""
+  CMD=(); NOTES=("${CFG_WARNINGS[@]}"); ERR=""; ENGINE=""; ENGINE_BIN=""
   if [ ${#CFG_ERRORS[@]} -gt 0 ]; then ERR="configuration errors: ${CFG_ERRORS[*]}"; return $EX_CONFIG; fi
   local bridge server refusals engine=${CFG[engine]}
+  if [[ -v BRIDGE_OVERRIDES[engine] ]]; then engine=${BRIDGE_OVERRIDES[engine],,}; fi
   bridge=$(find_bridge) || { ERR="xwlbridge not found (bridge=${CFG[bridge]}; looked next to $SELF and on PATH)"; return $EX_CONFIG; }
   case $engine in
     auto)
@@ -271,7 +301,8 @@ build_command() {
       ENGINE_BIN=$(find_xvfb 3>/dev/null) || {
         ERR="engine=xvfb but no usable Xvfb${refusals:+ (refused: ${refusals//$'\n'/; })}: sudo apt install xvfb"
         return $EX_CONFIG; };;
-    xwayland) ;;   # the bridge finds and checks Xwayland itself
+    xwayland|builtin) ;;   # the bridge finds and checks Xwayland itself
+    *) ERR="bridge_args: invalid -engine '${BRIDGE_OVERRIDES[engine]}'"; return $EX_CONFIG;;
   esac
   ENGINE=$engine
   local w
@@ -279,11 +310,11 @@ build_command() {
     # the bridge's X display alone, for X11 tools (xwlbridge.service): no VNC server, no RealVNC UI
     CMD=("$bridge")
     case ${CFG[log]} in quiet) CMD+=(-quiet);; verbose) CMD+=(-verbose);; esac
-    [ "${CFG[backend]}" = auto ] || CMD+=(-backend "${CFG[backend]}")
-    CMD+=(-engine "$engine")
+    [[ -v BRIDGE_OVERRIDES[backend] || ${CFG[backend]} = auto ]] || CMD+=(-backend "${CFG[backend]}")
+    [[ -v BRIDGE_OVERRIDES[engine] ]] || CMD+=(-engine "$engine")
     [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
-    [ "${CFG[display]}" = auto ] || CMD+=(-display "$((10#${CFG[display]#:}))")
-    while IFS= read -r -d '' w; do CMD+=("$w"); done < <(split_words "${CFG[bridge_args]}")
+    [[ -v BRIDGE_OVERRIDES[display] || ${CFG[display]} = auto ]] || CMD+=(-display "$((10#${CFG[display]#:}))")
+    CMD+=("${BRIDGE_ARGS[@]}")
     CMD+=(-nowrap)
     return 0
   fi
@@ -295,14 +326,15 @@ build_command() {
 
   CMD=("$bridge")
   case ${CFG[log]} in quiet) CMD+=(-quiet);; verbose) CMD+=(-verbose);; esac
-  [ "${CFG[backend]}" = auto ] || CMD+=(-backend "${CFG[backend]}")
-  CMD+=(-engine "$engine")
+  [[ -v BRIDGE_OVERRIDES[backend] || ${CFG[backend]} = auto ]] || CMD+=(-backend "${CFG[backend]}")
+  [[ -v BRIDGE_OVERRIDES[engine] ]] || CMD+=(-engine "$engine")
   [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
 
   # RealVNC's own windows (vncserverui) crash on the built-in X server, every ~2 s
   # and each time with a root apport run: with engine=builtin RealVNC never runs
   # unless its windows go to the desktop's X display (research: 18,912 crashes).
   local ui=${CFG[uidisplay]} sock why=""
+  if [[ -v BRIDGE_OVERRIDES[uidisplay] ]]; then ui=${BRIDGE_OVERRIDES[uidisplay]}; fi
   if [ "$ui" = auto ]; then
     if [ -z "${DISPLAY:-}" ]; then why="no DISPLAY in the session environment"
     elif sock=$(display_socket "$DISPLAY") && [ ! -S "$sock" ]; then why="DISPLAY=$DISPLAY has no socket $sock"
@@ -312,7 +344,7 @@ build_command() {
   fi
   if [ -n "$why" ]; then
     if [ "$engine" = builtin ]; then
-      ERR="uidisplay=${CFG[uidisplay]}: $why; waiting for the desktop's Xwayland (with the built-in X server RealVNC's windows must go to the desktop: on the bridge's display they crash)"
+      ERR="uidisplay=$ui: $why; waiting for the desktop's Xwayland (with the built-in X server RealVNC's windows must go to the desktop: on the bridge's display they crash)"
       return $EX_TEMPFAIL
     fi
     if [ "$ui" = auto ]; then NOTES+=("uidisplay auto: $why; RealVNC's windows stay hidden"); ui=none; fi
@@ -323,9 +355,9 @@ build_command() {
   fi
   # always said, also "none": a bridge started from a session with a local
   # DISPLAY takes RealVNC's windows to it by default
-  CMD+=(-uidisplay "$ui")
+  [[ -v BRIDGE_OVERRIDES[uidisplay] ]] || CMD+=(-uidisplay "$ui")
 
-  while IFS= read -r -d '' w; do CMD+=("$w"); done < <(split_words "${CFG[bridge_args]}")
+  CMD+=("${BRIDGE_ARGS[@]}")
 
   # Under NoNewPrivileges (the service's hardening) RealVNC's set-uid launcher
   # cannot gain root, so start the core it would start (as -uidisplay does).
@@ -436,6 +468,7 @@ cmd_config() {
       cfg_load
       echo "# file: ${CFG_FILE:-(none: built-in defaults)}"
       local k; for k in "${CONFIG_KEYS[@]}"; do printf '%s=%s\n' "$k" "${CFG[$k]}"; done
+      local n; for n in "${CFG_WARNINGS[@]}"; do say "warning: $n"; done
       if [ ${#CFG_ERRORS[@]} -gt 0 ]; then printf '# error: %s\n' "${CFG_ERRORS[@]}"; return 1; fi;;
     get)
       [ $# -eq 1 ] || die 2 "usage: $PROG config get KEY"
@@ -452,6 +485,7 @@ cmd_config() {
       if [ "$sub" = set ]; then CFG[$key]=$val; else CFG[$key]=$(default_of "$key"); fi
       CFG_ERRORS=(); cfg_validate
       [ ${#CFG_ERRORS[@]} -eq 0 ] || die 2 "${CFG_ERRORS[*]}"
+      local n; for n in "${CFG_WARNINGS[@]}"; do say "warning: $n"; done
       local tmp; tmp=$(mktemp "${f}.XXXXXX") || exit 1
       awk -v key="$key" -v val="${val-}" -v mode="$sub" '
         BEGIN { done = 0 }
@@ -695,6 +729,7 @@ cmd_doctor() {
   fi
 
   # -------------------------------------------------------------- engines
+  local n; for n in "${CFG_WARNINGS[@]}"; do report warn bridge.args_override "$n"; done
   section "X server engine"
   local xv xvf refus selected
   refus=$(find_xvnc 3>&1 >/dev/null) || true
