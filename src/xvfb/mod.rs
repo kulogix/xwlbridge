@@ -1221,12 +1221,11 @@ impl Agent {
                 xinput::EventMask {
                     deviceid: xinput::Device::ALL_MASTER.into(),
                     mask: vec![
-                        (xinput::XIEventMask::RAW_KEY_PRESS
+                        xinput::XIEventMask::RAW_KEY_PRESS
                             | xinput::XIEventMask::RAW_KEY_RELEASE
                             | xinput::XIEventMask::RAW_BUTTON_PRESS
                             | xinput::XIEventMask::RAW_BUTTON_RELEASE
-                            | xinput::XIEventMask::RAW_MOTION)
-                            .into(),
+                            | xinput::XIEventMask::RAW_MOTION,
                     ],
                 },
                 // devices coming and going (a new master brings its own
