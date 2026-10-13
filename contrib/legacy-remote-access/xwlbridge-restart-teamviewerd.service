@@ -1,0 +1,8 @@
+# /etc/systemd/system/xwlbridge-restart-teamviewerd.service (system unit; started by the .path unit)
+[Unit]
+Description=xwlbridge: restart teamviewerd for a new display :20
+After=teamviewerd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '[ -S /tmp/.X11-unix/X20 ] && sleep 2 && systemctl try-restart teamviewerd.service || true'

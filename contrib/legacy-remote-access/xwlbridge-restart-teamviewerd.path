@@ -1,0 +1,15 @@
+# /etc/systemd/system/xwlbridge-restart-teamviewerd.path (system unit; TeamViewer-specific; Ubuntu/Debian)
+# When the bridge display :20 is (re)created -- a bridge restart, a new login -- restart teamviewerd. After its GUI
+# died with the old X server, TeamViewer 15.20 keeps that GUI's (empty) X authority for the session and refuses every
+# new connection ("Unable to get XAuth ... cannot open display") until the daemon restarts.
+# Not on RHEL 10: SELinux denies systemd a watch on that socket; use teamviewerd-restart.polkit.rules.in and
+# xwlbridge-service-restart-teamviewerd.conf there.
+[Unit]
+Description=xwlbridge: restart teamviewerd when display :20 appears
+
+[Path]
+PathChanged=/tmp/.X11-unix/X20
+Unit=xwlbridge-restart-teamviewerd.service
+
+[Install]
+WantedBy=multi-user.target

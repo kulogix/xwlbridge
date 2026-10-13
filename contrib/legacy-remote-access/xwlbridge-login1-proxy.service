@@ -1,0 +1,20 @@
+# /etc/systemd/system/xwlbridge-login1-proxy.service (system unit, runs as root)
+# A system-bus proxy that reports the GNOME Wayland console session as an X11 session on the bridge display :20
+# (logind Session.Type "wayland" -> "x11", Display "" -> ":20"; every other message byte for byte). Each
+# connection is served with the connecting process's own uid. For the vendor daemon's mount namespace only: see
+# teamviewerd-xwlbridge.conf. Any daemon that picks X11 vs Wayland from logind.
+[Unit]
+Description=xwlbridge: logind Session.Type proxy (wayland -> x11, Display :20) for X11-only remote-access daemons
+Before=teamviewerd.service
+
+[Service]
+RuntimeDirectory=xwlbridge-login1
+RuntimeDirectoryMode=0755
+# keep the directory across restarts: the vendor daemon has it bind-mounted
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/python3 /usr/local/lib/xwlbridge-contrib/login1_x11_proxy_mu.py /run/xwlbridge-login1/system_bus_socket :20
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

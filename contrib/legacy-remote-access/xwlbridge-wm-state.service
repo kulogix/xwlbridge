@@ -1,0 +1,20 @@
+# ~/.config/systemd/user/xwlbridge-wm-state.service (user unit)
+# ICCCM WM_STATE on the top-level windows of the bridge display :20, as a window manager would set it. Bound to
+# xwlbridge.service (the bridge display alone, packaging/), so it restarts with the display. On RHEL 10, which has no
+# python3-xlib, use wm_state_ctypes.py instead of wm_state.py.
+[Unit]
+Description=xwlbridge: ICCCM WM_STATE for top-level windows on display :20
+PartOf=graphical-session.target
+After=xwlbridge.service
+BindsTo=xwlbridge.service
+
+[Service]
+ExecStartPre=/bin/sh -c 'for i in $(seq 50); do [ -S /tmp/.X11-unix/X20 ] && exit 0; sleep 0.2; done; exit 1'
+ExecStart=/usr/bin/python3 %h/.local/lib/xwlbridge-contrib/wm_state.py :20
+Restart=always
+RestartSec=2
+
+[Install]
+# not graphical-session.target: with After=xwlbridge.service that is an ordering cycle, which systemd resolves by
+# dropping this unit at every login
+WantedBy=xwlbridge.service
