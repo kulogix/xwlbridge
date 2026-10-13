@@ -38,10 +38,32 @@ Other VNC server implementations have not been tested.
 
 This also works well for some other tools, e.g., ffmpeg x11grab.
 
+##### Other X tools
+
+Programs the bridge starts get its `DISPLAY` and are kept off the Wayland compositor: `WAYLAND_DISPLAY` is
+removed and each toolkit's own switch is set to X11 (`GDK_BACKEND`, `QT_QPA_PLATFORM`, `SDL_VIDEODRIVER`,
+`ELECTRON_OZONE_PLATFORM_HINT`, `MOZ_ENABLE_WAYLAND`, `CLUTTER_BACKEND`, `WINIT_UNIX_BACKEND`, and
+`XDG_SESSION_TYPE=x11`, which Electron 38+ and GLFW go by). Removing `WAYLAND_DISPLAY` alone is not enough:
+libwayland then uses `wayland-0`, and GTK goes there. Measured: GTK 3/4, Qt 5/6, SDL 2/3, Electron 37, Java and
+Tk open the bridge's display; Firefox, Clutter, GLFW, winit and Electron 38+ were not measured (winit 0.29+ has no
+switch and relies on `WAYLAND_DISPLAY` being absent). To start a tool by hand on a running bridge's display with the
+same environment:
+
+```bash
+xwlrvnc run -- xdotool getmouselocation
+xwlrvnc run -display 20 -- scrot shot.png   # when several bridges run
+eval "$(xwlrvnc run -print)"                # a shell for bridge tools only
+```
+
+Programs whose own windows you want to see (OBS, SimpleScreenRecorder, viewers) stay on the desktop and point
+only their capture at the bridge's display; see [split display](./docs/split-display.md).
+
 ### Documentation
 
 - [Troubleshooting](./docs/troubleshooting.md)
 - [Testing](./docs/testing.md)
+- [RealVNC's own UI on a GNOME desktop (`-uidisplay`)](./docs/realvnc-gnome.md)
+- [Programs with their own windows: the split display](./docs/split-display.md)
 
 ### Features
 
@@ -87,7 +109,7 @@ The core VNC features, plus some RealVNC extensions work correctly and have been
 Some things are out-of scope:
 
 - I do not plan to implement any UI features.
-  - Status/connection/cloud windows (to configure RealVNC, just temporarily start vncserver-x11 under Xwayland or use the config files/flags).
+  - Status/connection/cloud windows (to configure RealVNC, just temporarily start vncserver-x11 under Xwayland or use the config files/flags; started from the desktop session, xwlrvnc puts RealVNC's own UI, tray icon included, on the desktop's Xwayland (`-uidisplay`, on by default for `vncserver-x11`): see [docs/realvnc-gnome.md](./docs/realvnc-gnome.md)).
   - Protocol extensions:
     - Chat.
     - Tray icon.
@@ -103,9 +125,12 @@ The fake X server implements:
 - Big-Requests (larger request sizes).
 - MIT-SHM (shared memory segments for screen capture).
 - XTest (input injection).
+- Requests generic X tools make, answered so that they don't die of an X error: `Bell` rings the compositor's system bell (`xdg_system_bell_v1`, if it has one); passive key and button grabs are accepted but never fire (the desktop's keys don't come through this server); screen-saver settings and gamma ramps are kept and read back, but nothing is blanked or recoloured.
 - XFixes (clipboard, cursor, geometry helpers).
-- XRandR (monitor layout).
+- XRandR (monitor layout: an output per compositor output, with the modes the compositor offers for it where it says, and a RandR 1.5 monitor named after each).
 - XDamage (screen damage tracking).
+- XKEYBOARD, read-only: the compositor's keymap (the layout of its current input source) as an XKB description, so Xlib's keysym handling, `xdotool`, `setxkbmap -query`/`-print`, `xkbcomp -xkb $DISPLAY` and toolkits that read the keymap through XKB (libxkbcommon-x11) work. The keyboard is the compositor's: requests that would change it fail with BadImplementation, but spare keycodes take keysyms (xdotool's and x11vnc's way to type a keysym they find nowhere else), which the bridge types through the layout. `-noxkb` hides the extension.
+- `WarpPointer`, which moves the desktop's pointer like an XTest motion (`xdotool mousemove`).
 
 I've tested this against niri 26.04 (with wl-uinput-proxy, and with [niri-wm/niri#4548](https://github.com/niri-wm/niri/pull/4548)/[niri-wm/niri#4554](https://github.com/niri-wm/niri/pull/4554)), sway 1.11, labwc 0.9.6, and cage 0.3.1.
 
