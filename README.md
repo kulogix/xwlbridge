@@ -1,7 +1,7 @@
 # xwlbridge — X11 ⇄ Wayland desktop bridge
 
 **xwlbridge is an X display that mirrors your Wayland desktop, so X11 screen-capture, remote-desktop and automation tools work on Wayland-only systems (GNOME first).**
-Screen recorders, VNC servers, remote-support tools and automation scripts written for X11 capture and control the real GNOME desktop through it. There is no portal prompt and no X session.
+Screen recorders, VNC servers, remote-support tools and automation scripts written for X11 capture and control the real GNOME desktop through it. It needs no portal prompt and no X11 (Xorg) login session.
 
 ```
 X11 tool (x11vnc, RealVNC, OBS XSHM, ffmpeg x11grab, xdotool, PyAutoGUI, Java Robot, ...)
@@ -72,7 +72,7 @@ Only XTest meant for the desktop is forwarded. `-xtesthelpers` and `-xtestdriver
 | 47 (Fedora 41) | real session in a VM | works |
 | 46 (Ubuntu 24.04: 46.2) | real session in a VM, container smoke 9/9 | works; the cursor is drawn into the picture (cursor metadata can crash mutter 46) |
 | 45 and older (RHEL 9: mutter 40) | package inspection | not supported: no ConnectToEIS, picture without input; use GNOME on Xorg there |
-| labwc 0.9 (Raspberry Pi OS, Debian 13, aarch64, Pi 5) | native build, headless labwc tests | wlr backend + builtin works; `-engine xwayland` 18/18 in a labwc container |
+| labwc 0.9 (Raspberry Pi OS, Debian 13, aarch64, Pi 5) | native build, headless labwc tests | wlr backend + builtin works; `-engine xwayland` 17-18 of 18 checks per run in a labwc container |
 | sway and other wlroots compositors | upstream backend | not re-tested in this fork beyond labwc |
 | KDE Plasma | – | not supported (no backend) |
 
@@ -80,7 +80,7 @@ Where GNOME on Xorg still exists (Ubuntu 24.04, Debian 13, RHEL 9), X11 tools wo
 
 ## Install
 
-Recommended: the release bundle `xwlbridge-<version>-x86_64-<distro>.tar.gz` and its `.sha256`. Run as the desktop user, no sudo.
+Recommended: the release bundle `xwlbridge-<version>-x86_64-<distro>.tar.gz` and its `.sha256` from the [Releases page](https://github.com/kulogix/xwlbridge/releases). Run as the desktop user, no sudo.
 
 ```sh
 sha256sum -c xwlbridge-*.tar.gz.sha256
@@ -89,7 +89,7 @@ tar xzf xwlbridge-*.tar.gz && cd xwlbridge-*/
 ~/.local/bin/xwlbridge-ctl doctor
 ```
 
-`install.sh` installs `~/.local/bin/xwlbridge` and `xwlbridge-ctl`, both systemd user units, the settings file `~/.config/xwlbridge/xwlbridge.conf` and an app-grid entry, then runs the doctor. On Ubuntu, `~/.local/bin` is on PATH only after the next login. The bundle's x86_64 binary needs glibc >= 2.39. Uninstall: `~/.local/share/xwlbridge/uninstall.sh`.
+`install.sh` installs `~/.local/bin/xwlbridge` and `xwlbridge-ctl`, both systemd user units, the settings file `~/.config/xwlbridge/xwlbridge.conf` and an app-grid entry, then runs the doctor. The doctor checks the service that `install.sh` enabled (`--display` or `--realvnc` names one). On Ubuntu, `~/.local/bin` is on PATH only after the next login. The bundle's x86_64 binary needs glibc >= 2.39. Uninstall: `~/.local/share/xwlbridge/uninstall.sh`.
 
 Build from source (Ubuntu 24.04/26.04, Debian 13 shown; Rust is pinned by `rust-toolchain.toml`):
 
@@ -99,7 +99,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 . "$HOME/.cargo/env"
 git clone https://github.com/kulogix/xwlbridge && cd xwlbridge
 rustup toolchain install
-cargo build --release --features gnome,xvfb
+cargo build --profile dist --features gnome,xvfb   # stripped; --release keeps debug info (about 190 MB)
 sudo apt install xwayland x11-xkb-utils           # runtime: Xwayland, xkbcomp for the stock engines
 packaging/install.sh                              # the same per-user install as the bundle's
 ```
@@ -114,15 +114,23 @@ xwlbridge -backend gnome -engine builtin xdpyinfo | grep -E 'name of display|dim
 
 ## Quick start
 
-```sh
-# a bridge display :20 for your X11 tools
-xwlbridge -backend gnome -engine xvnc -display 20 -nowrap &
+`install.sh` has already started a bridge display: `xwlbridge.service`, or `xwlbridge-realvnc.service` when RealVNC Server is installed. Run X11 tools on it:
 
-# run an X tool on it
+```sh
 xwlbridge run -- xdotool getmouselocation
+xwlbridge run -- sh -c 'echo "$DISPLAY"'     # the bridge's display, for tools that take it as an argument
 ```
 
 `xwlbridge run` finds the running bridge, sets the engine's cookie, hides Wayland and pins toolkits (GTK, Qt, SDL, Electron, Firefox, Clutter, winit) to X11. `xwlbridge run -print` prints that environment.
+
+A bridge of your own, without the services: when more than one bridge runs, `xwlbridge run` needs `-display N`.
+
+```sh
+xwlbridge -backend gnome -engine xvnc -display 20 -nowrap &
+xwlbridge run -display 20 -- xdotool getmouselocation
+```
+
+`-engine xvnc` needs TigerVNC's Xvnc (`sudo apt install tigervnc-standalone-server`; Fedora: `tigervnc-server-minimal`). `-engine builtin` needs no extra package and `-engine xwayland` only Xwayland.
 
 Packaged services (two systemd user units):
 
@@ -142,7 +150,7 @@ The GNOME remote-desktop session runs on demand. It runs while an X client watch
 | flag | meaning |
 |---|---|
 | `-warm secs\|always` | keep the session this long after the last activity (default 10 s) |
-| `-linger secs` | keep it this long after a screen reader client went away (default 30 s) |
+| `-linger secs` | keep it this long after an X client that read the screen (a screenshot tool) went away (default 30 s) |
 | `-alwayson` | same as `-warm always` |
 | `-coldconnect none\|start` | stock engines: a client that connects while the session is stopped starts it at once (default `start`) |
 | `-coldwait ms` | builtin: a screen read may wait this long while the session starts (default 2000) |
@@ -186,14 +194,14 @@ RHEL/AlmaLinux 10.
 
 Prefer OBS's own Screen Capture (PipeWire) source when it is enough. For OBS's X11 capture, run OBS on the desktop and
 point only its capture at the bridge display: `QT_QPA_PLATFORM=xcb obs`, a Screen Capture (XSHM) source, Advanced
-Settings, X Server = `:20`. Tested with the xvnc engine (OBS 32.1, containers); on GNOME's Xwayland the same source
+Settings, X Server = the bridge's display (`xwlbridge run -- sh -c 'echo "$DISPLAY"'` prints it, for example `:2`). Tested with the xvnc engine (OBS 32.1, containers); on GNOME's Xwayland the same source
 records black. Details: [docs/no-split.md](docs/no-split.md).
 
 ### ffmpeg and GStreamer
 
 ```sh
-ffmpeg -f x11grab -framerate 30 -i :20 desktop.mkv          # ffmpeg takes the display as an argument
-gst-launch-1.0 ximagesrc display-name=:20 ! videoconvert ! x264enc tune=zerolatency ! matroskamux ! filesink location=desktop.mkv
+xwlbridge run -- sh -c 'ffmpeg -f x11grab -framerate 30 -i "$DISPLAY" desktop.mkv'   # ffmpeg takes the display as an argument
+xwlbridge run -- gst-launch-1.0 ximagesrc ! videoconvert ! x264enc tune=zerolatency ! matroskamux ! filesink location=desktop.mkv
 ```
 
 ffmpeg x11grab (30 frames) was tested on Ubuntu 26.04 and with EPEL's ffmpeg-free on AlmaLinux 10.2.
@@ -216,7 +224,7 @@ xwd, scrot, import and maim work on the bridge. On the stock engines see the one
 
 ### X11-only remote-access apps
 
-TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021) worked through the bridge on Ubuntu 26.04 and AlmaLinux 10.2, with helpers from `contrib/legacy-remote-access/` and `-xtestdrivers default,TeamViewer_Desktop`. Old builds have known security holes. See [docs/legacy-remote-access-apps.md](docs/legacy-remote-access-apps.md).
+TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021) worked through the bridge on Ubuntu 26.04 and AlmaLinux 10.2, with helpers from `contrib/legacy-remote-access/` (in a clone of this repository; the release bundle does not contain them) and `-xtestdrivers default,TeamViewer_Desktop`. Old builds have known security holes. See [docs/legacy-remote-access-apps.md](docs/legacy-remote-access-apps.md).
 
 ### Keeping an X app entirely on the bridge
 
@@ -224,7 +232,7 @@ TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021
 
 ### Accessibility
 
-`tools/x11-a11y-proxy` shows windows of an app running on the bridge as GNOME windows with accessible objects, for Orca. See [docs/accessibility.md](docs/accessibility.md).
+`tools/x11-a11y-proxy` shows windows of an app running on the bridge as GNOME windows with accessible objects, for Orca. It is in a clone of this repository, not in the release bundle, and needs `python3-gi gir1.2-gtk-4.0 gir1.2-atspi-2.0 python3-xlib dbus` (Ubuntu/Debian). See [docs/accessibility.md](docs/accessibility.md).
 
 ### Input Leap / Barrier, conferencing apps
 
@@ -232,14 +240,16 @@ Input Leap/Barrier server: does not work, because X clients never see the local 
 
 ## Coming from xwlrvnc
 
-Names changed: binary `xwlrvnc` → `xwlbridge`, `xwlrvnc-ctl` → `xwlbridge-ctl`, `xwlrvnc.service` → `xwlbridge-realvnc.service`, `~/.config/xwlrvnc` → `~/.config/xwlbridge`, `XWLRVNC_*` → `XWLBRIDGE_*`. The lock-screen extension UUID is now `xwlbridge-lockscreen@xwlbridge`; re-enable it.
+From upstream xwlrvnc (`cargo install xwlrvnc`, run as `xwlrvnc vncserver-x11` on a wlroots compositor): replace `xwlrvnc` with `xwlbridge` in your command, for example `xwlbridge vncserver-x11`. Upstream's flags still work, and `-backend auto` picks the wlroots backend there. `cargo uninstall xwlrvnc` removes the old binary. On GNOME, use the packaged services instead (see [Install](#install)). The X vendor string is now `xwlbridge`. Upstream has no control script, unit or settings directory, so there is nothing to migrate.
+
+From a pre-release package of this fork: before 0.1.0 those unpublished packages also used the name xwlrvnc. Their names changed: `xwlrvnc-ctl` → `xwlbridge-ctl`, `xwlrvnc.service` → `xwlbridge-realvnc.service`, `~/.config/xwlrvnc` → `~/.config/xwlbridge`, `XWLRVNC_*` → `XWLBRIDGE_*`. The lock-screen extension UUID is now `xwlbridge-lockscreen@xwlbridge`; re-enable it. Move such an install with:
 
 ```sh
 xwlbridge-ctl migrate --dry-run
 xwlbridge-ctl migrate
 ```
 
-`install.sh` runs it once when it finds an xwlrvnc install.
+`install.sh` runs it once when it finds such an install.
 
 ## Security
 

@@ -30,8 +30,8 @@ RealVNC is licensed.
   tested there.
 - After the rename to xwlbridge: RealVNC Server 6.11 next to x11vnc on one display (four viewers, concurrent input),
   21/21 checks on the builtin, xvnc and xvfb engines; the picture/typing/scrolling/cursor/monitor-change checks
-  12/12 on builtin and 11/12 on xvnc and xvfb (the miss: a click-latency bound of 60 ms at the 95th percentile, 70 ms
-  measured on a heavily loaded host).
+  11 or 12 of 12 per engine and run (the miss: a click-latency bound of 60 ms at the 95th percentile, about 70 ms
+  measured on a heavily loaded host; the final binary made 11/12 on all three engines).
 - **Not tested**: RealVNC installed from its own .deb or .rpm (the tests used a copy of a licensed install), and with
   it RealVNC's system service on port 5900 and install.sh's automatic choice of port 5901.
 - **RealVNC Server 7.17 (unlicensed)**: starts and shows its UI on GNOME the same way, but it accepts no viewers
@@ -201,7 +201,7 @@ use the tray icon, `xwlbridge-ctl show` or the **VNC Server (Wayland desktop)** 
   ```sh
   sudo firewall-cmd --permanent --add-service=vnc-server
   sudo firewall-cmd --reload
-  # another port: sudo firewall-cmd --permanent --add-port=5911/tcp && sudo firewall-cmd --reload
+  # another port: sudo firewall-cmd --permanent --add-port=5910/tcp && sudo firewall-cmd --reload
   ```
 
 - Ubuntu has no firewall on by default (ufw users: `sudo ufw allow 5900/tcp`). Fedora Workstation's default zone

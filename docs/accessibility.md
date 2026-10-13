@@ -7,7 +7,7 @@ This page is for screen-reader users who run X apps that live on the bridge's di
 
 See [../tools/x11-a11y-proxy/README.md](../tools/x11-a11y-proxy/README.md) for the proxy itself.
 
-The proxy is a GNOME-side program (Python + GTK 4, MIT). It needs the `xvnc` or `xvfb` engine (the engines `-a11ybus` and `-reverseinput` are made for). It shows each X top-level window of an app as a GNOME window with live pixels. The window holds accessible GTK objects generated from the app's AT-SPI tree. The proxy reads that tree on the engine's private bus (`-a11ybus`). Keyboard and pointer go to the app through the bridge's `-reverseinput` master.
+The proxy is a GNOME-side program (Python + GTK 4, MIT). It needs a stock engine: `-a11ybus` and `-reverseinput` work on `xvnc`, `xvfb` and `xwayland` (the measurements below used `xvnc`). It shows each X top-level window of an app as a GNOME window with live pixels. The window holds accessible GTK objects generated from the app's AT-SPI tree. The proxy reads that tree on the engine's private bus (`-a11ybus`). Keyboard and pointer go to the app through the bridge's `-reverseinput` master.
 
 GNOME's accessibility settings (high contrast, text scaling, cursor size, reduced motion) are mirrored into the engine as XSETTINGS (the same 53 keys gsd-xsettings publishes on GNOME 50's Xwayland) and as X resources.
 
@@ -15,7 +15,13 @@ Apps without an accessibility tree (Tk, Xt/Athena such as xcalc, Motif) get one 
 
 ## Quick start
 
+The proxy is in a clone of this repository (`git clone https://github.com/kulogix/xwlbridge`), not in the release
+bundle. Run these from the clone. `-engine xvnc` needs TigerVNC's Xvnc. Packages on Ubuntu/Debian (RHEL/AlmaLinux 10:
+`python3-gobject gtk4 at-spi2-core`, plus `pip install --user python-xlib` because no repository packages python-xlib
+there, and `-engine xwayland` instead of xvnc):
+
 ```sh
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-atspi-2.0 python3-xlib dbus tigervnc-standalone-server
 xwlbridge -backend gnome -engine xvnc -display 20 -a11ybus -reverseinput -nowrap &
 tools/x11-a11y-proxy/x11-a11y-proxy --display :20 -- APP
 ```

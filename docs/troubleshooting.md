@@ -6,7 +6,7 @@ This is the first thing you should check if you have issues.
 
 Ensure `WAYLAND_DISPLAY` is set.
 
-Ensure your compositor implements the protocols specified in the [README](../README.md#compositor-requirements).
+With `-backend wlr`, ensure your compositor implements the protocols listed under [How it works](../README.md#how-it-works) in the README (wlr-screencopy or ext-image-copy-capture, virtual pointer and keyboard, data-control). `-backend gnome` uses mutter's D-Bus APIs instead; `xwlbridge-ctl doctor` checks them.
 
 Missing protocols will usually just cause the corresponding feature to become a no-op.
 
@@ -20,7 +20,7 @@ If the local display is asleep (e.g., swayidle turned it off), the compositor ca
 
 With `-backend gnome`, the same is done through mutter's `org.gnome.Mutter.DisplayConfig` `PowerSaveMode` (`-pwrmgr auto` or `gnome`, the default, so this is on unless `-pwrmgr none` is given): the screen is turned on when a remote desktop session starts and when it goes into power save while one runs. When the viewers have gone (and when xwlbridge exits or is stopped by a signal) and mutter saw no input at all since then (no local user, no remote input), the power save mode it was in is set again; otherwise it is left on for the idle policy (gsd-power) to handle. Note that on a real gnome-shell an idle session also raises the screen shield, which blocks remote access until it is dismissed, so this mostly matters where the shield is not involved.
 
-KDE and GNOME are not currently supported since they prefer to use [`org.freedesktop.portal.RemoteDesktop`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) via [xdg-desktop-protocol](https://flatpak.github.io/xdg-desktop-portal/), which uses [PipeWire](https://pipewire.org/) for screen capture and [libei](https://libinput.pages.freedesktop.org/libei/) for virtual input.
+GNOME is supported through mutter's own D-Bus APIs (`-backend gnome`), without the portal. KDE Plasma is not supported (there is no backend for it): it prefers [`org.freedesktop.portal.RemoteDesktop`](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html) via [xdg-desktop-protocol](https://flatpak.github.io/xdg-desktop-portal/), which uses [PipeWire](https://pipewire.org/) for screen capture and [libei](https://libinput.pages.freedesktop.org/libei/) for virtual input.
 
 ### Ensuring the X server works with Xlib
 
@@ -86,8 +86,6 @@ xwlbridge sh -c "echo '> copy'; date | tee /dev/stderr | WAYLAND_DISPLAY=$WAYLAN
 # note: if you see "screen capture started" after "capture", increase the sleep time
 xwlbridge -verbose -profile sh -c "for x in 1 2 3; do echo \$x; xwd -root -silent >/dev/null; sleep 1; done; echo capture; xwd -root -silent | magick xwd:- png:/tmp/screen.png"
 
-# TODO: test clipboard events both ways
-# TODO: test commands for xfixes, xdamage, etc?
 ```
 
 ### Log messages
@@ -146,8 +144,6 @@ With `-backend gnome` and the stock engines (`-engine xvnc`/`xvfb`):
 - `xvfb: can't upload the compositor keymap ... (retrying)`: `xkbcomp` failed or is missing (package
   `x11-xkb-utils`); until it succeeds, X clients see a US keyboard and type wrong characters on other layouts.
 
-<!-- TODO: I should add a lot more logging, especially around wayland protocol selection -->
-
 Exit status, for a service manager (use `Restart=on-failure`): the wrapped command's own status normally; **69** when
 what xwlbridge mirrors is gone for good: the stock X server of `-engine xvfb|xvnc` died (also when the wrapped
 command, an X client, exited first because its display went), or (GNOME) the session bus closed xwlbridge's
@@ -201,7 +197,7 @@ script that exits 0 then.
 
 ### Dynamic resolution
 
-Dynamic resolution needs `-dynres`, a compositor which supports `zwlr_output_manager_v1` (selected with `-outmgr`, default `auto`), and for RealVNC, the [hook](../dynres/README.md). It is meant for a headless or nested compositor (e.g., `WLR_BACKENDS=headless sway`), where the output supports arbitrary modes.
+Dynamic resolution needs `-dynres`. With `-backend wlr` it also needs a compositor which supports `zwlr_output_manager_v1` (selected with `-outmgr`, default `auto`), and for RealVNC, the [hook](../dynres/README.md); GNOME uses DisplayConfig instead (see [GNOME](#gnome) below). On wlroots it is meant for a headless or nested compositor (e.g., `WLR_BACKENDS=headless sway`), where the output supports arbitrary modes.
 
 When X client (vncagent-x11, or `xrandr`) sets the CRTC to a new mode, xwlbridge attempts to change the output's mode and waits for it before replying to the X request.
 
@@ -255,7 +251,6 @@ Try `-profile` with and without `-nodamage`.
 
 Note that RealVNC, by default, tests XDAMAGE for 6 seconds at startup if available and will only continue to use it if enough updates are seen and it's faster than it's own damage tracking. You can also force it with the [`CaptureMethod`](https://help.realvnc.com/hc/en-us/articles/360002251297-RealVNC-Server-Parameter-Reference) vncserver parameter.
 
-TODO: more info
 
 ### New RealVNC versions
 
@@ -369,7 +364,7 @@ point only their capture here (docs/no-split.md).
   Yes, use the `-Monitor` RealVNC parameter. The XRandR output names match Wayland (you can check them with your compositor, or using `xwlbridge xrandr --query`).
 
 - **Can I run multiple instances of RealVNC?** \
-  Yes, use the `-RfbPort` parameter to change the listen port, and also add `-newinstance` to the end of the `vncserver-x11` command.
+  Not with the packaged service: RealVNC runs one user-mode server per user, and a second one exits with `Existing server found; exiting.` (see [realvnc-server-6.md](realvnc-server-6.md)). Upstream's answer, for bridges you start by hand on a wlroots compositor, was to give each `vncserver-x11` its own `-RfbPort` and add `-newinstance` to the end of its command; this fork has not tested that.
 
 - **Which injected (XTest) input reaches the desktop?** (`-engine xvfb`/`xvnc`) \
   Input an X client injects is meant either for the desktop or for windows that live on the bridge's own display (a tray proxy such as KDE's `xembedsniproxy` clicking an icon, Xpra's server, `xdotool` typing into a window it focused there). The agent tells them apart per client, through RECORD:
@@ -391,5 +386,3 @@ point only their capture here (docs/no-split.md).
 
 - **How does the clipboard work on GNOME with a stock engine?** \
   With `-engine xvfb`/`xvnc` and the desktop's Xwayland reachable (xwlbridge started from the session, with its `DISPLAY`), `-clipboard auto` relays selections X to X between the bridge display and GNOME's Xwayland, which mutter keeps in step with the Wayland clipboard: every type the owner offers (text, images, HTML, ...), CLIPBOARD and PRIMARY, large values in steps (INCR, up to 64 MiB), and no screen-sharing session or indicator needed. Every client of the bridge display can read and set the desktop's clipboard at any time, as any Xwayland client can; the bridge display lets in only the desktop user (by uid, or its cookie). `-clipboard session` uses mutter's remote-desktop clipboard instead (text only, CLIPBOARD only, only while a session runs), as the built-in engine does. The relay stays connected to the desktop's Xwayland, so where mutter closes Xwayland when no X client is left (`autoclose-xwayland`) it keeps it running (about 60 MB). Values in transit are capped at 128 MiB; an owner that doesn't answer a conversion is asked again every 0.4 s for up to 10 s (xclip, for one, ignores other requests while a clipboard manager reads a large value from it).
-
-- TODO: more

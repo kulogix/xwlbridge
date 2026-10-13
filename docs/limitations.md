@@ -23,7 +23,7 @@ These are the known limits of xwlbridge 0.1.0.
 | KDE Plasma has no backend. | KDE | None. |
 | The default (no-feature) build has only the wlroots backend. | Source builds | Build with `--features gnome`. |
 | `rfb_port` and `server_args` go on RealVNC's command line, which RealVNC forgets on reload (measured: `rfb_port=5901` went back to 5900). | RealVNC service | Set parameters in `~/.vnc/config.d/vncserver-x11` and use `rfb_port=realvnc`. Not changed in this release. |
-| `-engine xwayland`: a few percent of frames can be torn in fast motion. | `xwayland` engine | The next update corrects it. |
+| `-engine xwayland`: a few percent of frames can be torn in fast motion. | `xwayland` engine | Known; not fixed in 0.1.0. |
 
 ## Not tested
 

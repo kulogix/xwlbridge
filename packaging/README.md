@@ -70,7 +70,7 @@ this user-mode setup is what shares the desktop. Choose one:
 1. **Disable the system service** (viewers keep connecting to port 5900):
 
         sudo systemctl disable --now vncserver-x11-serviced
-        xwlbridge-ctl config set rfb_port 5900 && xwlbridge-ctl restart
+        xwlbridge-ctl config set rfb_port realvnc && xwlbridge-ctl restart   # RealVNC's RfbPort: 5900 unless set
 
 2. **Keep it**, and serve the desktop on another port (no root needed): viewers
    connect to `host:5901` (RealVNC Viewer: `host::5901`).
@@ -91,8 +91,8 @@ RealVNC's system service holds 5900).
   builtin, 5 xvnc, one of them without its clipboard and CPU phases; host load
   average 100-140): the same click-to-picture
   latency (median p50 45.6 ms builtin vs 44.0 ms xvnc, p95 69 vs 70 ms), the
-  same functional and clipboard results (Gate 5 functional checks and the four
-  Gate 7 clipboard paths through RealVNC: all pass on both), about the same CPU
+  same functional and clipboard results (the release tests' functional checks
+  and the four clipboard paths through RealVNC: all pass on both), about the same CPU
   while an animation is watched (median 16 vs 17 % of a core for the stack),
   and about 70 MiB less memory without Xvnc (84 vs 157 MiB idle). So nothing needs
   installing for RealVNC; TigerVNC is worth installing when other X11 tools
@@ -130,7 +130,7 @@ the effective values). Change with `xwlbridge-ctl config set KEY VALUE`, then
 | key | default | meaning |
 |---|---|---|
 | `engine` | `auto` | X server: `builtin` (no extra packages), `xvnc` (TigerVNC's Xvnc: every X extension, follows monitor changes), `xvfb`, `xwayland` (a rootful Xwayland on a private compositor: every X extension; the complete engine on RHEL 10); `auto` = xvnc if TigerVNC is installed, else builtin |
-| `capture` | `area` | `area` (RecordArea, safe everywhere) or `monitor` (RecordMonitor; mutter >= 51 only, older mutter crashes when a recorded monitor is disabled: mutter#2718) |
+| `capture` | `area` | `area` (RecordArea, safe everywhere) or `monitor` (RecordMonitor; mutter >= 51 only, older mutter crashes when a recorded monitor is disabled: [mutter#2718](https://gitlab.gnome.org/GNOME/mutter/-/issues/2718)) |
 | `uidisplay` | `auto` | where RealVNC's windows appear: `auto` = the GNOME desktop (Xwayland), `none` = hidden (engine `xvnc`/`xvfb` only), or an X display |
 | `rfb_port` | `5900` | TCP port (`-RfbPort`); `realvnc` or empty = RealVNC's own `RfbPort` setting |
 | `server` | `vncserver-x11` | the RealVNC Server program |
@@ -166,7 +166,7 @@ writes in user mode; later lines win) and `/etc/vnc/config.d/common.custom`
     xwlbridge-ctl config set rfb_port realvnc
     vncpasswd -user                                   # sets Password=
     cat >>~/.vnc/config.d/vncserver-x11 <<'EOF'
-    RfbPort=5911
+    RfbPort=5910
     IpClientAddresses=+192.168.1.0/255.255.255.0,+127.0.0.1,-
     Authentication=VncAuth
     Encryption=AlwaysOn
@@ -226,10 +226,18 @@ that need a stable X display mirroring the desktop, without RealVNC:
 same `engine`, `capture`, `backend`, `log` and `bridge_args` settings. Both units
 can run at the same time (each starts its own bridge).
 
+Without `--display` or `--realvnc`, `doctor`, `status`, `logs`, `start`, `stop`,
+`restart` and `show` act on `xwlbridge.service` when it is enabled and
+`xwlbridge-realvnc.service` is not (an install without RealVNC Server), and on
+`xwlbridge-realvnc.service` otherwise. `enable`, `disable`, `run` and `command`
+act on `xwlbridge-realvnc.service` unless `--display` is given.
+
 ## Coming from xwlrvnc
 
-`xwlbridge-ctl migrate` takes over a per-user install of xwlrvnc (this
-project's name before 0.1.0): it stops and disables `xwlrvnc.service`, copies
+Upstream xwlrvnc (`cargo install xwlrvnc`) has no service or settings file to
+take over: run `xwlbridge` where you ran `xwlrvnc`. `xwlbridge-ctl migrate`
+takes over a per-user install of a pre-release package of this fork (those
+unpublished packages used the name xwlrvnc before 0.1.0): it stops and disables `xwlrvnc.service`, copies
 `~/.config/xwlrvnc/xwlrvnc.conf` to `~/.config/xwlbridge/xwlbridge.conf` (a
 `bridge=` path to the old binary becomes `auto`; an existing new file is kept),
 installs and enables `xwlbridge-realvnc.service`, and starts it when the old
@@ -267,7 +275,7 @@ until `xwlbridge-ctl start` or your next login.
 A stop is not a failure: on `xwlbridge-ctl stop` and on logging out xwlbridge
 passes the SIGTERM on to RealVNC, stops its X server and exits 0, also while a
 viewer is connected. Where your user manager outlives the session (an ssh
-login, lingering), `systemctl --user status xwlbridge` then says `inactive
+login, lingering), `systemctl --user status xwlbridge-realvnc` then says `inactive
 (dead)`, and `systemctl --user --failed` does not list it. A unit that is
 `failed` after a logout failed for a reason of its own: `xwlbridge-ctl logs`.
 So the unit has no `SuccessExitStatus=`: any other non-zero status is a
@@ -298,7 +306,7 @@ RealVNC's root helper: system authentication works for your own account only,
 and adding the viewer's printer needs membership in `lpadmin`. To restore the
 root helper (other local accounts, no `lpadmin`), install TigerVNC, set
 `engine=xvnc` and `uidisplay=none`, and remove the hardening with a drop-in
-(`systemctl --user edit xwlbridge`):
+(`systemctl --user edit xwlbridge-realvnc`):
 
     [Service]
     NoNewPrivileges=no
@@ -333,9 +341,9 @@ with `vncpasswd -user`) count as new: leave out `--purge` to keep them.
     sudo apt install ./target/debian/xwlbridge_*.deb
     systemctl --user enable --now xwlbridge-realvnc   # per user
 
-The package installs `/usr/bin/xwlbridge`, `/usr/bin/xwlbridge-ctl`, the user unit
+The package installs `/usr/bin/xwlbridge`, `/usr/bin/xwlbridge-ctl`, the two user units
 in `/usr/lib/systemd/user/`, the app-grid entry and the default settings in
 `/usr/share/xwlbridge/` (copied to `~/.config/xwlbridge/` by `xwlbridge-ctl config
 set`). It enables nothing by itself. Before removing it, each user who enabled
-it runs `systemctl --user disable --now xwlbridge` (and may delete
+it runs `systemctl --user disable --now xwlbridge-realvnc xwlbridge` (and may delete
 `~/.config/xwlbridge`); dpkg cannot reach per-user files.

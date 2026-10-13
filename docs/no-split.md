@@ -67,7 +67,10 @@ xwlbridge -backend gnome -engine xvnc -showwindows APP
 xwlbridge -backend gnome -engine xvnc -showwindows -showscreen APP
 ```
 
-The proxy:
+`-engine xvnc` needs TigerVNC's Xvnc (`sudo apt install tigervnc-standalone-server`); `-engine xvfb` and
+`-engine xwayland` work too.
+
+The proxy (from a clone of this repository; its packages are listed in [accessibility.md](accessibility.md#quick-start)):
 
 ```sh
 xwlbridge -backend gnome -engine xvnc -display 20 -a11ybus -reverseinput -nowrap &

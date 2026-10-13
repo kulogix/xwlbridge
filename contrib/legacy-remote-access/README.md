@@ -1,7 +1,8 @@
 # Helpers for X11-only remote-access servers
 
 Files for running remote-access servers that only know X11 (TeamViewer before 15.29, for one) on a GNOME Wayland
-desktop through the bridge's display `:20`. The how-to, what was tested and the known limits are in
+desktop through the bridge's display `:20` (step 1 of the how-to sets `display 20`; the packaged service picks a
+number otherwise). The how-to, what was tested and the known limits are in
 [docs/legacy-remote-access-apps.md](../../docs/legacy-remote-access-apps.md).
 
 | file | install as | what |

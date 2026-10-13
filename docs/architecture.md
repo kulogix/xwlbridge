@@ -55,7 +55,7 @@ With the gnome backend the remote-desktop session runs on demand. It starts whil
 | Flag | Meaning |
 |---|---|
 | `-warm secs\|always` | Keep the session after the last activity. Default 10 s. |
-| `-linger secs` | Keep it after a screen reader client went away. Default 30 s. |
+| `-linger secs` | Keep it after an X client that read the screen (a screenshot tool) went away. Default 30 s. |
 | `-alwayson` | Same as `-warm always`. |
 | `-coldconnect none\|start` | Stock engines. Default `start`: a client that connects while the session is stopped starts it at once. |
 | `-coldwait ms` | Builtin. A screen read may wait this long while the session starts. Default 2000. |

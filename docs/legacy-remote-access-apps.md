@@ -48,7 +48,8 @@ AnyDesk incoming sessions needed the logind proxy plus an `LD_PRELOAD` environme
   RHEL 10 packages no Xvnc or Xvfb. Every GNOME install has Xwayland.
 - systemd and Python 3; PyGObject (`python3-gi` / `python3-gobject`) for the logind proxy.
 - `python3-xlib` for `wm_state.py`. RHEL 10 has no `python3-xlib`; use `wm_state_ctypes.py` there. It calls libX11 through ctypes.
-- The helper files, in `contrib/legacy-remote-access/` of this repository:
+- The helper files, in `contrib/legacy-remote-access/` of a clone of this repository (the release bundle does not
+  contain them). They assume the display `:20` that step 1 sets:
 
   | file | purpose |
   |---|---|

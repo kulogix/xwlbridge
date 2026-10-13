@@ -19,7 +19,7 @@ First release under the name xwlbridge. It is based on xwlrvnc 0.0.8 by Patrick 
 - Builtin engine: read-only XKEYBOARD (`-noxkb` hides it), RandR monitors and modes, MIT-SHM ShmCreateSegment, MIT-SCREEN-SAVER requests, and the bell.
 - Packaging:
   - two systemd user services, `xwlbridge-realvnc.service` and `xwlbridge.service`;
-  - `xwlbridge-ctl`, including `doctor` and `migrate`;
+  - `xwlbridge-ctl`, including `doctor` and `migrate`; without `--display` or `--realvnc`, its `doctor`, `status`, `logs`, `start`, `stop`, `restart` and `show` follow the enabled service;
   - `install.sh` and `uninstall.sh`;
   - a release bundle and an optional .deb (`packaging/build-deb.sh`).
 - contrib: a GNOME lock-screen extension and legacy remote-access helpers.
@@ -27,15 +27,14 @@ First release under the name xwlbridge. It is based on xwlrvnc 0.0.8 by Patrick 
 
 ### Changed
 
-- Renamed from xwlrvnc (previous version 0.1.0-rc1):
-  - binary `xwlrvnc` to `xwlbridge`;
+- Upstream xwlrvnc's binary `xwlrvnc` is now `xwlbridge`, with upstream's flags; its X vendor string `xwlrvnc` is now `xwlbridge`, and its selection atoms `XWLRVNC_FETCH_*` are now `XWLBRIDGE_FETCH_*`.
+- This fork's unpublished pre-release packages also used the name xwlrvnc. Their names changed:
   - `xwlrvnc-ctl` to `xwlbridge-ctl`;
   - `xwlrvnc.service` to `xwlbridge-realvnc.service`;
   - `~/.config/xwlrvnc` to `~/.config/xwlbridge`;
-  - `XWLRVNC_*` to `XWLBRIDGE_*`;
-  - X vendor string `xwlrvnc` to `xwlbridge`;
+  - `XWLRVNC_*` environment variables to `XWLBRIDGE_*`;
   - lock-screen extension UUID `xwlrvnc-lockscreen@xwlrvnc` to `xwlbridge-lockscreen@xwlbridge`. Re-enable the extension under the new UUID.
-- `xwlbridge-ctl migrate` moves an xwlrvnc install to the new names. `install.sh` runs it once when it finds an xwlrvnc install.
+- `xwlbridge-ctl migrate` moves such a pre-release install to the new names. `install.sh` runs it once when it finds one.
 
 ### Known issues
 

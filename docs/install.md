@@ -13,13 +13,14 @@ No xdg-desktop-portal and no permission dialog is involved. That is why xwlbridg
 
 For RealVNC Server (its UI on your desktop, the systemd user unit, ports, authentication), read [realvnc-server-6.md](realvnc-server-6.md) after this page.
 
-The build and the runtime packages below were checked in a clean container of each distribution listed (with an
-earlier version of the code). This release was checked on fresh Ubuntu 26.04.1 (the bundle) and AlmaLinux 10.2 (a
+The build and the runtime packages below were checked in a clean container of each distribution listed: with this
+release on Ubuntu 26.04, Debian 13, Fedora 44 and AlmaLinux 10 (351 of 351 tests each), the others with an earlier
+version of the code. This release was checked on fresh Ubuntu 26.04.1 (the bundle) and AlmaLinux 10.2 (a
 source build) virtual machines.
 
 ## Install the release bundle (recommended)
 
-Download `xwlbridge-<version>-x86_64-<distro>.tar.gz` and its `.sha256` file. Then, as the desktop user (no sudo):
+Download `xwlbridge-<version>-x86_64-<distro>.tar.gz` and its `.sha256` file from the [Releases page](https://github.com/kulogix/xwlbridge/releases). Then, as the desktop user (no sudo):
 
 ```sh
 sha256sum -c xwlbridge-<version>-x86_64-<distro>.tar.gz.sha256
@@ -45,6 +46,9 @@ On Ubuntu, `~/.local/bin` is on your PATH only after the next login. Until then,
 ~/.local/bin/xwlbridge-ctl doctor
 ```
 
+The doctor checks the service that install.sh enabled. `xwlbridge-ctl --display doctor` checks `xwlbridge.service` and
+`xwlbridge-ctl --realvnc doctor` checks `xwlbridge-realvnc.service`.
+
 install.sh options:
 
 | option | meaning |
@@ -67,7 +71,7 @@ Options: `--keep-config` keeps your settings. `--purge` also removes RealVNC fil
 
 ### Coming from xwlrvnc
 
-install.sh runs `xwlbridge-ctl migrate` once when it finds an xwlrvnc install. The old files stay until you run `~/.local/share/xwlrvnc/uninstall.sh --keep-config`.
+Upstream xwlrvnc (`cargo install xwlrvnc`) needs no migration: run `xwlbridge` where you ran `xwlrvnc` (see the README). Pre-release packages of this fork also used the name xwlrvnc before 0.1.0. install.sh runs `xwlbridge-ctl migrate` once when it finds such an install. The old files stay until you run `~/.local/share/xwlrvnc/uninstall.sh --keep-config`.
 
 ## Requirements
 
@@ -89,13 +93,13 @@ install.sh runs `xwlbridge-ctl migrate` once when it finds an xwlrvnc install. T
 | 47 (Fedora 41) | real session in a VM | works |
 | 46 (Ubuntu 24.04: 46.2) | real session in a VM, container smoke 9/9 | works; the cursor is drawn into the picture (cursor metadata can crash mutter 46) |
 | 45 and older (RHEL 9: mutter 40) | package inspection | not supported: no ConnectToEIS, picture without input; use GNOME on Xorg there |
-| labwc 0.9 (Raspberry Pi OS, Debian 13, aarch64, Raspberry Pi 5) | native build and headless labwc tests | wlr backend + builtin works (input, clipboard, picture exact); `-engine xwayland` 18/18 in a labwc container |
+| labwc 0.9 (Raspberry Pi OS, Debian 13, aarch64, Raspberry Pi 5) | native build and headless labwc tests | wlr backend + builtin works (input, clipboard, picture exact); `-engine xwayland` 17-18 of 18 checks per run in a labwc container |
 | sway and other wlroots compositors | upstream backend | not re-tested in this fork beyond labwc |
 | KDE Plasma | -- | not supported (no backend) |
 
 Where GNOME on Xorg still exists (Ubuntu 24.04, Debian 13, RHEL 9), X11 tools work natively and do not need this.
 
-`-recordmonitor` is only safe on mutter 51 or newer (mutter#2718). The default, RecordArea, is safe everywhere.
+`-recordmonitor` is only safe on mutter 51 or newer ([mutter#2718](https://gitlab.gnome.org/GNOME/mutter/-/issues/2718)). The default, RecordArea, is safe everywhere.
 
 ## Distributions at a glance
 
@@ -121,7 +125,7 @@ Ubuntu 24.04, Ubuntu 26.04, Debian 13:
 sudo apt install build-essential pkg-config libclang-dev libpipewire-0.3-dev libspa-0.2-dev curl ca-certificates git
 ```
 
-Fedora 43:
+Fedora 43, 44:
 
 ```sh
 sudo dnf install gcc clang-devel pkgconf-pkg-config pipewire-devel curl git
@@ -165,18 +169,17 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 ```sh
 git clone https://github.com/kulogix/xwlbridge && cd xwlbridge
 rustup toolchain install
-cargo build --release --features gnome,xvfb    # about a minute
-cargo test --release --features gnome,xvfb     # 351 tests
+cargo build --profile dist --features gnome,xvfb   # about a minute; the stripped binary the bundle uses
+cargo test --release --features gnome,xvfb         # 351 tests
 packaging/install.sh
 ```
 
-`packaging/install.sh` uses `target/dist` or `target/release`. To copy only the binary:
+`packaging/install.sh` uses `target/dist`, else `target/release`. A `--release` binary keeps its debug info (about
+190 MB, for profilers). To copy only the binary:
 
 ```sh
-install -Dm755 target/release/xwlbridge ~/.local/bin/xwlbridge
+install -Dm755 target/dist/xwlbridge ~/.local/bin/xwlbridge
 ```
-
-`cargo build --profile dist --features gnome,xvfb` makes the stripped binary the bundle uses.
 
 - `gnome` is the GNOME backend. `xvfb` adds the stock engines (`xvnc`, `xvfb`, `xwayland`).
 - The default build, without features, is pure Rust and has only the wlr backend.
@@ -200,7 +203,7 @@ sudo apt install xwayland x11-xkb-utils
 sudo apt install tigervnc-standalone-server xvfb   # optional engines
 ```
 
-Fedora 43:
+Fedora 43, 44:
 
 ```sh
 sudo dnf install pipewire-libs xorg-x11-server-Xwayland xkbcomp
@@ -262,7 +265,7 @@ sudo firewall-cmd --permanent --add-service=vnc-server
 sudo firewall-cmd --reload
 ```
 
-The `vnc-server` service is 5900-5903/tcp. For another port, use `--add-port=5911/tcp`.
+The `vnc-server` service is 5900-5903/tcp. For another port, use `--add-port=5910/tcp`.
 
 Ubuntu has no firewall on by default. With ufw: `sudo ufw allow 5900/tcp`.
 
