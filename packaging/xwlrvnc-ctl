@@ -1,0 +1,946 @@
+#!/bin/bash
+# xwlrvnc-ctl: run, check and configure RealVNC Server on the GNOME (Wayland)
+# desktop through the xwlrvnc X11 bridge.
+#
+#   xwlrvnc-ctl run                  start the bridge + RealVNC (what the service runs)
+#   xwlrvnc-ctl command              print the command `run` would start
+#   xwlrvnc-ctl doctor [--json]      check prerequisites and the running service
+#   xwlrvnc-ctl config [show|path|get KEY|set KEY VALUE|unset KEY|edit]
+#   xwlrvnc-ctl status|logs [-f]|start|stop|restart|enable|disable
+#   xwlrvnc-ctl show                 bring up RealVNC's status window on the desktop
+#   xwlrvnc-ctl realvnc-get NAME     RealVNC's own value of a parameter (its config files)
+#   xwlrvnc-ctl version
+#
+# Settings: ~/.config/xwlrvnc/xwlrvnc.conf (else /etc/xwlrvnc/xwlrvnc.conf, else
+# built-in defaults). Exit status of `run`: 78 on a configuration error (not
+# retried), 75 while something it needs is not there yet (retried).
+#
+# SPDX-License-Identifier: MIT
+set -u
+
+PROG=xwlrvnc-ctl
+CTL_VERSION="@VERSION@"
+UNIT=xwlrvnc.service
+EX_CONFIG=78
+EX_TEMPFAIL=75
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+SELF_DIR=${SELF%/*}
+
+say() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die() { local rc=$1; shift; say "$*"; exit "$rc"; }
+
+# ---------------------------------------------------------------- configuration
+
+CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge)
+declare -A CFG=(
+  [engine]=auto [capture]=area [uidisplay]=auto [server]=vncserver-x11 [rfb_port]=5900
+  [server_log]=30 [server_args]="" [log]=normal [bridge_args]="" [xvnc]=auto [xvfb]=auto
+  [backend]=gnome [bridge]=auto
+)
+CFG_FILE=""
+CFG_ERRORS=()
+
+user_config_path() { printf '%s\n' "${XWLRVNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/xwlrvnc/xwlrvnc.conf}"; }
+
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+
+# Strips one pair of matching quotes around a whole scalar value.
+unquote() {
+  local v=$1
+  if [[ ${#v} -ge 2 && ( ( $v == \"*\" ) || ( $v == \'*\' ) ) ]]; then v=${v:1:${#v}-2}; fi
+  printf '%s' "$v"
+}
+
+cfg_load() {
+  local f n=0 line key val
+  f=$(user_config_path)
+  if [ -f "$f" ]; then CFG_FILE=$f
+  elif [ -z "${XWLRVNC_CONFIG:-}" ] && [ -f /etc/xwlrvnc/xwlrvnc.conf ]; then CFG_FILE=/etc/xwlrvnc/xwlrvnc.conf
+  else CFG_FILE=""; return 0
+  fi
+  [ -r "$CFG_FILE" ] || { CFG_ERRORS+=("$CFG_FILE: not readable"); return 0; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    line=$(trim "$line")
+    [[ -z $line || $line == \#* ]] && continue
+    if [[ $line != *=* ]]; then CFG_ERRORS+=("$CFG_FILE:$n: expected KEY=value"); continue; fi
+    key=$(trim "${line%%=*}"); key=${key,,}
+    val=$(trim "${line#*=}")
+    if [[ ! -v CFG[$key] ]]; then CFG_ERRORS+=("$CFG_FILE:$n: unknown setting '$key'"); continue; fi
+    case $key in *_args) ;; *) val=$(unquote "$val");; esac
+    CFG[$key]=$val
+  done <"$CFG_FILE"
+  cfg_validate
+}
+
+cfg_validate() {
+  case ${CFG[engine]} in auto|builtin|xvnc|xvfb) ;; *) CFG_ERRORS+=("engine: '${CFG[engine]}' is not auto, builtin, xvnc or xvfb");; esac
+  case ${CFG[capture]} in area|monitor) ;; *) CFG_ERRORS+=("capture: '${CFG[capture]}' is not area or monitor");; esac
+  [[ ${CFG[uidisplay]} =~ ^(auto|none|[[:alnum:]._-]*:[0-9]+(\.[0-9]+)?)$ ]] || CFG_ERRORS+=("uidisplay: '${CFG[uidisplay]}' is not auto, none or an X display such as :0")
+  case ${CFG[backend]} in gnome|wlr|auto) ;; *) CFG_ERRORS+=("backend: '${CFG[backend]}' is not gnome, wlr or auto");; esac
+  case ${CFG[log]} in quiet|normal|verbose) ;; *) CFG_ERRORS+=("log: '${CFG[log]}' is not quiet, normal or verbose");; esac
+  if [ -n "${CFG[rfb_port]}" ] && [ "${CFG[rfb_port]}" != realvnc ]; then
+    if [[ ! ${CFG[rfb_port]} =~ ^[0-9]{1,5}$ ]] || (( 10#${CFG[rfb_port]} < 1 || 10#${CFG[rfb_port]} > 65535 )); then
+      CFG_ERRORS+=("rfb_port: '${CFG[rfb_port]}' is not a TCP port (1-65535), realvnc or empty")
+    fi
+  fi
+  if [ -n "${CFG[server_log]}" ]; then
+    if [[ ! ${CFG[server_log]} =~ ^[0-9]{1,3}$ ]] || (( 10#${CFG[server_log]} > 100 )); then
+      CFG_ERRORS+=("server_log: '${CFG[server_log]}' is not a level 0-100 or empty")
+    fi
+  fi
+  [ -n "${CFG[server]}" ] || CFG_ERRORS+=("server: empty")
+  local k
+  for k in server_args bridge_args; do
+    split_words "${CFG[$k]}" >/dev/null || CFG_ERRORS+=("$k: unbalanced quotes")
+  done
+}
+
+# Splits a value into words like a shell would (quotes, backslashes), without
+# any expansion: NUL-terminated words on stdout.
+split_words() {
+  [ -n "$(trim "$1")" ] || return 0
+  printf '%s\n' "$1" | xargs -r printf '%s\0' 2>/dev/null
+}
+
+# ---------------------------------------------------------------- X server engines
+
+# Prints why a file is not usable as the TigerVNC engine, or nothing if it is.
+# Never executes the file.
+xvnc_refusal() {
+  local p=$1 base pkg=""
+  [ -e "$p" ] || { echo "does not exist"; return; }
+  [ -f "$p" ] && [ -x "$p" ] || { echo "not an executable file"; return; }
+  if [ -u "$p" ] || [ -g "$p" ]; then echo "set-uid/set-gid (RealVNC's Xvnc is set-uid root): never used"; return; fi
+  pkg=$(owner_package "$p")
+  case $pkg in realvnc*) echo "belongs to $pkg (RealVNC's Xvnc): never used"; return;; esac
+  if LC_ALL=C grep -aqF -e 'realvnc.com' -e 'RealVNC Ltd' -- "$p" 2>/dev/null; then
+    echo "a RealVNC binary: never used"; return
+  fi
+  base=${p##*/}
+  case $pkg in tigervnc*) return;; esac
+  [ "$base" = Xtigervnc ] && return
+  LC_ALL=C grep -aqF -e 'TigerVNC' -- "$p" 2>/dev/null && return
+  echo "not TigerVNC's Xvnc"
+}
+
+xvfb_refusal() {
+  local p=$1 pkg
+  [ -e "$p" ] || { echo "does not exist"; return; }
+  [ -f "$p" ] && [ -x "$p" ] || { echo "not an executable file"; return; }
+  if [ -u "$p" ] || [ -g "$p" ]; then echo "set-uid/set-gid: never used"; return; fi
+  pkg=$(owner_package "$p")
+  case $pkg in realvnc*) echo "belongs to $pkg: never used"; return;; esac
+  if LC_ALL=C grep -aqF -e 'realvnc.com' -e 'RealVNC Ltd' -- "$p" 2>/dev/null; then echo "a RealVNC binary: never used"; return; fi
+  [ "${p##*/}" = Xvfb ] || echo "not named Xvfb"
+}
+
+owner_package() {
+  local p=$1 out
+  if command -v dpkg-query >/dev/null 2>&1; then
+    out=$(dpkg-query -S -- "$p" 2>/dev/null | head -1) && [ -n "$out" ] && { printf '%s' "${out%%:*}"; return; }
+    # usrmerge: dpkg may know the file under /bin rather than /usr/bin
+    case $p in /usr/bin/*) out=$(dpkg-query -S -- "/bin/${p#/usr/bin/}" 2>/dev/null | head -1) && [ -n "$out" ] && { printf '%s' "${out%%:*}"; return; };; esac
+  fi
+  if command -v rpm >/dev/null 2>&1; then
+    out=$(rpm -qf --qf '%{NAME}\n' -- "$p" 2>/dev/null | head -1) && [[ $out != *"not owned"* ]] && printf '%s' "$out"
+  fi
+}
+
+# Candidate engine binaries for a setting: an explicit path, or PATH lookups.
+engine_candidates() {
+  local setting=$1; shift
+  if [ "$setting" != auto ]; then printf '%s\n' "$setting"; return; fi
+  local n d IFS=:
+  for n in "$@"; do
+    for d in $PATH; do [ -n "$d" ] && [ -e "$d/$n" ] && printf '%s\n' "$d/$n"; done
+  done
+}
+
+# Prints the verified TigerVNC Xvnc (resolved path) or fails; refusals on fd 3.
+find_xvnc() {
+  local c p why seen=" "
+  while IFS= read -r c; do
+    p=$(readlink -f -- "$c" 2>/dev/null) || continue
+    [[ $seen == *" $p "* ]] && continue; seen+="$p "
+    why=$(xvnc_refusal "$p")
+    if [ -z "$why" ]; then printf '%s\n' "$p"; return 0; fi
+    printf '%s -> %s: %s\n' "$c" "$p" "$why" >&3
+  done < <(engine_candidates "${CFG[xvnc]}" Xtigervnc Xvnc)
+  return 1
+}
+
+find_xvfb() {
+  local c p why seen=" "
+  while IFS= read -r c; do
+    p=$(readlink -f -- "$c" 2>/dev/null) || continue
+    [[ $seen == *" $p "* ]] && continue; seen+="$p "
+    why=$(xvfb_refusal "$p")
+    if [ -z "$why" ]; then printf '%s\n' "$p"; return 0; fi
+    printf '%s -> %s: %s\n' "$c" "$p" "$why" >&3
+  done < <(engine_candidates "${CFG[xvfb]}" Xvfb)
+  return 1
+}
+
+# ---------------------------------------------------------------- the command
+
+find_bridge() {
+  local b=${CFG[bridge]}
+  if [ "$b" = auto ]; then
+    for b in "$SELF_DIR/xwlrvnc" "$(command -v xwlrvnc 2>/dev/null)"; do
+      [ -n "$b" ] && [ -x "$b" ] && { printf '%s\n' "$b"; return 0; }
+    done
+    return 1
+  fi
+  [ -x "$b" ] && printf '%s\n' "$b"
+}
+
+no_new_privs() { grep -qE '^NoNewPrivs:[[:space:]]*1' /proc/self/status 2>/dev/null; }
+
+# The X display socket for a local display name like :0, :0.0 or unix:0; fails
+# for a display on another host (nothing to check here).
+X11_UNIX_DIR=${XWLRVNC_X11_UNIX_DIR:-/tmp/.X11-unix}   # override for tests only
+display_socket() {
+  local h=${1%%:*} d=${1#*:}
+  [ "$1" != "$d" ] || return 1
+  case $h in ""|unix) ;; *) return 1;; esac
+  d=${d%%.*}
+  [[ $d =~ ^[0-9]+$ ]] && printf '%s/X%s\n' "$X11_UNIX_DIR" "$d"
+}
+
+# rfb_port as a number, or nothing when RealVNC's own setting applies.
+rfb_port_number() {
+  case ${CFG[rfb_port]} in ""|realvnc) ;; *) printf '%d\n' "$((10#${CFG[rfb_port]}))";; esac
+}
+
+# Fills CMD (argv), ENGINE (resolved), ENGINE_BIN, NOTES; returns EX_CONFIG with
+# the reason in ERR on a configuration error, EX_TEMPFAIL when the desktop's X
+# display that RealVNC's windows need is not there (yet).
+build_command() {
+  CMD=(); NOTES=(); ERR=""; ENGINE=""; ENGINE_BIN=""
+  if [ ${#CFG_ERRORS[@]} -gt 0 ]; then ERR="configuration errors: ${CFG_ERRORS[*]}"; return $EX_CONFIG; fi
+  local bridge server refusals engine=${CFG[engine]}
+  bridge=$(find_bridge) || { ERR="xwlrvnc not found (bridge=${CFG[bridge]}; looked next to $SELF and on PATH)"; return $EX_CONFIG; }
+  case $engine in
+    auto)
+      if ENGINE_BIN=$(find_xvnc 3>/dev/null); then engine=xvnc; else engine=builtin
+        NOTES+=("engine auto: TigerVNC's Xvnc is not installed, using the built-in X server (sudo apt install tigervnc-standalone-server for the xvnc engine)")
+      fi;;
+    xvnc)
+      refusals=$(find_xvnc 3>&1 >/dev/null) || true
+      ENGINE_BIN=$(find_xvnc 3>/dev/null) || {
+        ERR="engine=xvnc but no usable TigerVNC Xvnc${refusals:+ (refused: ${refusals//$'\n'/; })}: sudo apt install tigervnc-standalone-server"
+        return $EX_CONFIG; };;
+    xvfb)
+      refusals=$(find_xvfb 3>&1 >/dev/null) || true
+      ENGINE_BIN=$(find_xvfb 3>/dev/null) || {
+        ERR="engine=xvfb but no usable Xvfb${refusals:+ (refused: ${refusals//$'\n'/; })}: sudo apt install xvfb"
+        return $EX_CONFIG; };;
+  esac
+  ENGINE=$engine
+  case ${CFG[server]} in
+    */*) server=${CFG[server]};;
+    *) server=$(command -v -- "${CFG[server]}" 2>/dev/null) || { ERR="${CFG[server]} not found on PATH (is RealVNC Server installed?)"; return $EX_CONFIG; };;
+  esac
+  [ -x "$server" ] || { ERR="$server is not executable"; return $EX_CONFIG; }
+
+  CMD=("$bridge")
+  case ${CFG[log]} in quiet) CMD+=(-quiet);; verbose) CMD+=(-verbose);; esac
+  [ "${CFG[backend]}" = auto ] || CMD+=(-backend "${CFG[backend]}")
+  CMD+=(-engine "$engine")
+  [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
+
+  # RealVNC's own windows (vncserverui) crash on the built-in X server, every ~2 s
+  # and each time with a root apport run: with engine=builtin RealVNC never runs
+  # unless its windows go to the desktop's X display (research: 18,912 crashes).
+  local ui=${CFG[uidisplay]} sock why=""
+  if [ "$ui" = auto ]; then
+    if [ -z "${DISPLAY:-}" ]; then why="no DISPLAY in the session environment"
+    elif sock=$(display_socket "$DISPLAY") && [ ! -S "$sock" ]; then why="DISPLAY=$DISPLAY has no socket $sock"
+    fi
+  elif [ "$ui" != none ] && sock=$(display_socket "$ui") && [ ! -S "$sock" ]; then
+    why="X display $ui has no socket $sock"
+  fi
+  if [ -n "$why" ]; then
+    if [ "$engine" = builtin ]; then
+      ERR="uidisplay=${CFG[uidisplay]}: $why; waiting for the desktop's Xwayland (with the built-in X server RealVNC's windows must go to the desktop: on the bridge's display they crash)"
+      return $EX_TEMPFAIL
+    fi
+    if [ "$ui" = auto ]; then NOTES+=("uidisplay auto: $why; RealVNC's windows stay hidden"); ui=none; fi
+  fi
+  if [ "$ui" = none ] && [ "$engine" = builtin ]; then
+    ERR="uidisplay=none needs engine xvnc or xvfb: on the built-in X server RealVNC's own windows crash every few seconds. Use uidisplay=auto, or install TigerVNC (sudo apt install tigervnc-standalone-server) and set engine=xvnc"
+    return $EX_CONFIG
+  fi
+  # always said, also "none": a bridge started from a session with a local
+  # DISPLAY takes RealVNC's windows to it by default
+  CMD+=(-uidisplay "$ui")
+
+  local w
+  while IFS= read -r -d '' w; do CMD+=("$w"); done < <(split_words "${CFG[bridge_args]}")
+
+  # Under NoNewPrivileges (the service's hardening) RealVNC's set-uid launcher
+  # cannot gain root, so start the core it would start (as -uidisplay does).
+  if [ "$ui" = none ] && [ "${server##*/}" = vncserver-x11 ] && no_new_privs && [ -x "${server%/*}/vncserver-x11-core" ]; then
+    server=${server%/*}/vncserver-x11-core
+    NOTES+=("no-new-privileges: starting $server directly (RealVNC's root helper is not available)")
+  fi
+  CMD+=("$server")
+  local port; port=$(rfb_port_number)
+  [ -n "$port" ] && CMD+=("-RfbPort=$port")
+  [ -n "${CFG[server_log]}" ] && CMD+=("-Log=*:stderr:$((10#${CFG[server_log]}))")
+  while IFS= read -r -d '' w; do CMD+=("$w"); done < <(split_words "${CFG[server_args]}")
+  return 0
+}
+
+# This user's RealVNC user-mode servers that are not this service's. RealVNC
+# runs one user-mode server per user: a second one finds the first through its
+# control socket /tmp/.vnc-UID/vncserver-x11.CtrlComms, hands over to it
+# ("Existing server found; exiting.") and exits. So what counts is who listens
+# on that socket here; RealVNC in containers (other network and mount
+# namespaces, own /tmp) does not. Prints pids, or "?" for a listener whose
+# process cannot be seen (e.g. started by RealVNC's set-uid launcher).
+other_usermode_servers() {
+  local sock="/tmp/.vnc-$(id -u)/vncserver-x11.CtrlComms" listener pids="" p me
+  listener=$(ss -Hxlp 2>/dev/null | awk -v s="$sock" '$5 == s')
+  pids=$(grep -oE 'pid=[0-9]+' <<<"$listener" | cut -d= -f2 | sort -u)
+  if [ -z "$pids" ]; then
+    # not listening (yet), or not visible: this user's servers in our mount namespace
+    me=$(readlink /proc/self/ns/mnt 2>/dev/null)
+    for p in $(pgrep -u "$(id -u)" -f 'vncserver-x11-core' 2>/dev/null); do
+      [ -n "$me" ] && [ "$(readlink "/proc/$p/ns/mnt" 2>/dev/null)" = "$me" ] && pids+="$p "
+    done
+  fi
+  for p in $pids; do
+    [ "$p" = "$$" ] && continue
+    case $(tr -d '\0' <"/proc/$p/comm" 2>/dev/null) in vncserver-x11*) ;; *) continue;; esac
+    grep -q "/$UNIT" "/proc/$p/cgroup" 2>/dev/null && continue
+    printf '%s\n' "$p"
+  done
+  if [ -n "$listener" ] && [ -z "$(grep -oE 'pid=[0-9]+' <<<"$listener")" ] && [ -z "$pids" ]; then echo "?"; fi
+}
+
+describe_pids() {
+  local p
+  for p in "$@"; do
+    if [ "$p" = "?" ]; then printf 'a process this user cannot inspect listens on /tmp/.vnc-%s/vncserver-x11.CtrlComms\n' "$(id -u)"; continue; fi
+    printf 'pid %s: %s\n' "$p" "$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | cut -c1-160)"
+  done
+}
+
+runtime_dir() { printf '%s/xwlrvnc\n' "${XDG_RUNTIME_DIR:-/tmp/xwlrvnc-$(id -u)}"; }
+
+# A private PATH directory whose Xvnc/Xvfb are exactly the verified engine
+# binaries, so the bridge (which starts "Xvnc"/"Xvfb" from PATH) can never pick
+# up RealVNC's /usr/bin/Xvnc.
+prepare_engine_path() {
+  local dir; dir=$(runtime_dir)/bin
+  ( umask 077; mkdir -p -- "$dir" ) || return 1
+  [ -O "${dir%/bin}" ] && [ ! -L "${dir%/bin}" ] && [ -O "$dir" ] && [ ! -L "$dir" ] || { say "$dir is not ours"; return 1; }
+  chmod 700 -- "${dir%/bin}" "$dir"
+  rm -f -- "$dir/Xvnc" "$dir/Xtigervnc" "$dir/Xvfb"
+  case $ENGINE in
+    xvnc) ln -s -- "$ENGINE_BIN" "$dir/Xvnc" && ln -s -- "$ENGINE_BIN" "$dir/Xtigervnc";;
+    xvfb) ln -s -- "$ENGINE_BIN" "$dir/Xvfb";;
+  esac || return 1
+  PATH=$dir:$PATH
+  export PATH
+}
+
+shell_quote() { local a out=(); for a in "$@"; do out+=("$(printf '%q' "$a")"); done; printf '%s\n' "${out[*]}"; }
+
+cmd_run() {
+  cfg_load
+  build_command; local rc=$?
+  [ $rc -eq 0 ] || die "$rc" "$ERR"
+  local others
+  others=$(other_usermode_servers)
+  if [ -n "$others" ]; then
+    # EX_TEMPFAIL: the service retries (back-off up to 2 min) and takes over once it is gone
+    say "another RealVNC Server in user mode is already running for $(id -un); RealVNC allows one per user. Stop it (this service then starts by itself):"
+    describe_pids $others | while IFS= read -r l; do say "  $l"; done
+    exit 75
+  fi
+  local n; for n in "${NOTES[@]}"; do say "$n"; done
+  prepare_engine_path || die 1 "cannot prepare $(runtime_dir)/bin"
+  say "config ${CFG_FILE:-(built-in defaults)}; engine $ENGINE${ENGINE_BIN:+ ($ENGINE_BIN)}"
+  say "starting: $(shell_quote "${CMD[@]}")"
+  exec "${CMD[@]}"
+}
+
+cmd_command() {
+  cfg_load
+  build_command; local rc=$?
+  [ $rc -eq 0 ] || die "$rc" "$ERR"
+  local n; for n in "${NOTES[@]}"; do say "$n"; done
+  [ -n "$ENGINE_BIN" ] && say "engine $ENGINE: $ENGINE_BIN (via $(runtime_dir)/bin first on PATH)"
+  shell_quote "${CMD[@]}"
+}
+
+# ---------------------------------------------------------------- config command
+
+cmd_config() {
+  local sub=${1:-show}; shift || true
+  local f; f=$(user_config_path)
+  case $sub in
+    path) echo "$f";;
+    show)
+      cfg_load
+      echo "# file: ${CFG_FILE:-(none: built-in defaults)}"
+      local k; for k in "${CONFIG_KEYS[@]}"; do printf '%s=%s\n' "$k" "${CFG[$k]}"; done
+      if [ ${#CFG_ERRORS[@]} -gt 0 ]; then printf '# error: %s\n' "${CFG_ERRORS[@]}"; return 1; fi;;
+    get)
+      [ $# -eq 1 ] || die 2 "usage: $PROG config get KEY"
+      cfg_load; [[ -v CFG[${1,,}] ]] || die 2 "unknown setting '$1'"; printf '%s\n' "${CFG[${1,,}]}";;
+    set|unset)
+      local key=${1:-} val=""
+      [ -n "$key" ] || die 2 "usage: $PROG config $sub KEY${sub/unset/}${sub/set/ VALUE}"
+      key=${key,,}; [[ -v CFG[$key] ]] || die 2 "unknown setting '$key' (settings: ${CONFIG_KEYS[*]})"
+      if [ "$sub" = set ]; then [ $# -ge 2 ] || die 2 "usage: $PROG config set KEY VALUE"; shift; val="$*"; fi
+      [[ $val == *$'\n'* ]] && die 2 "a value cannot contain a newline"
+      ensure_config_file "$f" || exit 1
+      # check the new value before writing it
+      cfg_load
+      if [ "$sub" = set ]; then CFG[$key]=$val; else CFG[$key]=$(default_of "$key"); fi
+      CFG_ERRORS=(); cfg_validate
+      [ ${#CFG_ERRORS[@]} -eq 0 ] || die 2 "${CFG_ERRORS[*]}"
+      local tmp; tmp=$(mktemp "${f}.XXXXXX") || exit 1
+      awk -v key="$key" -v val="${val-}" -v mode="$sub" '
+        BEGIN { done = 0 }
+        {
+          line = $0; probe = line; sub(/^[ \t]+/, "", probe)
+          if (probe !~ /^#/ && index(probe, "=") > 0) {
+            k = substr(probe, 1, index(probe, "=") - 1); gsub(/[ \t]+$/, "", k)
+            if (tolower(k) == key) {
+              if (mode == "set" && !done) { print key "=" val; done = 1 }
+              next
+            }
+          }
+          print line
+        }
+        END { if (mode == "set" && !done) print key "=" val }' "$f" >"$tmp" && chmod --reference="$f" "$tmp" 2>/dev/null; mv -f -- "$tmp" "$f"
+      if [ "$sub" = set ]; then say "$key=$val in $f (apply with: $PROG restart)"
+      else say "$key: back to the default ($(default_of "$key")) in $f (apply with: $PROG restart)"; fi;;
+    edit) ensure_config_file "$f" || exit 1; exec "${VISUAL:-${EDITOR:-nano}}" "$f";;
+    *) die 2 "usage: $PROG config [show|path|get KEY|set KEY VALUE|unset KEY|edit]";;
+  esac
+}
+
+# The commented default settings file shipped with the package.
+config_template() {
+  local t
+  for t in "$SELF_DIR/../share/xwlrvnc/xwlrvnc.conf" /usr/share/xwlrvnc/xwlrvnc.conf "$SELF_DIR/xwlrvnc.conf"; do
+    [ -f "$t" ] && { printf '%s\n' "$t"; return 0; }
+  done
+  return 1
+}
+
+ensure_config_file() {
+  local f=$1 t
+  [ -f "$f" ] && return 0
+  ( umask 077; mkdir -p -- "${f%/*}" ) || return 1
+  ( umask 077; if t=$(config_template); then cp -- "$t" "$f"; else : >"$f"; fi )
+}
+
+default_of() {
+  case $1 in
+    engine|xvnc|xvfb|uidisplay|bridge) echo auto;; capture) echo area;; server) echo vncserver-x11;;
+    rfb_port) echo 5900;; server_log) echo 30;; log) echo normal;; backend) echo gnome;; *) echo "";;
+  esac
+}
+
+# ---------------------------------------------------------------- doctor
+
+D_JSON=0; D_FAIL=0; D_WARN=0; D_SECTION=""; D_JSON_ITEMS=()
+
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/}
+  s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
+  printf '"%s"' "$s"
+}
+
+mask_keys() { sed -E 's/[0-9A-Z]{5}(-[0-9A-Z]{5}){4}/XXXXX-XXXXX-XXXXX-XXXXX-XXXXX/g; s/(key, )[0-9A-Z]{5}-/\1XXXXX-/g'; }
+
+section() {
+  D_SECTION=$1
+  [ $D_JSON -eq 1 ] || printf '\n%s\n' "$1"
+}
+
+# report STATUS ID SUMMARY [DETAIL...]   STATUS: ok|warn|fail|info
+report() {
+  local st=$1 id=$2 summary=$3; shift 3
+  local detail; detail=$(printf '%s\n' "$@" | mask_keys); detail=${detail%$'\n'}
+  summary=$(printf '%s' "$summary" | mask_keys)
+  case $st in fail) D_FAIL=$((D_FAIL + 1));; warn) D_WARN=$((D_WARN + 1));; esac
+  if [ $D_JSON -eq 1 ]; then
+    D_JSON_ITEMS+=("{\"id\":$(json_str "$id"),\"section\":$(json_str "$D_SECTION"),\"status\":$(json_str "$st"),\"summary\":$(json_str "$summary"),\"detail\":$(json_str "$detail")}")
+  else
+    local tag
+    case $st in ok) tag='[ OK ]';; warn) tag='[WARN]';; fail) tag='[FAIL]';; *) tag='[INFO]';; esac
+    printf '  %s %s\n' "$tag" "$summary"
+    [ -n "$detail" ] && printf '%s\n' "$detail" | sed 's/^/         /'
+  fi
+  return 0
+}
+
+t5() { timeout 5 "$@"; }
+
+# The graphical session's environment as the user manager sees it (works from
+# ssh too); falls back to our own environment.
+session_env() {
+  local name=$1 v
+  v=$(t5 systemctl --user show-environment 2>/dev/null | sed -n "s/^$name=//p" | tail -1)
+  [ -n "$v" ] || v=${!name:-}
+  printf '%s' "$v"
+}
+
+bus_has() { t5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus NameHasOwner s "$1" 2>/dev/null | grep -q 'true'; }
+bus_prop() { t5 busctl --user get-property "$1" "$2" "$3" "$4" 2>/dev/null | sed -E 's/^[a-z]+ //; s/^"(.*)"$/\1/'; }
+
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+mutter_version() {
+  local v=""
+  if command -v mutter >/dev/null 2>&1; then v=$(t5 mutter --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1); fi
+  if [ -z "$v" ] && command -v dpkg-query >/dev/null 2>&1; then
+    v=$(dpkg-query -W -f '${Version}' mutter-common 2>/dev/null | sed -E 's/^[0-9]+://; s/[-+~].*//')
+  fi
+  if [ -z "$v" ] && command -v rpm >/dev/null 2>&1; then v=$(rpm -q --qf '%{VERSION}' mutter 2>/dev/null | grep -E '^[0-9]'); fi
+  printf '%s' "$v"
+}
+
+listeners() { ss -Hltnp "sport = :$1" 2>/dev/null; }
+
+# RealVNC's effective value of a parameter for user-mode vncserver-x11, from its
+# config files (later wins; policy last) and then our server_args. Prints
+# "value<TAB>source"; nothing when unset.
+rvnc_param() {
+  local name=$1 f v="" src="" line w k
+  for f in /etc/vnc/config.d/common /etc/vnc/config.d/common.custom /etc/vnc/config.d/vncserver-x11 \
+           /etc/vnc/config.d/vncserver-x11.custom "$HOME/.vnc/config.d/common" "$HOME/.vnc/config.d/vncserver-x11" \
+           "$HOME/.vnc/config.d/vncserver-x11-common"; do
+    [ -r "$f" ] || continue
+    line=$(grep -iE "^[[:space:]]*$name[[:space:]]*=" "$f" 2>/dev/null | tail -1) || true
+    [ -n "$line" ] && { v=$(trim "${line#*=}"); src=$f; }
+  done
+  while IFS= read -r -d '' w; do
+    [[ $w == -*=* ]] || continue
+    k=${w%%=*}; k=${k#-}; k=${k#-}
+    [ "${k,,}" = "${name,,}" ] && { v=${w#*=}; src="server_args"; }
+  done < <(split_words "${CFG[server_args]}")
+  for f in /etc/vnc/policy.d/common /etc/vnc/policy.d/vncserver-x11; do
+    [ -r "$f" ] || continue
+    line=$(grep -iE "^[[:space:]]*$name[[:space:]]*=" "$f" 2>/dev/null | tail -1) || true
+    [ -n "$line" ] && { v=$(trim "${line#*=}"); src="$f (policy)"; }
+  done
+  [ -n "$v" ] && printf '%s\t%s\n' "$v" "$src"
+}
+
+# The TCP port RealVNC will listen on: "port<TAB>source". RealVNC's command line
+# (rfb_port, then server_args) beats its config files; its policy beats both.
+effective_port() {
+  local v n
+  v=$(rvnc_param RfbPort)
+  case ${v#*$'\t'} in
+    *"(policy)"|server_args) printf '%s\n' "$v"; return;;
+  esac
+  n=$(rfb_port_number)
+  if [ -n "$n" ]; then printf '%s\trfb_port\n' "$n"
+  elif [ -n "$v" ]; then printf '%s\n' "$v"
+  else printf '5900\tRealVNC default\n'; fi
+}
+
+rvnc_has_password() {
+  local f
+  for f in "$HOME/.vnc/config.d/vncserver-x11" "$HOME/.vnc/config.d/common" /etc/vnc/config.d/vncserver-x11 \
+           /etc/vnc/config.d/common.custom /etc/vnc/policy.d/vncserver-x11 /etc/vnc/policy.d/common; do
+    [ -r "$f" ] && grep -qiE '^[[:space:]]*Password[[:space:]]*=[[:space:]]*[^[:space:]]' "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+cmd_doctor() {
+  [ "${1:-}" = --json ] && D_JSON=1
+  cfg_load
+  # judge the command with the environment the service gets (the user manager's), e.g. from ssh
+  local sdisp; sdisp=$(session_env DISPLAY); local DISPLAY=$sdisp
+  [ $D_JSON -eq 1 ] || printf 'xwlrvnc doctor (%s, %s)\n' "$(ctl_version)" "$(date '+%F %T')"
+
+  # -------------------------------------------------------------- session
+  section "GNOME session"
+  local stype desk shell_inst shell_run mv sc rd dc
+  stype=$(session_env XDG_SESSION_TYPE); desk=$(session_env XDG_CURRENT_DESKTOP)
+  shell_inst=$(t5 gnome-shell --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+  shell_run=$(bus_prop org.gnome.Shell /org/gnome/Shell org.gnome.Shell ShellVersion)
+  case $stype in
+    wayland) report ok session.type "Wayland session (${desk:-desktop unknown})";;
+    x11) report warn session.type "X11 session: the bridge is for Wayland; run RealVNC Server directly on X11";;
+    "") report warn session.type "no graphical session found for this user (log in at the machine, or enable automatic login)";;
+    *) report warn session.type "session type '$stype' (${desk:-desktop unknown})";;
+  esac
+  if [ -n "$shell_run" ]; then report ok session.gnome "GNOME Shell $shell_run running${shell_inst:+ (installed $shell_inst)}"
+  elif [ -n "$shell_inst" ]; then report warn session.gnome "GNOME Shell $shell_inst installed but not running for this user"
+  else report fail session.gnome "GNOME Shell not found" "This package drives mutter's remote-desktop APIs; other compositors need backend=wlr."; fi
+
+  mv=$(mutter_version)
+  sc=$(bus_prop org.gnome.Mutter.ScreenCast /org/gnome/Mutter/ScreenCast org.gnome.Mutter.ScreenCast Version)
+  rd=$(bus_prop org.gnome.Mutter.RemoteDesktop /org/gnome/Mutter/RemoteDesktop org.gnome.Mutter.RemoteDesktop Version)
+  bus_has org.gnome.Mutter.DisplayConfig && dc=yes || dc=no
+  if [ -n "$sc" ] && [ -n "$rd" ]; then
+    report ok session.mutter "mutter ${mv:-?}: ScreenCast API v$sc, RemoteDesktop API v$rd, DisplayConfig ${dc/yes/present}"
+  elif [ -n "$shell_run" ]; then
+    report fail session.mutter "mutter ${mv:-?}: its ScreenCast/RemoteDesktop D-Bus APIs are not on the session bus"
+  else
+    report info session.mutter "mutter ${mv:-unknown} (APIs not checked: no running session)"
+  fi
+  if [ "${CFG[capture]}" = monitor ]; then
+    if [ -n "$mv" ] && version_ge "$mv" 51; then report ok session.capture "capture=monitor (RecordMonitor) on mutter $mv"
+    else report fail session.capture "capture=monitor on mutter ${mv:-unknown}: crashes GNOME when a recorded monitor is disabled (mutter#2718)" "Use: $PROG config set capture area"; fi
+  fi
+
+  local pwsock
+  pwsock="$(session_env XDG_RUNTIME_DIR)"; pwsock=${pwsock:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}}/pipewire-0
+  if [ -S "$pwsock" ]; then report ok session.pipewire "PipeWire socket $pwsock"
+  else report fail session.pipewire "no PipeWire socket ($pwsock): GNOME's screen capture needs PipeWire" "systemctl --user enable --now pipewire.socket"; fi
+
+  local disp xsock
+  disp=$(session_env DISPLAY)
+  if [ "${CFG[uidisplay]}" = none ]; then
+    report info session.xwayland "uidisplay=none: RealVNC's windows stay hidden"
+  else
+    [ "${CFG[uidisplay]}" = auto ] || disp=${CFG[uidisplay]}
+    xsock=$(display_socket "$disp")
+    if [ -z "$disp" ]; then report warn session.xwayland "no DISPLAY in the session: RealVNC's windows (tray icon, dialogs) will stay hidden" "GNOME sets DISPLAY when Xwayland is enabled; check that the session runs Xwayland."
+    elif [ -n "$xsock" ] && [ -S "$xsock" ]; then report ok session.xwayland "RealVNC's windows go to X display $disp (Xwayland)"
+    else report warn session.xwayland "X display $disp has no socket ${xsock:-?}: RealVNC's windows will stay hidden"; fi
+  fi
+
+  # -------------------------------------------------------------- bridge
+  section "Bridge"
+  local bridge help bver
+  if bridge=$(find_bridge); then
+    bver=$(t5 "$bridge" -version 2>&1 | head -1)
+    help=$(t5 "$bridge" -help 2>&1)
+    local missing; missing=$(ldd "$bridge" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ')
+    if [ -n "$missing" ]; then report fail bridge.binary "$bridge: missing libraries: $missing" "On Ubuntu: sudo apt install libpipewire-0.3-0t64"
+    elif ! grep -q -- '-backend' <<<"$help"; then report fail bridge.binary "$bridge does not run (-help failed)"
+    else
+      local feats=()
+      grep -qE 'gnome' <<<"$(grep -- '-backend' <<<"$help")" && feats+=(gnome)
+      grep -qE 'xvnc' <<<"$help" && feats+=(engines)
+      grep -q -- '-uidisplay' <<<"$help" && feats+=(uidisplay)
+      report ok bridge.binary "$bridge (${bver:-version unknown}; ${feats[*]:-no optional features})"
+    fi
+  else
+    report fail bridge.binary "xwlrvnc binary not found (next to $SELF or on PATH)"
+  fi
+  if [ ${#CFG_ERRORS[@]} -gt 0 ]; then
+    report fail bridge.config "${CFG_FILE}: ${#CFG_ERRORS[@]} error(s)" "${CFG_ERRORS[@]}"
+  else
+    report ok bridge.config "settings: ${CFG_FILE:-built-in defaults} (engine=${CFG[engine]} capture=${CFG[capture]} uidisplay=${CFG[uidisplay]} rfb_port=${CFG[rfb_port]:-(empty)})"
+  fi
+
+  # -------------------------------------------------------------- engines
+  section "X server engine"
+  local xv xvf refus selected
+  refus=$(find_xvnc 3>&1 >/dev/null) || true
+  if xv=$(find_xvnc 3>/dev/null); then report ok engine.xvnc "TigerVNC Xvnc: $xv${refus:+ (refused: ${refus//$'\n'/; })}"
+  else report info engine.xvnc "TigerVNC Xvnc not installed (optional: sudo apt install tigervnc-standalone-server)" ${refus:+"refused: $refus"}; fi
+  local rx; rx=$(command -v Xvnc 2>/dev/null)
+  if [ -n "$rx" ] && [ -n "$(xvnc_refusal "$(readlink -f -- "$rx")")" ]; then
+    report info engine.realvnc_xvnc "$rx is $(xvnc_refusal "$(readlink -f -- "$rx")")"
+  fi
+  if xvf=$(find_xvfb 3>/dev/null); then report ok engine.xvfb "Xvfb: $xvf"; else report info engine.xvfb "Xvfb not installed (optional)"; fi
+  local brc
+  build_command >/dev/null 2>&1; brc=$?
+  if [ $brc -eq 0 ]; then
+    selected="$ENGINE${ENGINE_BIN:+ ($ENGINE_BIN)}"
+    report ok engine.selected "engine=${CFG[engine]} -> $selected"
+  elif [ $brc -eq $EX_TEMPFAIL ]; then
+    report fail engine.selected "the service waits: $ERR" "It retries by itself (back-off up to 2 min) and starts once this is resolved."
+  else
+    report fail engine.selected "${ERR:-cannot build the command}"
+  fi
+
+  # -------------------------------------------------------------- RealVNC
+  section "RealVNC Server"
+  local srv core rver pkgv lic licrc auth enc pw
+  case ${CFG[server]} in */*) srv=${CFG[server]};; *) srv=$(command -v -- "${CFG[server]}" 2>/dev/null);; esac
+  if [ -z "$srv" ] || [ ! -x "$srv" ]; then
+    report fail realvnc.installed "${CFG[server]} not found: install RealVNC Server (realvnc-vnc-server)"
+  else
+    core=${srv%/*}/vncserver-x11-core
+    rver=$( [ -x "$core" ] && t5 "$core" -help 2>&1 | grep -m1 -oE 'VNC\(R\) Server [0-9][0-9.]*' | grep -oE '[0-9][0-9.]*$')
+    pkgv=$(command -v dpkg-query >/dev/null && dpkg-query -W -f '${Version}' realvnc-vnc-server 2>/dev/null)
+    case ${rver:-$pkgv} in
+      6.*|7.*) report ok realvnc.installed "RealVNC Server ${rver:-$pkgv} ($srv${pkgv:+, package $pkgv})";;
+      "") report warn realvnc.installed "RealVNC Server at $srv (version unknown)";;
+      *) report warn realvnc.installed "RealVNC Server ${rver:-$pkgv}: tested with 6.11 and 7.x";;
+    esac
+    if command -v vnclicense >/dev/null 2>&1; then
+      lic=$(t5 vnclicense -check 2>&1 | mask_keys); licrc=$?
+      local planline
+      planline=$(t5 journalctl --user -u "$UNIT" -b --no-pager -o cat 2>/dev/null | grep -oE 'FeaturePlans: Using [A-Za-z ]+ plan' | tail -1)
+      if grep -qi 'no licen' <<<"$lic"; then
+        report fail realvnc.license "RealVNC Server is not licensed: $(head -1 <<<"$lic")" "Add your key (as an administrator): sudo vnclicense -add <key>, then: $PROG restart"
+      elif [[ $planline == *Unlicensed* ]]; then
+        report fail realvnc.license "the running server uses the Unlicensed plan (licensed since?): $PROG restart" "$lic"
+      elif grep -qi 'licensed desktops' <<<"$lic"; then
+        report ok realvnc.license "licensed ($(grep -i 'licensed desktops' <<<"$lic" | head -1 | sed 's/^ *//'))${planline:+; running: ${planline#FeaturePlans: }}"
+      else
+        report warn realvnc.license "licence state unclear (vnclicense -check exit $licrc)" "$lic"
+      fi
+    else
+      report warn realvnc.license "vnclicense not found; cannot check the licence"
+    fi
+    auth=$(rvnc_param Authentication); enc=$(rvnc_param Encryption)
+    local authv=${auth%%$'\t'*} encv=${enc%%$'\t'*}
+    case ${authv,,} in
+      *vncauth*)
+        if rvnc_has_password; then report ok realvnc.auth "Authentication=$authv (VNC password set; ${auth#*$'\t'})"
+        else report fail realvnc.auth "Authentication=$authv but no VNC password is set" "Set one with: vncpasswd -user"; fi;;
+      ""|*systemauth*)
+        if [ "${CFG[uidisplay]}" = none ]; then report ok realvnc.auth "Authentication=${authv:-SystemAuth (RealVNC default)}: Linux account passwords"
+        else report ok realvnc.auth "Authentication=${authv:-SystemAuth (RealVNC default)}: your own Linux login and password" "With uidisplay=${CFG[uidisplay]} RealVNC runs without its root helper: other local accounts cannot log in. For a separate VNC password: vncpasswd -user and server_args=-Authentication=VncAuth"; fi;;
+      none|*none*) report warn realvnc.auth "Authentication=$authv: anyone who can reach the port controls this desktop (${auth#*$'\t'})";;
+      *) report info realvnc.auth "Authentication=$authv (${auth#*$'\t'})";;
+    esac
+    case ${encv,,} in
+      alwaysoff) report warn realvnc.encryption "Encryption=AlwaysOff (${enc#*$'\t'}): sessions are not encrypted";;
+      "") report ok realvnc.encryption "Encryption: RealVNC's default (AlwaysOn)";;
+      *) report ok realvnc.encryption "Encryption=$encv";;
+    esac
+    local ipf; ipf=$(rvnc_param IpClientAddresses)
+    if [ -n "$ipf" ]; then
+      report ok realvnc.ip_filter "IpClientAddresses=${ipf%%$'\t'*} (${ipf#*$'\t'})"
+    else
+      report info realvnc.ip_filter "no IP address filter (RealVNC's IpClientAddresses is not set): any address that reaches the port may try to log in" \
+        "Restrict it in RealVNC's Options > Connections, or in ~/.vnc/config.d/vncserver-x11, e.g." \
+        "  IpClientAddresses=+192.168.1.0/255.255.255.0,+127.0.0.1,-"
+    fi
+    if [ "${CFG[uidisplay]}" != none ]; then
+      if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx lpadmin; then report ok realvnc.printing "remote printing: you are in lpadmin"
+      else report info realvnc.printing "remote printing to the viewer's printer needs the lpadmin group with uidisplay=${CFG[uidisplay]}" "sudo usermod -aG lpadmin $(id -un)   (then log out and in)"; fi
+    fi
+  fi
+
+  local others o byhand="" foreign=""
+  others=$(other_usermode_servers)
+  [ "$others" = "?" ] && [ "$(t5 systemctl --user is-active "$UNIT" 2>/dev/null)" = active ] && others=""
+  for o in $others; do
+    # under a bridge started by hand (xwlrvnc-ctl run / xwlrvnc ... in a terminal), or something else
+    if [ "$o" != "?" ] && [ "$(cat "/proc/$(awk '{print $4}' "/proc/$o/stat" 2>/dev/null)/comm" 2>/dev/null)" = xwlrvnc ]; then byhand+="$o "; else foreign+="$o "; fi
+  done
+  if [ -n "$foreign" ]; then
+    report fail realvnc.other_server "another RealVNC Server in user mode runs for $(id -un), outside $UNIT; RealVNC allows one per user" \
+      "$(describe_pids $foreign)" "Stop it; $UNIT then starts within 2 minutes, or: $PROG restart"
+  fi
+  if [ -n "$byhand" ]; then
+    report warn realvnc.other_server "RealVNC Server runs under a bridge started by hand (not $UNIT); while it runs, the service cannot start (one user-mode server per user)" \
+      "$(describe_pids $byhand)"
+  fi
+  if [ -f /usr/share/applications/realvnc-vncserver-service.desktop ]; then
+    report info realvnc.app_entry "RealVNC's own app-grid entry \"VNC Server\" starts its service-mode server (no use on Wayland); use \"VNC Server (Wayland desktop)\" or: $PROG show"
+  fi
+
+  # system service + ports
+  local sen sac port psrc l own_active
+  port=$(effective_port); psrc=${port#*$'\t'}; port=${port%%$'\t'*}
+  if [ "$psrc" = rfb_port ]; then
+    report info realvnc.rfb_port "port $port (rfb_port in $PROG's settings; RealVNC's own RfbPort is not used)"
+  else
+    report info realvnc.rfb_port "port $port ($psrc)" "rfb_port=${CFG[rfb_port]:-}: RealVNC's own settings decide the port (RfbPort)."
+  fi
+  sen=$(t5 systemctl is-enabled vncserver-x11-serviced.service 2>/dev/null); sac=$(t5 systemctl is-active vncserver-x11-serviced.service 2>/dev/null)
+  if [ "$sac" = active ] || [ "$sen" = enabled ]; then
+    local why="RealVNC's service-mode server (vncserver-x11-serviced: $sen/$sac) looks for an X server on the console. A GNOME Wayland desktop has none, so it accepts viewers on port 5900 and drops them."
+    if [ "$port" = 5900 ]; then
+      local alt="$PROG config set rfb_port 5901 && $PROG restart"
+      [ "$psrc" = rfb_port ] || alt="set RfbPort=5901 in RealVNC's settings (Options > Connections, or ~/.vnc/config.d/vncserver-x11), then: $PROG restart"
+      report fail realvnc.system_service "RealVNC's system service holds port 5900, which this setup also wants" "$why" \
+        "Choose one:" \
+        "  1. Disable it (viewers keep using port 5900):  sudo systemctl disable --now vncserver-x11-serviced" \
+        "     then: $PROG restart" \
+        "  2. Keep it, and serve this desktop on port 5901:  $alt" \
+        "     (viewers then connect to <host>:5901, or <host>::5901)"
+    else
+      report warn realvnc.system_service "RealVNC's system service is $sen/$sac on port 5900; this desktop is served on port $port" "$why" \
+        "Viewers must connect to <host>:$port. To serve on 5900 instead:" \
+        "  sudo systemctl disable --now vncserver-x11-serviced && $PROG config set rfb_port 5900 && $PROG restart"
+    fi
+  else
+    case $sen in not-found|"") sen="not installed";; esac
+    report ok realvnc.system_service "RealVNC's system service is not running ($sen)"
+  fi
+  [ "$(t5 systemctl is-enabled vncserver-virtuald.service 2>/dev/null)" = enabled ] && \
+    report info realvnc.virtuald "RealVNC's virtual-mode daemon (vncserver-virtuald) is enabled; it is unrelated to this desktop"
+
+  own_active=$(t5 systemctl --user is-active "$UNIT" 2>/dev/null)
+  l=$(listeners "$port")
+  if [ -z "$l" ]; then
+    if [ "$own_active" = active ]; then report warn realvnc.port "nothing listens on port $port although $UNIT is active (licence? see: $PROG logs)"
+    else report ok realvnc.port "port $port is free"; fi
+  elif grep -qE 'vncserver-x11|Xvnc-core' <<<"$l" && [ "$own_active" = active ]; then
+    report ok realvnc.port "port $port: served by $UNIT"
+  else
+    local who lpid
+    who=$(grep -oE 'users:\(\("[^"]+' <<<"$l" | head -1 | sed 's/^users:(("//')
+    lpid=$(grep -oE 'pid=[0-9]+' <<<"$l" | head -1 | cut -d= -f2)
+    if [ -n "$lpid" ] && [[ " $byhand " == *" $lpid "* ]]; then
+      report warn realvnc.port "port $port: served by the bridge started by hand (pid $lpid), not by $UNIT"
+    elif [ "$port" = 5900 ] && [ "$sac" = active ] && { [ -z "$lpid" ] || [ "$who" = vncserver-x11-s ]; }; then
+      :   # RealVNC's system service: reported above with the two choices
+    else
+      report fail realvnc.port "port $port is in use by ${who:-another user or a system process}${lpid:+ (pid $lpid)}" "Pick another: $PROG config set rfb_port <port> && $PROG restart"
+    fi
+  fi
+
+  # -------------------------------------------------------------- GNOME settings
+  section "GNOME integration"
+  local ext info st
+  info=""; ext=""
+  # (gnome-extensions talks to the running shell; without one it would only D-Bus-activate a helper)
+  [ -n "$shell_run" ] && for ext in ubuntu-appindicators@ubuntu.com appindicatorsupport@rgcjonas.gmail.com; do
+    info=$(t5 gnome-extensions info "$ext" 2>/dev/null) && break
+    info=""
+  done
+  if [ -n "$info" ]; then
+    st=$(sed -n 's/^ *State: *//p' <<<"$info" | head -1)
+    if grep -qiE '^ *Enabled: *Yes' <<<"$info" || [ "$st" = ACTIVE ] || [ "$st" = ENABLED ]; then
+      report ok gnome.appindicator "tray icons: $ext is enabled (${st:-?}): RealVNC's icon shows in the top bar"
+    else
+      report warn gnome.appindicator "tray icons: $ext is installed but not enabled (${st:-?})" "gnome-extensions enable $ext"
+    fi
+  elif [ -z "$shell_run" ]; then
+    report info gnome.appindicator "tray icon extension not checked (no running GNOME Shell)"
+  else
+    report warn gnome.appindicator "no AppIndicator extension: RealVNC's tray icon will not show (its status window: $PROG show)" \
+      "Ubuntu: sudo apt install gnome-shell-extension-appindicator; then enable it in Extensions"
+  fi
+
+  if command -v gsettings >/dev/null 2>&1 && gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.remote-desktop.rdp; then
+    local rdp rport vnc vport
+    rdp=$(gsettings get org.gnome.desktop.remote-desktop.rdp enable 2>/dev/null); rport=$(gsettings get org.gnome.desktop.remote-desktop.rdp port 2>/dev/null | grep -oE '[0-9]+$')
+    vnc=$(gsettings get org.gnome.desktop.remote-desktop.vnc enable 2>/dev/null); vport=$(gsettings get org.gnome.desktop.remote-desktop.vnc port 2>/dev/null | grep -oE '[0-9]+$')
+    if [ "$vnc" = true ] && [ "${vport:-5900}" = "$port" ]; then
+      report fail gnome.remote_desktop "GNOME Remote Desktop's own VNC sharing is on, on port ${vport:-5900} (Settings > System > Remote Desktop)" "Turn it off, or: $PROG config set rfb_port 5901"
+    else
+      report info gnome.remote_desktop "GNOME Remote Desktop (Settings > System > Remote Desktop): desktop sharing RDP ${rdp:-?}${rport:+ on $rport}, VNC ${vnc:-n/a}; independent of this service" \
+        "This service does not need it: it uses mutter's remote-desktop API directly. GNOME shows its screen-sharing indicator while a viewer watches."
+    fi
+  fi
+  if [ "$(t5 systemctl is-active gnome-remote-desktop.service 2>/dev/null)" = active ]; then
+    report info gnome.remote_login "GNOME Remote Login (system gnome-remote-desktop, RDP) is active; no conflict with VNC"
+  fi
+
+  local gdmconf al="" alu=""
+  for gdmconf in /etc/gdm3/custom.conf /etc/gdm/custom.conf /etc/gdm3/daemon.conf; do [ -r "$gdmconf" ] && break; gdmconf=""; done
+  if [ -n "$gdmconf" ]; then
+    al=$(sed -n 's/^[[:space:]]*AutomaticLoginEnable[[:space:]]*=[[:space:]]*//Ip' "$gdmconf" | tail -1)
+    alu=$(sed -n 's/^[[:space:]]*AutomaticLogin[[:space:]]*=[[:space:]]*//Ip' "$gdmconf" | tail -1)
+  fi
+  if [[ ${al,,} == true || ${al} == 1 ]] && [ "$alu" = "$(id -un)" ]; then
+    report ok gnome.autologin "automatic login for $(id -un): the service is up after a reboot"
+  else
+    report info gnome.autologin "the service runs inside your GNOME session: after a reboot, viewers can connect once you have logged in at the machine" \
+      "For unattended reboots: Settings > System > Users > Automatic Login"
+  fi
+  local lock idle
+  lock=$(gsettings get org.gnome.desktop.screensaver lock-enabled 2>/dev/null); idle=$(gsettings get org.gnome.desktop.session idle-delay 2>/dev/null | grep -oE '[0-9]+$')
+  local blank=""
+  case $idle in "") ;; 0) blank=", the screen never blanks";; *) blank=", the screen blanks after ${idle}s idle";; esac
+  case $lock in
+    true) report info gnome.lock "screen lock on$blank: viewers see the lock screen and unlock it with your password";;
+    false) report info gnome.lock "screen lock off$blank";;
+  esac
+
+  # -------------------------------------------------------------- service
+  section "Service"
+  local props loadst enabled active sub nres result since mainpid
+  props=$(t5 systemctl --user show "$UNIT" -p LoadState -p UnitFileState -p ActiveState -p SubState -p NRestarts -p Result -p ActiveEnterTimestamp -p MainPID -p FragmentPath 2>/dev/null)
+  loadst=$(sed -n 's/^LoadState=//p' <<<"$props"); enabled=$(sed -n 's/^UnitFileState=//p' <<<"$props")
+  active=$(sed -n 's/^ActiveState=//p' <<<"$props"); sub=$(sed -n 's/^SubState=//p' <<<"$props")
+  nres=$(sed -n 's/^NRestarts=//p' <<<"$props"); result=$(sed -n 's/^Result=//p' <<<"$props")
+  since=$(sed -n 's/^ActiveEnterTimestamp=//p' <<<"$props"); mainpid=$(sed -n 's/^MainPID=//p' <<<"$props")
+  if [ "$loadst" != loaded ]; then
+    report warn service.unit "$UNIT is not installed for this user (${loadst:-no systemd user manager})" "Install with install.sh, or run in a terminal: $PROG run"
+  else
+    if [ "$enabled" = enabled ]; then report ok service.enabled "$UNIT is enabled (starts with your GNOME session)"
+    else report warn service.enabled "$UNIT is ${enabled:-not enabled}" "$PROG enable"; fi
+    case $active in
+      active) report ok service.active "$UNIT is running (pid $mainpid, since ${since:-?}; restarts: ${nres:-0})";;
+      activating) report warn service.active "$UNIT is $active/$sub (restarts: ${nres:-0}, last result: ${result:-?})" "$PROG logs";;
+      failed) report fail service.active "$UNIT failed (result: ${result:-?}; restarts: ${nres:-0})" "$PROG logs   then: $PROG restart";;
+      *) report warn service.active "$UNIT is ${active:-?}" "$PROG start";;
+    esac
+    local errs
+    errs=$(t5 journalctl --user -u "$UNIT" -b -p warning --no-pager -o cat -n 200 2>/dev/null | grep -vE '^-- ' | grep -cE '.' || true)
+    [ "${errs:-0}" -gt 0 ] && report info service.journal "$errs warning line(s) from $UNIT this boot ($PROG logs)"
+  fi
+
+  if [ $D_JSON -eq 1 ]; then
+    local IFS=,
+    printf '{"version":%s,"config":%s,"fail":%d,"warn":%d,"checks":[%s]}\n' "$(json_str "$(ctl_version)")" \
+      "$(json_str "${CFG_FILE:-}")" "$D_FAIL" "$D_WARN" "${D_JSON_ITEMS[*]}"
+  else
+    printf '\n%d problem(s), %d warning(s).\n' "$D_FAIL" "$D_WARN"
+  fi
+  [ $D_FAIL -eq 0 ]
+}
+
+# ---------------------------------------------------------------- service helpers
+
+ctl_version() {
+  local v=$CTL_VERSION
+  [[ $v == @*@ ]] && v=dev
+  printf 'xwlrvnc-ctl %s' "$v"
+}
+
+cmd_show() {
+  # RealVNC's own "vncserver-x11 -showstatus" asks a running user-mode server
+  # (through its control socket) to show its status window, which -uidisplay
+  # puts on the GNOME desktop. With no server running it would start a plain
+  # one on Xwayland instead, which sees only X windows: so make sure ours runs.
+  local srv sock rc i
+  cfg_load
+  case ${CFG[server]} in */*) srv=${CFG[server]};; *) srv=$(command -v -- "${CFG[server]}" 2>/dev/null);; esac
+  [ -n "$srv" ] || die 1 "RealVNC Server not found"
+  [ "${CFG[uidisplay]}" = none ] && say "uidisplay=none: RealVNC's windows are hidden (xwlrvnc-ctl config set uidisplay auto)"
+  if [ "$(systemctl --user is-active "$UNIT" 2>/dev/null)" != active ]; then
+    systemctl --user start "$UNIT" || die 1 "cannot start $UNIT (xwlrvnc-ctl logs)"
+  fi
+  sock=/tmp/.vnc-$(id -u)/vncserver-x11.CtrlComms
+  for i in $(seq 50); do [ -S "$sock" ] && break; sleep 0.2; done
+  [ -S "$sock" ] || die 1 "RealVNC Server is not answering (no $sock): xwlrvnc-ctl logs"
+  "$srv" -showstatus >/dev/null 2>&1; rc=$?
+  # 5: "Existing server found; exiting." after handing the request over
+  [ $rc -eq 0 ] || [ $rc -eq 5 ] || die "$rc" "$srv -showstatus failed ($rc)"
+}
+
+usage() { sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    run) cmd_run "$@";;
+    command) cmd_command "$@";;
+    doctor|check) cmd_doctor "$@";;
+    config) cmd_config "$@";;
+    status) systemctl --user --no-pager status "$UNIT" "$@";;
+    logs) exec journalctl --user -u "$UNIT" -b --no-pager "$@";;
+    start|stop|restart|enable|disable|reset-failed) exec systemctl --user "$cmd" "$UNIT" "$@";;
+    show) cmd_show;;
+    realvnc-get)
+      [ $# -eq 1 ] || die 2 "usage: $PROG realvnc-get NAME   (e.g. RfbPort, IpClientAddresses, Authentication)"
+      cfg_load; v=$(rvnc_param "$1") || true
+      [ -n "$v" ] || exit 1
+      printf '%s\n' "${v%%$'\t'*}";;
+    version|--version|-v) ctl_version; echo; b=$(cfg_load; find_bridge) && "$b" -version 2>&1 | head -1;;
+    help|--help|-h) usage;;
+    *) usage >&2; exit 2;;
+  esac
+}
+
+main "$@"

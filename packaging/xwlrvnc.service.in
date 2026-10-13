@@ -1,0 +1,63 @@
+# systemd user service: RealVNC Server on the GNOME (Wayland) desktop through
+# the xwlrvnc X11 bridge. Settings: ~/.config/xwlrvnc/xwlrvnc.conf
+# (xwlrvnc-ctl config); checks: xwlrvnc-ctl doctor; logs: xwlrvnc-ctl logs.
+[Unit]
+Description=RealVNC Server on the GNOME desktop (xwlrvnc X11 bridge)
+Documentation=https://github.com/pgaskin/xwlrvnc
+# Runs inside the graphical session (mutter's remote-desktop APIs, PipeWire,
+# Xwayland), starts with it and stops with it.
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+# Back-off restarts below; give up only on a tight crash loop.
+StartLimitIntervalSec=10min
+StartLimitBurst=20
+
+[Service]
+Type=exec
+ExecStart=@BINDIR@/xwlrvnc-ctl run
+Restart=on-failure
+RestartSec=2s
+RestartSteps=6
+RestartMaxDelaySec=2min
+# 78: settings error (fix them, then xwlrvnc-ctl restart); 2: usage error
+RestartPreventExitStatus=78 2
+# A stop (systemctl stop, or a logout, which stops graphical-session.target)
+# exits 0: xwlrvnc passes the SIGTERM on to RealVNC, stops its X server and
+# exits 0, so a logout leaves the unit "inactive", not "failed". So no
+# SuccessExitStatus=: any other status is a failure to restart from, like 69
+# (X server or desktop lost), 70 (backend failed) and 128+n (RealVNC killed by
+# signal n). (RealVNC exits 0 on any SIGTERM, a stop of this unit or not.)
+# xwlrvnc forwards SIGTERM to RealVNC and stops its X server itself
+KillMode=mixed
+TimeoutStopSec=15s
+SyslogIdentifier=xwlrvnc
+
+# Hardening that keeps the session bus, PipeWire, Xwayland and the X sockets
+# in /tmp/.X11-unix reachable (each directive tested with the real stack).
+# RealVNC's set-uid launcher cannot gain root under NoNewPrivileges (implied by
+# every seccomp-based directive here), so xwlrvnc-ctl starts
+# vncserver-x11-core directly, as -uidisplay does anyway.
+# Not used: PrivateTmp (hides /tmp/.X11-unix and RealVNC's control socket from
+# the desktop), ProtectSystem/ProtectHome (RealVNC writes ~/.vnc, received
+# files), PrivateDevices/ProtectClock/CapabilityBoundingSet (a user manager
+# cannot drop capabilities: the unit fails with status 218),
+# SystemCallFilter=@system-service (RealVNC needs more).
+UMask=0077
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Runaway guard; the whole stack normally uses well under 300 MB.
+MemoryHigh=2G
+MemoryMax=4G
+TasksMax=1024
+# Under memory pressure, lose this before the desktop itself.
+OOMScoreAdjust=100
+
+[Install]
+WantedBy=graphical-session.target

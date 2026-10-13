@@ -1,0 +1,120 @@
+#!/bin/bash
+# Removes what install.sh installed for the current user: stops and disables the
+# service, deletes the programs, the unit, the settings and runtime files.
+#
+#   ~/.local/share/xwlrvnc/uninstall.sh [--keep-config] [--purge] [--prefix DIR]
+#
+#   --keep-config  keep ~/.config/xwlrvnc (settings)
+#   --purge        also delete RealVNC's per-user files (~/.vnc) that appeared after
+#                  the first install (keys, logs, the first-run answers); files that
+#                  were there before are never touched
+# SPDX-License-Identifier: MIT
+set -uo pipefail
+
+PREFIX="$HOME/.local" KEEP=0 PURGE=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --keep-config) KEEP=1; shift;;
+    --purge) PURGE=1; shift;;
+    --prefix) PREFIX=$2; shift 2;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) echo "uninstall.sh: unknown option $1" >&2; exit 2;;
+  esac
+done
+say() { printf '==> %s\n' "$*"; }
+[ "$(id -u)" -ne 0 ] || { echo "uninstall.sh: run as the desktop user, without sudo" >&2; exit 1; }
+
+CONF_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+SHARE=$PREFIX/share/xwlrvnc
+MANIFEST=$SHARE/manifest
+UNIT=xwlrvnc.service
+[ -f "$MANIFEST" ] || { echo "uninstall.sh: no install found ($MANIFEST missing)" >&2; exit 1; }
+
+# 1. the service
+if systemctl --user show-environment >/dev/null 2>&1; then
+  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 && say "stopped and disabled $UNIT"
+  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+fi
+# a wants-link left by a manual enable with another unit path
+rm -f -- "$CONF_HOME/systemd/user/graphical-session.target.wants/$UNIT" "$CONF_HOME/systemd/user/default.target.wants/$UNIT"
+rm -rf -- "$CONF_HOME/systemd/user/$UNIT.d"
+
+# 2. RealVNC's per-user files that appeared since the first install (--purge)
+if [ $PURGE = 1 ] && [ -d "$HOME/.vnc" ] && [ ! -L "$HOME/.vnc" ] && [ ! -f "$SHARE/vnc-before.list" ]; then
+  # without the list of what was there before the install, nothing in ~/.vnc can be told apart from the user's
+  # own RealVNC settings, keys and password: keep everything
+  say "kept ~/.vnc: $SHARE/vnc-before.list is missing, so files created since the install cannot be told apart"
+elif [ $PURGE = 1 ] && [ -d "$HOME/.vnc" ] && [ ! -L "$HOME/.vnc" ]; then
+  before=$SHARE/vnc-before.list
+  vnc_real=$(realpath -- "$HOME/.vnc")
+  n=0
+  # NUL-separated, so a name with a newline is one name; find never follows a
+  # link, and each candidate's directory must really be inside ~/.vnc (no link
+  # in the path), so nothing outside it can be reached
+  while IFS= read -r -d '' p; do
+    case $p in "$HOME/.vnc/"*) ;; *) continue;; esac
+    case $(realpath -- "$(dirname -- "$p")" 2>/dev/null) in "$vnc_real"|"$vnc_real/"*) ;; *) continue;; esac
+    # (a name with a newline is never in the newline-separated list: kept as the user's if any part matches)
+    grep -qxF -- "$p" "$before" && continue
+    if [ -d "$p" ] && [ ! -L "$p" ]; then rmdir -- "$p" 2>/dev/null && n=$((n + 1))
+    else rm -f -- "$p" && n=$((n + 1)); fi
+  done < <(find "$HOME/.vnc" -mindepth 1 -depth -print0 2>/dev/null)
+  if [ ! -s "$before" ] && [ -d "$HOME/.vnc" ]; then rmdir -- "$HOME/.vnc" 2>/dev/null; fi
+  # RealVNC's empty runtime directories in /tmp, unless a RealVNC user-mode server of ours still runs
+  if [ -d "/tmp/.vnc-$(id -u)" ] && ! pgrep -u "$(id -u)" -x vncserver-x11-c >/dev/null 2>&1; then
+    find "/tmp/.vnc-$(id -u)" -depth -type d -empty -delete 2>/dev/null
+  fi
+  say "removed $n RealVNC per-user file(s) created since the install"
+fi
+
+# 3. files from the manifest (settings unless --keep-config)
+mapfile -t FILES < <(sed -n 's/^file //p' "$MANIFEST")
+mapfile -t CONFIGS < <(sed -n 's/^config //p' "$MANIFEST")
+mapfile -t DIRS < <(sed -n 's/^dir //p' "$MANIFEST")
+for f in "${FILES[@]}"; do [ -f "$f" ] || [ -L "$f" ] && rm -f -- "$f"; done
+if [ $KEEP = 0 ]; then
+  for f in "${CONFIGS[@]}"; do rm -f -- "$f" "$f".??????; done
+  # settings files we did not create are left alone, but say so
+  [ -f "$CONF_HOME/xwlrvnc/xwlrvnc.conf" ] && say "kept $CONF_HOME/xwlrvnc/xwlrvnc.conf (not created by the installer; delete it yourself)"
+else
+  say "kept settings in $CONF_HOME/xwlrvnc"
+fi
+# directories the installer created, deepest first, only if empty now
+while IFS= read -r d; do [ -d "$d" ] && rmdir -- "$d" 2>/dev/null; done < <(printf '%s\n' "${DIRS[@]}" | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)
+say "removed $(printf '%s\n' "${FILES[@]}" | grep -c .) installed file(s)"
+
+# 4. runtime leftovers: the private engine PATH dir, the -uidisplay hook copies,
+# stale stock-engine files (only ours: they carry our name and a dead pid)
+rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+rm -rf -- "$rt/xwlrvnc" "/tmp/xwlrvnc-$(id -u)"
+# The -uidisplay hook is one file per hook build, shared by every bridge of this
+# user: a bridge still running (one started by hand, say) has RealVNC preload it
+# into each UI process it starts, and without it the UI crash-loops on the
+# built-in X server. So it goes only when no bridge runs (the next start writes
+# it again anyway).
+if pgrep -u "$(id -u)" -x xwlrvnc >/dev/null 2>&1; then
+  say "kept the -uidisplay hook in $rt: a bridge started by hand still runs and uses it"
+else
+  rm -f -- "$rt"/xwlrvnc-uihook-*.so "$rt"/.xwlrvnc-uihook-*.tmp "$HOME/.cache"/xwlrvnc-uihook-*.so 2>/dev/null
+  # newer bridges keep the hook in ~/.cache/xwlrvnc when XDG_RUNTIME_DIR is not usable
+  if [ -d "$HOME/.cache/xwlrvnc" ] && [ ! -L "$HOME/.cache/xwlrvnc" ]; then
+    rm -f -- "$HOME/.cache/xwlrvnc"/xwlrvnc-uihook-*.so "$HOME/.cache/xwlrvnc"/.xwlrvnc-uihook-*.tmp 2>/dev/null
+    rmdir -- "$HOME/.cache/xwlrvnc" 2>/dev/null
+  fi
+fi
+for s in "$rt"/xwlrvnc-xvnc-*.sock; do
+  [ -S "$s" ] || continue
+  pid=${s##*xwlrvnc-xvnc-}; pid=${pid%.sock}
+  kill -0 "$pid" 2>/dev/null || rm -f -- "$s"
+done
+# a stock engine's private directory (authority file, Xvnc's socket) of a bridge
+# that was killed outright: xwlrvnc-<pid>-XXXXXX
+for d in "$rt"/xwlrvnc-[0-9]*-??????; do
+  [ -d "$d" ] && [ ! -L "$d" ] || continue
+  pid=${d##*/xwlrvnc-}; pid=${pid%-*}
+  case $pid in ''|*[!0-9]*) continue;; esac
+  kill -0 "$pid" 2>/dev/null || rm -rf -- "$d"
+done
+
+if systemctl --user show-environment >/dev/null 2>&1; then systemctl --user daemon-reload; fi
+say "xwlrvnc is uninstalled. RealVNC Server itself and its settings (~/.vnc) are unchanged$([ $PURGE = 1 ] && echo ' apart from the purged files')."
