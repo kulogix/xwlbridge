@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher: runs the package from this directory (no installation needed).
+here=$(dirname "$(readlink -f "$0")")
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m x11_a11y_proxy "$@"

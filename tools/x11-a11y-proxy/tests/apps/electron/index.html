@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Electron probe</title></head><body>
+<p>Probe label</p>
+<button accesskey="s" title="Adds the digit seven" onclick="console.log('ACTIVATE Seven')">Seven</button><br>
+<label><input type="checkbox" accesskey="c" onchange="console.log('TOGGLE ' + this.checked)"> Check me</label><br>
+<input type="text" placeholder="type here" aria-label="entry" oninput="console.log('TEXT ' + this.value)"><br>
+<input type="range" min="0" max="100" value="40" aria-label="level" oninput="console.log('VALUE ' + this.value)">
+<script>
+document.addEventListener('keydown', e => { if (e.ctrlKey && e.key === 'k') { console.log('SHORTCUT ctrl+k'); e.preventDefault(); } });
+const css = () => console.log('SETTINGS electron-css', JSON.stringify({ reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+  contrast: matchMedia('(prefers-contrast: more)').matches, forcedColors: matchMedia('(forced-colors: active)').matches,
+  dpr: devicePixelRatio, fontSize: getComputedStyle(document.body).fontSize,
+  canvasText: getComputedStyle(document.body).color, canvas: getComputedStyle(document.body).backgroundColor }));
+css(); setInterval(css, 4000);
+</script>
+</body></html>
