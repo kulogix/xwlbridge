@@ -71,8 +71,8 @@ use x11rb::protocol::render::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GrabMode,
-    GrabStatus, MapState, PropMode, StackMode, Window, WindowClass,
+    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, MapState,
+    PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
@@ -358,23 +358,21 @@ fn tool_out_releases(buttons: &[u32], pointer_entered: bool) -> (Vec<u32>, bool)
 }
 
 /// Whether the reverse pointer switches to relative (locked) delivery: no
-/// lock is held, the client hid the cursor and an X client grab was detected
-/// (SDL2's relative mode: XGrabPointer, hidden cursor, XI2 raw motion, no
-/// warps).
-fn relative_mode_due(no_lock: bool, blank: bool, client_grab: bool) -> bool {
-    no_lock && blank && client_grab
+/// lock is held, the client hid the cursor and a client's pointer grab was
+/// seen to confine the pointer to a window (SDL2's relative mode: a core
+/// `GrabPointer` with confine-to, hidden cursor, XI2 raw motion, no warps; a
+/// grab without confine-to — GTK 4's XI2 grabs, a pop-up grab — does not
+/// count, and nothing does without RECORD, which sees the grabs).
+fn relative_mode_due(no_lock: bool, blank: bool, confining: bool) -> bool {
+    no_lock && blank && confining
 }
 
 /// Whether a held pointer lock is released and absolute motion resumes: the
-/// cursor is visible again.
-fn relative_mode_ends(locked: bool, blank: bool) -> bool {
-    locked && !blank
-}
-
-/// Whether a new `client_grab` probe may be sent now: at most one every
-/// 100 ms, since motion events come at the desktop's rate.
-fn grab_probe_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    last.is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(100))
+/// cursor is visible again; or the lock was taken for a client's confining
+/// grab and the grab is gone (a warp-triggered lock ends only when the
+/// cursor shows).
+fn relative_mode_ends(locked: bool, blank: bool, grab: bool, confining: bool) -> bool {
+    locked && (!blank || (grab && !confining))
 }
 
 /// A Linux BTN_* code (Wayland's wl_pointer.button) as an X button, numbered
@@ -570,6 +568,9 @@ struct Lock {
     relative: zwp_relative_pointer_v1::ZwpRelativePointerV1,
     window: Window,
     active: bool,
+    /// Taken for a client's confining pointer grab (rather than for a warp
+    /// of a hidden pointer): it ends when the grab does.
+    grab: bool,
     /// Sub-pixel motion not sent yet.
     rest: (f64, f64),
 }
@@ -622,9 +623,6 @@ struct State {
     /// Where the reverse pointer was last put (root coordinates).
     last_pos: Option<(i16, i16)>,
     lock: Option<Lock>,
-    /// When `client_grab` last asked (it is asked at most every 100 ms while
-    /// the cursor is blank and the pointer is not locked).
-    grab_asked: Option<std::time::Instant>,
     cursor: Option<CursorImage>,
     keys_down: Vec<u8>,
     buttons_down: Vec<u8>,
@@ -763,7 +761,6 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         enter_serial: 0,
         last_pos: None,
         lock: None,
-        grab_asked: None,
         cursor: None,
         keys_down: Vec::new(),
         buttons_down: Vec::new(),
@@ -1835,16 +1832,18 @@ impl State {
                 now.0,
                 now.1
             );
-            self.lock_pointer(w);
+            self.lock_pointer(w, false);
         } else if self.lock.is_none() {
-            // no warp was seen: a client grab plus a blank cursor is the
-            // other relative-mode trigger (checked here and on cursor change)
+            // no warp was seen: a client's confining pointer grab (a core
+            // GrabPointer with confine-to, seen on RECORD; GTK 4's XI2 grabs
+            // don't confine) plus a hidden cursor is the other relative-mode
+            // trigger, checked here and on cursor change
             let blank = self.cursor.as_ref().is_some_and(|c| c.blank);
-            if relative_mode_due(true, blank, blank && self.ask_grab()) {
+            if relative_mode_due(true, blank, blank && super::record::confining_grab()) {
                 crate::log!(
-                    "-showwindows: the client hid the cursor and grabbed the pointer (relative mode): locking the desktop's pointer for relative motion"
+                    "-showwindows: the client hid the cursor and its pointer grab confines the pointer (relative mode): locking the desktop's pointer for relative motion"
                 );
-                self.lock_pointer(w);
+                self.lock_pointer(w, true);
                 if self.lock.is_some() {
                     return; // the X pointer stays put; relative motion follows once locked
                 }
@@ -1852,63 +1851,6 @@ impl State {
         }
         self.last_pos = Some((x, y));
         let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
-    }
-
-    /// Rate-limited `client_grab` (motion events come at the desktop's rate).
-    fn ask_grab(&mut self) -> bool {
-        let now = std::time::Instant::now();
-        if !grab_probe_due(self.grab_asked, now) {
-            return false;
-        }
-        self.grab_asked = Some(now);
-        self.client_grab()
-    }
-
-    /// Whether an X client holds the reverse pointer grabbed (SDL's relative
-    /// mouse mode, Quake-style games: XGrabPointer with the cursor hidden,
-    /// motion read from XI2 raw events, no warps). X has no request that
-    /// says so; a grab of our own on the deepest window under the pointer
-    /// answers AlreadyGrabbed then, and otherwise succeeds without any
-    /// crossing event (the pointer is already in that window) and is dropped
-    /// at once.
-    fn client_grab(&self) -> bool {
-        let mut w = self.root;
-        for _ in 0..32 {
-            let Ok(Ok(r)) = self
-                .x
-                .xinput_xi_query_pointer(w, self.devs.pointer)
-                .map(|c| c.reply())
-            else {
-                return false;
-            };
-            if r.child == x11rb::NONE {
-                break;
-            }
-            w = r.child;
-        }
-        let Ok(Ok(r)) = self
-            .x
-            .xinput_xi_grab_device(
-                w,
-                x11rb::CURRENT_TIME,
-                x11rb::NONE,
-                self.devs.pointer,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                xinput::GrabOwner::NO_OWNER,
-                &[0u32],
-            )
-            .map(|c| c.reply())
-        else {
-            return false;
-        };
-        if r.status == GrabStatus::SUCCESS {
-            let _ = self
-                .x
-                .xinput_xi_ungrab_device(x11rb::CURRENT_TIME, self.devs.pointer);
-            return false;
-        }
-        r.status == GrabStatus::ALREADY_GRABBED || r.status == GrabStatus::FROZEN
     }
 
     /// Smooth scrolling (touchpad fingers, continuous devices) as wheel
@@ -2246,7 +2188,7 @@ impl State {
         Some(((r.root_x >> 16) as i16, (r.root_y >> 16) as i16))
     }
 
-    fn lock_pointer(&mut self, w: Window) {
+    fn lock_pointer(&mut self, w: Window, grab: bool) {
         let (Some(constraints), Some(manager), Some(pointer), Some(s)) = (
             self.constraints.as_ref(),
             self.relative_manager.as_ref(),
@@ -2269,8 +2211,21 @@ impl State {
             relative,
             window: w,
             active: false,
+            grab,
             rest: (0.0, 0.0),
         });
+    }
+
+    /// Whether the held pointer lock ends now: the cursor is visible again,
+    /// or the lock was taken for a client's confining grab and the grab is
+    /// gone (see `relative_mode_ends`).
+    fn lock_ended(&self, blank: bool) -> bool {
+        relative_mode_ends(
+            self.lock.is_some(),
+            blank,
+            self.lock.as_ref().is_some_and(|l| l.grab),
+            super::record::confining_grab(),
+        )
     }
 
     fn unlock(&mut self) {
@@ -2296,6 +2251,13 @@ impl State {
     }
 
     fn relative_motion(&mut self, dx: f64, dy: f64) {
+        // the lock ends when the cursor shows again, or (for one taken for
+        // a client's confining grab) when the grab does; a warp-triggered
+        // lock keeps until the cursor shows
+        let blank = self.cursor.as_ref().is_some_and(|c| c.blank);
+        if self.lock_ended(blank) {
+            self.unlock();
+        }
         let Some(l) = self.lock.as_mut() else {
             return;
         };
@@ -2516,16 +2478,17 @@ impl State {
         }
         if blank && self.lock.is_none() {
             // a warp while blank locks (see motion); so does a client's
-            // pointer grab (relative mode), checked here and on motion
+            // confining pointer grab (relative mode), checked here and on
+            // motion
             if let Some(w) = self.pointer_on
-                && self.ask_grab()
+                && super::record::confining_grab()
             {
                 crate::log!(
-                    "-showwindows: the client hid the cursor and grabbed the pointer (relative mode): locking the desktop's pointer for relative motion"
+                    "-showwindows: the client hid the cursor and its pointer grab confines the pointer (relative mode): locking the desktop's pointer for relative motion"
                 );
-                self.lock_pointer(w);
+                self.lock_pointer(w, true);
             }
-        } else if relative_mode_ends(self.lock.is_some(), blank) {
+        } else if self.lock_ended(blank) {
             self.unlock();
         }
         self.apply_cursor();
@@ -3883,32 +3846,34 @@ mod tests {
     }
 
     #[test]
-    fn relative_mode_needs_blank_cursor_grab_and_no_lock() {
-        // client grab + hidden cursor + no lock: switch to relative delivery
+    fn relative_mode_needs_a_confining_grab_and_no_lock() {
+        // a client's confining grab + hidden cursor + no lock: relative
+        // delivery
         assert!(relative_mode_due(true, true, true));
         // already locked: no new lock
         assert!(!relative_mode_due(false, true, true));
         // cursor visible: absolute motion
         assert!(!relative_mode_due(true, false, true));
-        // no client grab: absolute motion
+        // no confining grab: a grab without confine-to (GTK 4's XI2 grabs,
+        // which RECORD never sees confine) or none at all: absolute motion
         assert!(!relative_mode_due(true, true, false));
-        // release: the cursor is visible again while locked, absolute resumes
-        assert!(relative_mode_ends(true, false));
-        assert!(!relative_mode_ends(true, true));
-        assert!(!relative_mode_ends(false, false));
     }
 
     #[test]
-    fn grab_probes_are_rate_limited() {
-        let now = std::time::Instant::now();
-        assert!(grab_probe_due(None, now));
-        assert!(!grab_probe_due(
-            Some(now - std::time::Duration::from_millis(50)),
-            now
-        ));
-        assert!(grab_probe_due(
-            Some(now - std::time::Duration::from_millis(150)),
-            now
-        ));
+    fn a_lock_ends_when_the_cursor_shows_or_its_confining_grab_does() {
+        // the cursor is visible again: absolute motion resumes, however the
+        // lock was taken
+        assert!(relative_mode_ends(true, false, true, true));
+        assert!(relative_mode_ends(true, false, false, false));
+        // still blank: a grab-triggered lock ends with the grab
+        assert!(!relative_mode_ends(true, true, true, true));
+        assert!(relative_mode_ends(true, true, true, false));
+        // a warp-triggered lock ends only when the cursor shows, grab or
+        // no grab
+        assert!(!relative_mode_ends(true, true, false, false));
+        assert!(!relative_mode_ends(true, true, false, true));
+        // not locked: nothing to end
+        assert!(!relative_mode_ends(false, true, true, false));
+        assert!(!relative_mode_ends(false, false, false, false));
     }
 }

@@ -32,11 +32,17 @@
 //! at once (`-coldconnect start`), so one that reads a moment later gets the
 //! desktop; and who leaves after reading the screen, which keeps capture up a
 //! while (`-linger`) for the next one-shot screenshot.
+//!
+//! And whose pointer grabs confine the pointer to a window (core
+//! `GrabPointer`/`UngrabPointer`): the -showwindows thread locks the desktop's
+//! pointer for relative motion while the cursor is hidden and one is held
+//! (SDL2's relative mouse mode; GTK 4's XI2 grabs have no confine-to and do
+//! not count), see [`confining_grab`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::{Connection, RequestConnection};
@@ -58,6 +64,10 @@ const GET_IMAGE: u8 = 73;
 const SHM_GET_IMAGE: u8 = 4;
 /// The core NoOperation request: the agent's marker (see `attrib`).
 const NO_OPERATION: u8 = 127;
+/// The core requests that take (`GrabPointer`) and end (`UngrabPointer`) a
+/// client's pointer grab.
+const GRAB_POINTER: u8 = 26;
+const UNGRAB_POINTER: u8 = 27;
 
 /// RECORD's reply categories (the protocol numbers them; x11rb has no names).
 const FROM_CLIENT: u8 = 1;
@@ -237,6 +247,53 @@ pub fn lock(holds: &Mutex<Holds>) -> std::sync::MutexGuard<'_, Holds> {
     holds.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Which clients hold a core pointer grab that confines the pointer to a
+/// window (its confine-to window), from the clients' `GrabPointer` and
+/// `UngrabPointer` requests, one entry per client. Shared with the
+/// -showwindows thread, which locks the desktop's pointer for relative motion
+/// while the cursor is hidden and one is held (SDL2's relative mouse mode): a
+/// grab without confine-to (GTK 4's XI2 grabs, a pop-up grab) does not count,
+/// and with no RECORD thread none is ever seen, so no grab triggers the lock.
+/// One RECORD thread at a time runs, and one starts and ends with the map
+/// cleared (grabs seen before it started, or after it stopped, are none of
+/// its business).
+static CONFINES: LazyLock<Mutex<HashMap<u32, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn confines() -> std::sync::MutexGuard<'static, HashMap<u32, u32>> {
+    CONFINES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether some client holds a pointer grab that confines the pointer to a
+/// window: the -showwindows relative-mode trigger, together with a hidden
+/// cursor.
+pub fn confining_grab() -> bool {
+    !confines().is_empty()
+}
+
+/// Forgets every client's grab, at the start and end of a RECORD thread's
+/// run (see [`CONFINES`]).
+pub fn clear_grabs() {
+    confines().clear();
+}
+
+/// A client's `GrabPointer` request: it now holds a grab that confines the
+/// pointer to `confine` — or holds none, when `confine` is 0 (None): a grab
+/// without confine-to (a pop-up grab), or a grab that failed (RECORD sees
+/// the request, not its reply), replaces a held one either way.
+fn grab_seen(confines: &mut HashMap<u32, u32>, client: u32, confine: u32) {
+    if confine != 0 {
+        confines.insert(client, confine);
+    } else {
+        confines.remove(&client);
+    }
+}
+
+/// The client's `UngrabPointer` request, or the client itself (a grab ends
+/// when its client does): it holds no confining grab.
+fn grab_gone(confines: &mut HashMap<u32, u32>, client: u32) {
+    confines.remove(&client);
+}
+
 /// Where root reads are reported: milliseconds on [`super::now_ms`]'s clock
 /// of the last one by a client other than the agent (0: none yet).
 pub struct RootReads {
@@ -354,6 +411,8 @@ pub fn run(
     stop: &AtomicBool,
     attrib: Attrib,
 ) -> Result<(), super::AnyError> {
+    // what a RECORD thread of ours saw before, or a dead one left behind
+    clear_grabs();
     let xtest = conn
         .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)?
         .ok_or("no XTEST")?
@@ -415,13 +474,24 @@ pub fn run(
         client_died: false,
         ..range
     };
-    // The range with a core request goes first: Xorg (record.c,
+    // whose pointer grabs confine (SDL2's relative mode): see `grab_confine`
+    let grabs = Range {
+        core_requests: Range8 {
+            first: GRAB_POINTER,
+            last: UNGRAB_POINTER,
+        },
+        ext_requests: none_ext,
+        client_started: false,
+        client_died: false,
+        ..range
+    };
+    // The ranges with core requests go first: Xorg (record.c,
     // RecordConvertRangesToIntervals) sizes the one interval list core and
     // extension requests share as twice the ranges from the first one with a
     // core request on, and asserts (the server aborts) when the extension
     // requests then overflow it, which XTest's range ahead of this one did.
-    // (XTest's range has a core request too now, NoOperation: two core and two
-    // extension intervals, in a list sized for four.)
+    // (All three ranges have core requests now: three core and two extension
+    // intervals, in a list sized for six.)
     let ranges = [
         reads_of(
             Range8 {
@@ -431,6 +501,7 @@ pub fn run(
             shm,
             SHM_GET_IMAGE,
         ),
+        grabs,
         range,
     ];
     let ctx = conn.generate_id()?;
@@ -514,6 +585,10 @@ pub fn run(
                         if r.xid_base == agent_base {
                             ledger.marker();
                         }
+                    } else if op == UNGRAB_POINTER {
+                        grab_gone(&mut confines(), r.xid_base);
+                    } else if let Some(confine) = grab_confine(op, body, little) {
+                        grab_seen(&mut confines(), r.xid_base, confine);
                     } else if r.xid_base != reads.agent_base
                         && reads_pixels(op, minor, shm)
                         && body.len() >= 4
@@ -589,6 +664,8 @@ pub fn run(
                     reads.framebuffer.note_oneshot();
                 }
                 classifier.known.remove(&r.xid_base);
+                // its grab went with it (see `grab_gone`)
+                grab_gone(&mut confines(), r.xid_base);
                 // the reverse thread's connection is gone: its X slot (and so
                 // its resource base) goes to the next client, whose input must
                 // count again (review F1)
@@ -733,6 +810,14 @@ fn fake_motion(body: &[u8], little: bool) -> Option<Motion> {
         x: i16_at(&body[20..]),
         y: i16_at(&body[22..]),
     })
+}
+
+/// The confine-to window of a core `GrabPointer` request's `body` (after the
+/// 4-byte header), in the client's byte order: grab-window, event-mask,
+/// pointer- and keyboard-mode, confine-to, cursor, time (20 bytes whole).
+/// `None` for other requests, or one too short to hold the field.
+fn grab_confine(op: u8, body: &[u8], little: bool) -> Option<u32> {
+    (op == GRAB_POINTER && body.len() >= 12).then(|| u32_at(&body[8..12], little))
 }
 
 /// A root read this long after the previous one wakes the agent.
@@ -1187,6 +1272,104 @@ mod tests {
             }
         });
         seen
+    }
+
+    /// A core GrabPointer request as libX11 sends it (xGrabPointerReq):
+    /// opcode 26, owner-events, length 6, grab-window, event-mask, the
+    /// pointer- and keyboard-modes, the confine-to window (0 for None), the
+    /// cursor and the time, in the client's byte order.
+    fn grab_pointer_req(little: bool, confine: u32) -> Vec<u8> {
+        let w16 = |v: u16| {
+            if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
+        let w32 = |v: u32| {
+            if little {
+                v.to_le_bytes()
+            } else {
+                v.to_be_bytes()
+            }
+        };
+        let mut r = vec![GRAB_POINTER, 0];
+        r.extend_from_slice(&w16(6));
+        r.extend_from_slice(&w32(0x4000_0001)); // grab-window
+        r.extend([0, 4]); // event-mask: button 3
+        r.extend([0, 0]); // pointer- and keyboard-mode
+        r.extend_from_slice(&w32(confine));
+        r.extend_from_slice(&w32(0)); // cursor
+        r.extend_from_slice(&w32(0)); // time
+        r
+    }
+
+    /// The confine-to windows of every GrabPointer request in `data`.
+    fn confines_in(data: &[u8], little: bool) -> Vec<u32> {
+        let mut seen = Vec::new();
+        for_each_request(data, little, false, |op, _, body, _| {
+            if let Some(c) = grab_confine(op, body, little) {
+                seen.push(c);
+            }
+        });
+        seen
+    }
+
+    #[test]
+    fn grab_pointer_requests_carry_their_confine_to() {
+        for little in [true, false] {
+            // SDL2's relative mode grabs its window
+            let data = grab_pointer_req(little, 0x4000_0002);
+            assert_eq!(
+                confines_in(&data, little),
+                vec![0x4000_0002],
+                "little {little}"
+            );
+            // a pop-up grab (or a failed one): no confine-to
+            assert_eq!(confines_in(&grab_pointer_req(little, 0), little), vec![0]);
+        }
+        // another request's body is not read for a confine-to
+        let body = grab_pointer_req(true, 0x4000_0002);
+        assert!(grab_confine(GET_IMAGE, &body[4..], true).is_none());
+        assert!(grab_confine(UNGRAB_POINTER, &[0, 0, 0, 0], true).is_none());
+        // a request too short to hold the field
+        assert!(grab_confine(GRAB_POINTER, &[0, 0, 0, 0, 0, 0, 0, 0], true).is_none());
+    }
+
+    #[test]
+    fn clients_confining_grabs_come_and_go_per_client() {
+        let mut g = HashMap::new();
+        // SDL2's grab: its confine-to window
+        grab_seen(&mut g, 1, 0x4000_0001);
+        assert_eq!(g.get(&1), Some(&0x4000_0001));
+        // another client's grab without confine-to adds nothing
+        grab_seen(&mut g, 2, 0);
+        assert!(!g.contains_key(&2));
+        // a re-grab without confine-to, and an UngrabPointer, end a held one
+        grab_seen(&mut g, 1, 0);
+        assert!(!g.contains_key(&1));
+        grab_seen(&mut g, 1, 0x4000_0001);
+        grab_gone(&mut g, 1);
+        assert!(!g.contains_key(&1));
+        // a client dying ends its grab, not another client's
+        grab_seen(&mut g, 1, 0x4000_0001);
+        grab_seen(&mut g, 2, 0x4000_0002);
+        grab_gone(&mut g, 2);
+        assert_eq!(g.get(&1), Some(&0x4000_0001));
+        grab_gone(&mut g, 1);
+        assert!(g.is_empty());
+    }
+
+    /// The grab state is shared (with the -showwindows thread) and a RECORD
+    /// thread's start and end forget it.
+    #[test]
+    fn the_grab_state_is_shared_and_forgotten() {
+        clear_grabs();
+        assert!(!confining_grab());
+        grab_seen(&mut confines(), 3, 0x4000_0003);
+        assert!(confining_grab());
+        clear_grabs();
+        assert!(!confining_grab());
     }
 
     #[test]

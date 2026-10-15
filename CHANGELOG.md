@@ -25,7 +25,7 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 - `-showwindows`: a popup placed past the monitor's edge slides onto it (its X window follows); a tooltip or notification takes no pointer input.
 - `-showwindows`: when the keyboard leaves for another window, the client's open menus are closed with Escape (one per menu-like popup, at most 4).
 - `-showwindows`: when the desktop's keyboard leaves all shown windows, the reverse keyboard's X focus is cleared, so games see FocusOut and stop receiving keys and focus-dependent joystick input while the GNOME user is elsewhere.
-- `-showwindows`: SDL2 relative-mode mouse-look works without warps: a client that grabs the pointer with a hidden cursor locks the desktop's pointer, and the desktop's unaccelerated motion is injected as relative XTest motion (before, only a warp of a hidden pointer locked, so SDL read absolute positions as deltas and the look ran to the screen corner).
+- `-showwindows`: SDL2 relative-mode mouse-look works without warps: a client whose pointer grab confines the pointer to a window (a core `GrabPointer` with confine-to, seen on RECORD) and hides the cursor locks the desktop's pointer, and the desktop's unaccelerated motion is injected as relative XTest motion; the lock ends when the grab does (UngrabPointer, the client leaving, a new grab without confine-to) or the cursor shows. A grab without confine-to does not lock (GTK 4's XI2 grabs during drag-and-drop and popups) (before, any grab of a hidden cursor locked, and such a lock kept every later absolute-pointer step from working; only a warp of a hidden pointer locked before that, so SDL read absolute positions as deltas and the look ran to the screen corner).
 
 ## 0.1.0 (2026-10-13)
 

@@ -1514,6 +1514,8 @@ impl Agent {
                              and forwarding every client's input to the desktop"
                         );
                     }
+                    // its grab sightings go with it (no RECORD, no grab trigger)
+                    record::clear_grabs();
                     rec_ledger.close();
                     rec.store(false, Ordering::Release);
                 })?;

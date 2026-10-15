@@ -115,7 +115,7 @@ Ubuntu 26.04 VM: `-showwindows` with xcalc and a GTK 3 app passed 6/6. Both GNOM
 
 ## Games on `-showwindows`
 
-- Mouse-look works for both SDL generations: a game that hides the cursor and warps the pointer (SDL1-style) or grabs the pointer with a hidden cursor and reads raw motion without warping (SDL2's relative mode) locks the desktop's pointer. While locked, the game receives the desktop's unaccelerated motion as relative motion and the desktop pointer stays put; the lock ends when the cursor is visible again.
+- Mouse-look works for both SDL generations: a game that hides the cursor and warps the pointer (SDL1-style) locks the desktop's pointer, and so does one whose pointer grab confines the pointer to a window (SDL2's relative mode: a core GrabPointer with confine-to; RECORD sees the grabs, so without it only the warp locks). While locked, the game receives the desktop's unaccelerated motion as relative motion and the desktop pointer stays put; the lock ends when the cursor is visible again, or when the confining grab ends. A grab that does not confine (GTK 4's XI2 grabs during drag-and-drop and popups) does not lock.
 - The X focus follows the desktop keyboard: when it leaves the shown windows, the focus is cleared, so a game sees FocusOut and stops receiving keys and focus-dependent joystick input until the desktop keyboard comes back to one of its windows.
 
 ## When to use which
