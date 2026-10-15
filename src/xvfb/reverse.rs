@@ -43,8 +43,8 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-    wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
+    wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection as WlConnection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
@@ -54,6 +54,7 @@ use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1};
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
@@ -63,10 +64,11 @@ use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, MapState,
-    StackMode, Window, WindowClass,
+    PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use super::{AnyError, Auth};
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
@@ -80,6 +82,10 @@ pub const MASTER_NAME: &str = "xwlbridge-reverse";
 /// the compositor connection every shown window shares; review F3).
 const MAX_SIDE: u16 = 16384;
 const MAX_POOL: usize = 1 << 30;
+
+/// Scroll distance (surface pixels) of one emulated wheel click for smooth
+/// (touchpad, continuous) scrolling: Xwayland's step.
+const SCROLL_STEP: f64 = 10.0;
 
 /// The plain background of `-showscreen` (no desktop picture: that would
 /// show the desktop inside itself).
@@ -177,6 +183,59 @@ fn popup_anchor(dx: i32, dy: i32, pw: u16, ph: u16) -> ((i32, i32), (i32, i32)) 
     ((ax, ay), (dx - ax, dy - ay))
 }
 
+/// Whether an override-redirect window is a toolkit's invisible helper (off
+/// the screen, or at most 2x2) rather than something to show.
+fn helper_window(x: i32, y: i32, w: i32, h: i32, screen: (u16, u16)) -> bool {
+    let (sw, sh) = (i32::from(screen.0), i32::from(screen.1));
+    x + w <= 0 || y + h <= 0 || x >= sw || y >= sh || (w <= 2 && h <= 2)
+}
+
+/// WM_NORMAL_HINTS (as 32-bit values) -> ((min w, h), (max w, h)), 0 = none;
+/// values that are no window size (Qt's 16777215, negative) count as none.
+fn size_limits(v: &[u32]) -> ((i32, i32), (i32, i32)) {
+    let flags = v.first().copied().unwrap_or(0);
+    let ok = |n: u32| {
+        if n > 0 && n <= u32::from(MAX_SIDE) {
+            n as i32
+        } else {
+            0
+        }
+    };
+    let min = if flags & (1 << 4) != 0 && v.len() >= 7 {
+        (ok(v[5]), ok(v[6]))
+    } else {
+        (0, 0)
+    };
+    let max = if flags & (1 << 5) != 0 && v.len() >= 9 {
+        (ok(v[7]), ok(v[8]))
+    } else {
+        (0, 0)
+    };
+    (min, max)
+}
+
+/// xdg_toplevel configure states -> (maximised, fullscreen).
+fn toplevel_states(states: &[u8]) -> (bool, bool) {
+    let mut out = (false, false);
+    for c in states.chunks_exact(4) {
+        match u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) {
+            1 => out.0 = true,
+            2 => out.1 = true,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Adds `value` pixels of smooth scrolling to `rest` and takes whole
+/// `SCROLL_STEP`s out of it as wheel clicks (signed, + = down/right).
+fn scroll_steps(rest: &mut f64, value: f64) -> i32 {
+    *rest += value;
+    let steps = (*rest / SCROLL_STEP).trunc();
+    *rest -= steps * SCROLL_STEP;
+    steps as i32
+}
+
 /// Whether a cursor image shows nothing (every pixel transparent).
 fn blank_cursor(image: &[u32]) -> bool {
     image.iter().all(|p| p >> 24 == 0)
@@ -242,6 +301,17 @@ struct Atoms {
     net_wm_name: u32,
     net_wm_window_type: u32,
     utf8_string: u32,
+    net_wm_state: u32,
+    net_wm_state_modal: u32,
+    net_wm_state_max_vert: u32,
+    net_wm_state_max_horz: u32,
+    net_wm_state_fullscreen: u32,
+    net_wm_state_hidden: u32,
+    motif_wm_hints: u32,
+    wm_change_state: u32,
+    net_wm_moveresize: u32,
+    net_supported: u32,
+    net_supporting_wm_check: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -296,6 +366,11 @@ struct Shown {
     iconic: bool,
     /// The transient parent whose first frame ours waits for.
     parent: Option<Window>,
+    /// A modal dialog's xdg_dialog_v1 (GNOME attaches it to its parent).
+    dialog: Option<xdg_dialog_v1::XdgDialogV1>,
+    /// The compositor's last maximised / fullscreen state, as told to X.
+    maximized: bool,
+    fullscreen: bool,
 }
 
 /// `-showscreen`: a window of the X screen, composited onto the canvas.
@@ -362,6 +437,7 @@ struct State {
     constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
     relative_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
+    dialogs: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     windows: HashMap<Window, Shown>,
     /// Shown popups, oldest first (the last is the topmost).
     popups: Vec<Window>,
@@ -401,6 +477,18 @@ struct State {
     lock_events: Vec<bool>,
     /// Relative motion while locked.
     relative: Vec<(f64, f64)>,
+    /// Toplevel states the compositor configured: (window, maximised, fullscreen).
+    states: Vec<(Window, bool, bool)>,
+    /// Serial of the last button press on a shown window (for an interactive move).
+    press_serial: u32,
+    /// A window that moved itself with the pointer, being moved by the desktop
+    /// instead: its motion is not forwarded until the pointer comes back.
+    moving: Option<Window>,
+    /// The current pointer frame's axis source, and whether it had discrete steps.
+    axis_source: Option<wl_pointer::AxisSource>,
+    axis_discrete_seen: bool,
+    /// Smooth scroll not yet sent as wheel clicks (horizontal, vertical).
+    axis_rest: (f64, f64),
     qh: QueueHandle<State>,
 }
 
@@ -437,6 +525,17 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_wm_name: atom(b"_NET_WM_NAME")?,
         net_wm_window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
         utf8_string: atom(b"UTF8_STRING")?,
+        net_wm_state: atom(b"_NET_WM_STATE")?,
+        net_wm_state_modal: atom(b"_NET_WM_STATE_MODAL")?,
+        net_wm_state_max_vert: atom(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
+        net_wm_state_max_horz: atom(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+        net_wm_state_fullscreen: atom(b"_NET_WM_STATE_FULLSCREEN")?,
+        net_wm_state_hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
+        motif_wm_hints: atom(b"_MOTIF_WM_HINTS")?,
+        wm_change_state: atom(b"WM_CHANGE_STATE")?,
+        net_wm_moveresize: atom(b"_NET_WM_MOVERESIZE")?,
+        net_supported: atom(b"_NET_SUPPORTED")?,
+        net_supporting_wm_check: atom(b"_NET_SUPPORTING_WM_CHECK")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -460,6 +559,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         constraints: None,
         relative_manager: None,
         viewporter: None,
+        dialogs: None,
         windows: HashMap::new(),
         popups: Vec::new(),
         adopted: Vec::new(),
@@ -483,6 +583,12 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         popup_done: Vec::new(),
         lock_events: Vec::new(),
         relative: Vec::new(),
+        states: Vec::new(),
+        press_serial: 0,
+        moving: None,
+        axis_source: None,
+        axis_discrete_seen: false,
+        axis_rest: (0.0, 0.0),
         qh: qh.clone(),
     };
     queue.roundtrip(&mut state)?;
@@ -523,6 +629,10 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
 
     if screen_mode {
         state.show_screen(&qh, display)?;
+    } else if let Err(e) = state.announce_wm() {
+        crate::warning!(
+            "-showwindows: can't announce the window-manager requests it carries out: {e}"
+        );
     }
     // what is already up
     let tree = state.x.query_tree(root)?.reply()?;
@@ -729,6 +839,19 @@ impl State {
             toplevel.set_parent(Some(pt));
             parent = Some(p);
         }
+        // WM_NORMAL_HINTS' min/max size, as a window manager honours them
+        self.apply_size_hints(w, &toplevel);
+        // a modal dialog (_NET_WM_STATE_MODAL, or Motif's modal input mode)
+        // with a parent: GNOME attaches it to the parent, as it does on X
+        let dialog = match (&parent, self.dialogs.as_ref()) {
+            (Some(_), Some(d)) if self.is_modal(w) => {
+                let x = d.get_xdg_dialog(&toplevel, qh, ());
+                x.set_modal();
+                crate::log!("-showwindows: {w:#x} is a modal dialog of its parent");
+                Some(x)
+            }
+            _ => None,
+        };
         surface.commit();
         crate::log!(
             "-showwindows: showing {w:#x} {:?} (class {:?}) {}x{}+{}+{} depth {}{}{}",
@@ -769,6 +892,9 @@ impl State {
                 client,
                 iconic,
                 parent,
+                dialog,
+                maximized: false,
+                fullscreen: false,
             },
         );
         Ok(())
@@ -779,6 +905,29 @@ impl State {
     /// up (a submenu), else its window under the pointer or with the
     /// keyboard, else its transient parent, else any of its windows.
     fn show_popup(&mut self, w: Window, qh: &QueueHandle<State>) -> Result<(), AnyError> {
+        // toolkits' invisible helpers (GTK's drag-and-drop IPC window: 1x1 at
+        // -99,-99) are not popups: the compositor dismisses such a popup, and
+        // the pointer leaving the parent then ends the drag
+        let g = self.x.get_geometry(w)?.reply()?;
+        let (gw, gh) = (
+            i32::from(g.width + 2 * g.border_width),
+            i32::from(g.height + 2 * g.border_width),
+        );
+        if helper_window(i32::from(g.x), i32::from(g.y), gw, gh, self.screen) {
+            crate::vlog!(
+                "-showwindows: {w:#x} is an override-redirect window off the screen or {gw}x{gh}: not shown"
+            );
+            return Ok(());
+        }
+        // a drag-and-drop icon sits under the pointer: as a popup it would take
+        // the pointer from the window the drag started in (the pointer leaves
+        // it, its buttons are released, and the drag ends at once); the
+        // desktop's cursor shows the drag (the X cursor is shown) instead
+        let kind = self.window_type(w);
+        if kind == "dnd" {
+            crate::vlog!("-showwindows: {w:#x} is a drag-and-drop icon: not shown");
+            return Ok(());
+        }
         let client = self.client_of(w);
         let mine = |s: &&Window, windows: &HashMap<Window, Shown>| {
             windows
@@ -820,16 +969,27 @@ impl State {
         positioner.set_offset(ox, oy);
         positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
         positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
-        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::empty());
+        // the X client placed it for the X screen; on the desktop it may not
+        // fit the monitor there: let the compositor slide it in (the X window
+        // follows, see `placed`)
+        positioner.set_constraint_adjustment(
+            xdg_positioner::ConstraintAdjustment::SlideX
+                | xdg_positioner::ConstraintAdjustment::SlideY,
+        );
         let compositor = self.compositor.as_ref().expect("checked at start");
         let surface = compositor.create_surface(qh, w);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, w);
         let popup = xdg_surface.get_popup(Some(&p.xdg_surface), &positioner, qh, w);
         positioner.destroy();
+        if kind == "tooltip" || kind == "notification" {
+            let region = compositor.create_region(qh, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+        }
         surface.commit();
         crate::log!(
             "-showwindows: showing {w:#x} (override-redirect, {}) as a popup of {parent:#x} at {dx},{dy} {}x{}",
-            self.window_type(w),
+            kind,
             width,
             height
         );
@@ -855,6 +1015,9 @@ impl State {
                 client,
                 iconic: false,
                 parent: None,
+                dialog: None,
+                maximized: false,
+                fullscreen: false,
             },
         );
         self.popups.push(w);
@@ -928,6 +1091,9 @@ impl State {
         if self.lock.as_ref().is_some_and(|l| l.window == w) {
             self.unlock();
         }
+        if let Some(d) = s.dialog {
+            d.destroy();
+        }
         match s.role {
             Role::Toplevel(t) | Role::Screen { toplevel: t, .. } => t.destroy(),
             Role::Popup { popup, .. } => popup.destroy(),
@@ -983,6 +1149,31 @@ impl State {
                     self.screen_dirty();
                     return;
                 }
+                // a client moving its own top-level while a button is held on
+                // it (a drag handle, a toolkit's emulated move without a
+                // window manager): the desktop moves the shown window instead;
+                // left to X, the move would shift the pointer mapping and run
+                // away
+                if !self.screen_mode()
+                    && self.moving.is_none()
+                    && !self.buttons_down.is_empty()
+                    && self.pointer_on == Some(e.window)
+                    && self.windows.get(&e.window).is_some_and(|s| {
+                        matches!(s.role, Role::Toplevel(_))
+                            && (e.x, e.y) != (s.x, s.y)
+                            && (w, h) == (s.width, s.height)
+                    })
+                {
+                    self.begin_move(e.window);
+                }
+                if !self.windows.contains_key(&e.window)
+                    && e.override_redirect
+                    && !self.screen_mode()
+                {
+                    // a popup mapped off the screen and moved onto it
+                    self.consider(e.window, qh);
+                    return;
+                }
                 if let Some(s) = self.windows.get_mut(&e.window) {
                     (s.x, s.y) = (e.x, e.y);
                     if (w, h) != (s.width, s.height) {
@@ -1036,6 +1227,24 @@ impl State {
                     t.set_title(title);
                 }
             }
+            Event::PropertyNotify(e)
+                if e.atom == u32::from(AtomEnum::WM_NORMAL_HINTS)
+                    && self.windows.contains_key(&e.window) =>
+            {
+                if let Some(Shown {
+                    role: Role::Toplevel(t),
+                    ..
+                }) = self.windows.get(&e.window)
+                {
+                    self.apply_size_hints(e.window, t);
+                }
+                if let Some(s) = self.windows.get_mut(&e.window) {
+                    s.dirty = true;
+                }
+                self.paint(e.window);
+            }
+            // a client asking the window manager (EWMH / ICCCM requests to the root)
+            Event::ClientMessage(e) if e.format == 32 => self.client_message(e),
             Event::XfixesCursorNotify(_) => self.update_cursor(),
             Event::Error(e) => crate::vlog!("-showwindows: X error {e:?}"),
             _ => {}
@@ -1088,6 +1297,25 @@ impl State {
                         .width(width as u32)
                         .height(height as u32),
                 );
+            }
+        }
+        for (w, maximized, fullscreen) in std::mem::take(&mut self.states) {
+            let changed = self.windows.get_mut(&w).is_some_and(|s| {
+                let c = (s.maximized, s.fullscreen) != (maximized, fullscreen);
+                (s.maximized, s.fullscreen) = (maximized, fullscreen);
+                c
+            });
+            if changed {
+                crate::log!(
+                    "-showwindows: {w:#x} is {}{}",
+                    if maximized {
+                        "maximised"
+                    } else {
+                        "not maximised"
+                    },
+                    if fullscreen { ", fullscreen" } else { "" }
+                );
+                self.set_net_wm_state(w, maximized, fullscreen);
             }
         }
         for (w, px, py) in std::mem::take(&mut self.placed) {
@@ -1372,6 +1600,9 @@ impl State {
 
     /// Moves the reverse pointer to surface-local `(sx, sy)` of `w`.
     fn motion(&mut self, w: Window, sx: f64, sy: f64) {
+        if self.moving == Some(w) {
+            return;
+        }
         let Some((x, y)) = self.to_root(w, sx, sy) else {
             return;
         };
@@ -1394,6 +1625,297 @@ impl State {
         }
         self.last_pos = Some((x, y));
         let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
+    }
+
+    /// Smooth scrolling (touchpad fingers, continuous devices) as wheel
+    /// clicks, one per `SCROLL_STEP` pixels, as Xwayland emulates them for
+    /// core clients.
+    fn smooth_scroll(&mut self, axis: wl_pointer::Axis, value: f64) {
+        let rest = if axis == wl_pointer::Axis::VerticalScroll {
+            &mut self.axis_rest.1
+        } else {
+            &mut self.axis_rest.0
+        };
+        let steps = scroll_steps(rest, value);
+        if steps != 0 {
+            self.wheel(axis, steps);
+        }
+    }
+
+    /// The desktop's interactive move of `w`'s shown window, for the press
+    /// that is down now.
+    fn begin_move(&mut self, w: Window) {
+        let (
+            Some(seat),
+            Some(Shown {
+                role: Role::Toplevel(t),
+                ..
+            }),
+        ) = (self.seat.as_ref(), self.windows.get(&w))
+        else {
+            return;
+        };
+        t._move(seat, self.press_serial);
+        self.moving = Some(w);
+        crate::log!(
+            "-showwindows: {w:#x} moves itself with the pointer: the desktop moves its window instead"
+        );
+    }
+
+    /// Tells clients (EWMH) which window-manager requests the desktop carries
+    /// out for shown windows, so toolkits ask (`_NET_WM_MOVERESIZE` for their
+    /// drag handles, size grips and title bars, `_NET_WM_STATE` for maximise
+    /// and fullscreen) instead of emulating them with root coordinates that
+    /// mean nothing on the desktop (GTK 3's emulated move snaps a window at
+    /// the top of the X screen to maximised). Not done when a window manager
+    /// already runs on the engine.
+    fn announce_wm(&mut self) -> Result<(), AnyError> {
+        let a = &self.atoms;
+        let existing = self
+            .x
+            .get_property(
+                false,
+                self.root,
+                a.net_supporting_wm_check,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )?
+            .reply()?
+            .value32()
+            .and_then(|mut v| v.next());
+        if existing.is_some_and(|w| w != 0) {
+            crate::log!(
+                "-showwindows: a window manager runs on the engine display: not announcing one"
+            );
+            return Ok(());
+        }
+        let check = self.x.generate_id()?;
+        self.x.create_window(
+            0,
+            check,
+            self.root,
+            -1,
+            -1,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_ONLY,
+            0,
+            &x11rb::protocol::xproto::CreateWindowAux::new(),
+        )?;
+        self.x.change_property32(
+            PropMode::REPLACE,
+            check,
+            a.net_supporting_wm_check,
+            AtomEnum::WINDOW,
+            &[check],
+        )?;
+        self.x.change_property8(
+            PropMode::REPLACE,
+            check,
+            a.net_wm_name,
+            a.utf8_string,
+            b"xwlbridge",
+        )?;
+        let supported = [
+            a.net_supported,
+            a.net_supporting_wm_check,
+            a.net_wm_name,
+            a.net_wm_moveresize,
+            a.net_wm_state,
+            a.net_wm_state_max_vert,
+            a.net_wm_state_max_horz,
+            a.net_wm_state_fullscreen,
+            a.net_wm_state_modal,
+        ];
+        self.x.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            a.net_supported,
+            AtomEnum::ATOM,
+            &supported,
+        )?;
+        self.x.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            a.net_supporting_wm_check,
+            AtomEnum::WINDOW,
+            &[check],
+        )?;
+        crate::log!(
+            "-showwindows: announced _NET_WM_MOVERESIZE and _NET_WM_STATE (maximise, fullscreen) to clients"
+        );
+        Ok(())
+    }
+
+    fn net_wm_state(&self, w: Window) -> Vec<u32> {
+        self.x
+            .get_property(false, w, self.atoms.net_wm_state, AtomEnum::ATOM, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect::<Vec<u32>>()))
+            .unwrap_or_default()
+    }
+
+    /// Whether `w` asks to be modal: `_NET_WM_STATE_MODAL`, or Motif's
+    /// `_MOTIF_WM_HINTS` with a modal input mode.
+    fn is_modal(&self, w: Window) -> bool {
+        if self
+            .net_wm_state(w)
+            .contains(&self.atoms.net_wm_state_modal)
+        {
+            return true;
+        }
+        let v: Vec<u32> = self
+            .x
+            .get_property(false, w, self.atoms.motif_wm_hints, AtomEnum::ANY, 0, 5)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default();
+        v.len() >= 4 && v[0] & 4 != 0 && v[3] != 0
+    }
+
+    /// WM_NORMAL_HINTS' minimum and maximum size on the shown toplevel.
+    fn apply_size_hints(&self, w: Window, t: &xdg_toplevel::XdgToplevel) {
+        let v: Vec<u32> = self
+            .x
+            .get_property(
+                false,
+                w,
+                AtomEnum::WM_NORMAL_HINTS,
+                AtomEnum::WM_SIZE_HINTS,
+                0,
+                18,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default();
+        let ((minw, minh), (maxw, maxh)) = size_limits(&v);
+        t.set_min_size(minw, minh);
+        t.set_max_size(maxw, maxh);
+        if (minw, minh, maxw, maxh) != (0, 0, 0, 0) {
+            crate::vlog!("-showwindows: {w:#x} size limits {minw}x{minh} .. {maxw}x{maxh}");
+        }
+    }
+
+    /// The compositor's maximised / fullscreen state in `_NET_WM_STATE`, so
+    /// the client knows (the rest of the property is the client's own).
+    fn set_net_wm_state(&self, w: Window, maximized: bool, fullscreen: bool) {
+        let a = &self.atoms;
+        let mut v = self.net_wm_state(w);
+        v.retain(|x| {
+            ![
+                a.net_wm_state_max_vert,
+                a.net_wm_state_max_horz,
+                a.net_wm_state_fullscreen,
+            ]
+            .contains(x)
+        });
+        if maximized {
+            v.extend([a.net_wm_state_max_vert, a.net_wm_state_max_horz]);
+        }
+        if fullscreen {
+            v.push(a.net_wm_state_fullscreen);
+        }
+        let _ = self
+            .x
+            .change_property32(PropMode::REPLACE, w, a.net_wm_state, AtomEnum::ATOM, &v);
+    }
+
+    /// A client's request to the window manager: `_NET_WM_STATE` (maximise,
+    /// fullscreen, hidden) and ICCCM's `WM_CHANGE_STATE` (iconify), for a
+    /// shown toplevel.
+    fn client_message(&mut self, e: ClientMessageEvent) {
+        let d = e.data.as_data32();
+        let a = &self.atoms;
+        let Some(s) = self.windows.get(&e.window) else {
+            return;
+        };
+        let Role::Toplevel(t) = &s.role else {
+            return;
+        };
+        if e.type_ == a.net_wm_state {
+            crate::vlog!(
+                "-showwindows: {:#x} _NET_WM_STATE request {:?}",
+                e.window,
+                d
+            );
+            let want = |cur: bool| match d[0] {
+                0 => false,
+                1 => true,
+                _ => !cur,
+            };
+            let props = [d[1], d[2]];
+            if props.contains(&a.net_wm_state_fullscreen) {
+                if want(s.fullscreen) {
+                    t.set_fullscreen(None);
+                } else {
+                    t.unset_fullscreen();
+                }
+                crate::log!(
+                    "-showwindows: {:#x} asks for fullscreen {}",
+                    e.window,
+                    want(s.fullscreen)
+                );
+            }
+            if props.contains(&a.net_wm_state_max_vert) || props.contains(&a.net_wm_state_max_horz)
+            {
+                if want(s.maximized) {
+                    t.set_maximized();
+                } else {
+                    t.unset_maximized();
+                }
+                crate::log!(
+                    "-showwindows: {:#x} asks to be maximised {}",
+                    e.window,
+                    want(s.maximized)
+                );
+            }
+            if props.contains(&a.net_wm_state_hidden) && want(false) {
+                t.set_minimized();
+            }
+        } else if e.type_ == a.wm_change_state && d[0] == 3 {
+            t.set_minimized();
+            crate::log!("-showwindows: {:#x} iconifies itself: minimised", e.window);
+        } else if e.type_ == a.net_wm_moveresize {
+            // [x_root, y_root, direction, button, source]: an interactive move
+            // or resize for the press that is down now, as the desktop does it
+            let Some(seat) = self.seat.as_ref() else {
+                return;
+            };
+            if self.buttons_down.is_empty() {
+                return;
+            }
+            let edge = match d[2] {
+                0 => xdg_toplevel::ResizeEdge::TopLeft,
+                1 => xdg_toplevel::ResizeEdge::Top,
+                2 => xdg_toplevel::ResizeEdge::TopRight,
+                3 => xdg_toplevel::ResizeEdge::Right,
+                4 => xdg_toplevel::ResizeEdge::BottomRight,
+                5 => xdg_toplevel::ResizeEdge::Bottom,
+                6 => xdg_toplevel::ResizeEdge::BottomLeft,
+                7 => xdg_toplevel::ResizeEdge::Left,
+                8 => {
+                    t._move(seat, self.press_serial);
+                    crate::log!(
+                        "-showwindows: {:#x} asks for a move: the desktop moves its window",
+                        e.window
+                    );
+                    self.moving = Some(e.window);
+                    return;
+                }
+                _ => return,
+            };
+            t.resize(seat, self.press_serial, edge);
+            crate::log!(
+                "-showwindows: {:#x} asks for a resize ({edge:?}): the desktop resizes its window",
+                e.window
+            );
+            self.moving = Some(e.window);
+        }
     }
 
     fn query_pointer(&self) -> Option<(i16, i16)> {
@@ -1530,6 +2052,35 @@ impl State {
         }
         let ty = if pressed { KEY_PRESS } else { KEY_RELEASE };
         let _ = xtest::fake_input(&self.x, ty, kc, 0, self.root, 0, 0, 0);
+    }
+
+    /// The keyboard went to another window (the person clicked it): close the
+    /// client's open menus, as on an X desktop, where the menu's grab sees
+    /// that click. The popups have no grab on the desktop (an X client's
+    /// grabs are its own), so nothing else would close them: one Escape per
+    /// menu-like popup still up (a menu's keyboard grab takes it).
+    fn dismiss_menus(&mut self) {
+        let menus = self
+            .popups
+            .iter()
+            .filter(|p| {
+                matches!(
+                    self.window_type(**p).as_str(),
+                    "popup_menu" | "dropdown_menu" | "menu" | "combo"
+                )
+            })
+            .count();
+        if menus == 0 {
+            return;
+        }
+        crate::log!(
+            "-showwindows: the keyboard left for another window: closing {menus} open menu(s) with Escape"
+        );
+        for _ in 0..menus.min(4) {
+            // KEY_ESC
+            self.key(1, true);
+            self.key(1, false);
+        }
     }
 
     fn release_keys(&mut self) {
@@ -1739,6 +2290,9 @@ impl State {
                 client: 0,
                 iconic: false,
                 parent: None,
+                dialog: None,
+                maximized: false,
+                fullscreen: false,
             },
         );
         Ok(())
@@ -2054,6 +2608,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.relative_manager = Some(registry.bind(name, 1, qh, ()))
                 }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
+                "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
                 _ => {}
             }
         }
@@ -2155,11 +2710,55 @@ impl Dispatch<xdg_toplevel::XdgToplevel, Window> for State {
     ) {
         match event {
             xdg_toplevel::Event::Close => state.close.push(*w),
-            xdg_toplevel::Event::Configure { width, height, .. } => {
-                state.resize.push((*w, width, height))
+            xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } => {
+                state.resize.push((*w, width, height));
+                if *w != state.root {
+                    let (m, f) = toplevel_states(&states);
+                    state.states.push((*w, m, f));
+                }
             }
             _ => {}
         }
+    }
+}
+
+impl Dispatch<wl_region::WlRegion, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_region::WlRegion,
+        _: wl_region::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_wm_dialog_v1::XdgWmDialogV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &xdg_wm_dialog_v1::XdgWmDialogV1,
+        _: xdg_wm_dialog_v1::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_dialog_v1::XdgDialogV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &xdg_dialog_v1::XdgDialogV1,
+        _: xdg_dialog_v1::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -2236,6 +2835,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
                 state.pointer_on = Some(w);
                 state.enter_serial = serial;
+                state.moving = None;
                 if w != state.root {
                     // the reverse pointer must hit this window, not one
                     // stacked above it on the X screen; the popups shown stay
@@ -2270,16 +2870,54 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::Button {
+                serial,
                 button,
                 state: WEnum::Value(bs),
                 ..
             } if state.pointer_on.is_some() => {
-                state.button(button, bs == wl_pointer::ButtonState::Pressed);
+                let pressed = bs == wl_pointer::ButtonState::Pressed;
+                if pressed {
+                    state.press_serial = serial;
+                } else {
+                    state.moving = None;
+                }
+                state.button(button, pressed);
+            }
+            wl_pointer::Event::AxisSource {
+                axis_source: WEnum::Value(src),
+            } => state.axis_source = Some(src),
+            wl_pointer::Event::Axis {
+                axis: WEnum::Value(axis),
+                value,
+                ..
+            } if state.pointer_on.is_some()
+                && !state.axis_discrete_seen
+                && !matches!(
+                    state.axis_source,
+                    Some(wl_pointer::AxisSource::Wheel | wl_pointer::AxisSource::WheelTilt)
+                ) =>
+            {
+                state.smooth_scroll(axis, value);
+            }
+            wl_pointer::Event::AxisStop {
+                axis: WEnum::Value(axis),
+                ..
+            } => {
+                if axis == wl_pointer::Axis::VerticalScroll {
+                    state.axis_rest.1 = 0.0;
+                } else {
+                    state.axis_rest.0 = 0.0;
+                }
+            }
+            wl_pointer::Event::Frame => {
+                state.axis_source = None;
+                state.axis_discrete_seen = false;
             }
             wl_pointer::Event::AxisDiscrete {
                 axis: WEnum::Value(axis),
                 discrete,
             } if state.pointer_on.is_some() => {
+                state.axis_discrete_seen = true;
                 state.wheel(axis, discrete);
             }
             _ => {}
@@ -2313,6 +2951,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Leave { .. } => {
                 state.release_keys();
                 state.keyboard_on = None;
+                state.dismiss_menus();
             }
             wl_keyboard::Event::Key {
                 key,
@@ -2382,6 +3021,69 @@ impl Dispatch<wl_surface::WlSurface, Window> for State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn size_hints_become_limits() {
+        use super::size_limits;
+        // flags PMinSize|PMaxSize, min 640x480, max 1800x1200
+        let mut v = [0u32; 18];
+        v[0] = (1 << 4) | (1 << 5);
+        (v[5], v[6], v[7], v[8]) = (640, 480, 1800, 1200);
+        assert_eq!(size_limits(&v), ((640, 480), (1800, 1200)));
+        // Qt's "no maximum" (16777215) is none
+        (v[7], v[8]) = (16_777_215, 16_777_215);
+        assert_eq!(size_limits(&v), ((640, 480), (0, 0)));
+        // flags off: none
+        v[0] = 0;
+        assert_eq!(size_limits(&v), ((0, 0), (0, 0)));
+        assert_eq!(size_limits(&[]), ((0, 0), (0, 0)));
+    }
+
+    #[test]
+    fn configure_states_are_read() {
+        use super::toplevel_states;
+        let b = |v: &[u32]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
+        assert_eq!(toplevel_states(&b(&[4, 1])), (true, false));
+        assert_eq!(toplevel_states(&b(&[2, 4])), (false, true));
+        assert_eq!(toplevel_states(&b(&[])), (false, false));
+    }
+
+    #[test]
+    fn helpers_are_not_popups() {
+        use super::helper_window;
+        // GTK 3's drag-and-drop IPC window: 1x1 at -99,-99
+        assert!(helper_window(-99, -99, 1, 1, (1600, 900)));
+        // wholly off the screen
+        assert!(helper_window(-200, 10, 100, 30, (1600, 900)));
+        assert!(helper_window(1600, 10, 100, 30, (1600, 900)));
+        // a normal menu is shown
+        assert!(!helper_window(570, 32, 90, 356, (1600, 900)));
+        // hanging off one edge is still shown
+        assert!(!helper_window(-10, 10, 100, 30, (1600, 900)));
+        // a 24x24 on-screen window passes this check: it is skipped later,
+        // only if its _NET_WM_WINDOW_TYPE says it is a drag-and-drop icon
+        assert!(!helper_window(100, 100, 24, 24, (1600, 900)));
+    }
+
+    #[test]
+    fn smooth_scroll_becomes_clicks() {
+        use super::scroll_steps;
+        let mut rest = 0.0;
+        assert_eq!(scroll_steps(&mut rest, 4.0), 0);
+        assert_eq!(scroll_steps(&mut rest, 7.0), 1);
+        assert!((rest - 1.0).abs() < 1e-9);
+        assert_eq!(scroll_steps(&mut rest, -31.0), -3);
+        assert_eq!(scroll_steps(&mut rest, 25.0), 2);
+        assert!((rest - 5.0).abs() < 1e-9);
+        // a direction change reverses the carried remainder first: nothing is
+        // sent until the new direction reaches a whole step of its own
+        let mut rest = 8.0;
+        assert_eq!(scroll_steps(&mut rest, -8.0), 0);
+        assert!((rest - 0.0).abs() < 1e-9);
+        let mut rest = -15.0;
+        assert_eq!(scroll_steps(&mut rest, 15.0), 0);
+        assert_eq!(scroll_steps(&mut rest, 10.0), 1);
+    }
+
     use super::*;
 
     #[test]

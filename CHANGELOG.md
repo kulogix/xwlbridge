@@ -12,6 +12,12 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 ### Fixed
 
 - TeamViewer's capture process (`TeamViewer_Desktop`) is a default desktop driver: its keys reach the desktop without `-xtestdrivers` naming it (the process is matched by its executable and `argv[0]`; its kernel `comm` is truncated to `TeamViewer_Desk`). Before, its keys stayed on the bridge display unless `-xtestdrivers` named it.
+- `-showwindows`: a GTK 3 drag no longer ends the session (mutter: Invalid popup parent window). Invisible toolkit helpers (GTK 3's 1x1 drag-and-drop IPC window, mapped off the screen) and drag-and-drop icons are no longer shown as popups: a desktop that dismissed the helper took the icon's parent away with it, and mutter's protocol error killed every shown window.
+- `-showwindows`: a client's window-manager requests are carried out instead of emulated on the engine display — WM_NORMAL_HINTS' min/max size becomes the toplevel's, a modal dialog is attached to its parent (xdg-dialog-v1), _NET_WM_STATE maximise/fullscreen/hidden and WM_CHANGE_STATE iconify go to the toplevel, _NET_WM_MOVERESIZE becomes the desktop's interactive move or resize (announced via _NET_SUPPORTED unless a window manager runs on the engine), and the compositor's maximised/fullscreen state is reflected back into _NET_WM_STATE.
+- `-showwindows`: a client that moves its own top-level with a button held starts the desktop's interactive move (no motion is forwarded meanwhile).
+- `-showwindows`: smooth (touchpad) scrolling is wheel clicks, one per 10 surface pixels of scroll (before, it did nothing).
+- `-showwindows`: a popup placed past the monitor's edge slides onto it (its X window follows); a tooltip or notification takes no pointer input.
+- `-showwindows`: when the keyboard leaves for another window, the client's open menus are closed with Escape (one per menu-like popup, at most 4).
 
 ## 0.1.0 (2026-10-13)
 

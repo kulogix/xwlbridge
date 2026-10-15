@@ -105,7 +105,7 @@ Ubuntu 26.04 VM: `-showwindows` with xcalc and a GTK 3 app passed 6/6. Both GNOM
 ## Limits of `-showwindows`
 
 - No title bars. mutter draws no server-side decorations. Super+drag moves a window.
-- X window positions are not kept. GNOME places toplevels.
+- X window positions are not kept when a window opens: GNOME places toplevels. A client's move-resize, maximise, fullscreen, minimise or iconify requests are carried out (a client that moves itself with a button held moves the desktop's window instead), and a popup keeps its X position, sliding onto the monitor when it does not fit.
 - AT-SPI screen coordinates are engine coordinates. Accerciser and Orca flat-review click are off by the window's offset.
 - Settings (high contrast and so on) reach engine apps only with the proxy's `--settings-only` mirror (3/3 with it, 0/3 without).
 - XEmbed tray icons are not shown.
