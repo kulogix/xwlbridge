@@ -32,11 +32,14 @@
 //!   pointer grabs, warps and queries follow the desktop's pointer, and its
 //!   own XTest goes to the reverse master's focus (an on-screen keyboard on
 //!   the engine types into the X window that has that keyboard, inside X; the
-//!   keyboard is given ICCCM-style, see `focus_x`). The X cursor of that master
-//!   is the desktop's cursor over shown windows. Mouse-look: when the cursor
-//!   is blank and the client warps the pointer, the desktop's pointer is
-//!   locked (pointer-constraints) and its relative motion is injected as
-//!   relative XTest motion, as Xwayland emulates warps.
+//!   keyboard is given ICCCM-style, see `focus_x`); when the desktop's
+//!   keyboard leaves our windows, the X focus is cleared too, so X clients
+//!   see FocusOut as on Xwayland while a Wayland window is active. The X
+//!   cursor of that master is the desktop's cursor over shown windows.
+//!   Mouse-look: when the cursor is blank and the client warps the pointer or
+//!   holds a pointer grab (SDL2's relative mode), the desktop's pointer is
+//!   locked (pointer-constraints) and its unaccelerated relative motion is
+//!   injected as relative XTest motion, as Xwayland emulates warps.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -63,8 +66,8 @@ use x11rb::protocol::render::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, MapState,
-    PropMode, StackMode, Window, WindowClass,
+    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, GrabMode,
+    GrabStatus, MapState, PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
@@ -239,6 +242,47 @@ fn scroll_steps(rest: &mut f64, value: f64) -> i32 {
 /// Whether a cursor image shows nothing (every pixel transparent).
 fn blank_cursor(image: &[u32]) -> bool {
     image.iter().all(|p| p >> 24 == 0)
+}
+
+/// wl_keyboard.enter: the keyboard is on shown window `w`, and a pending
+/// leave is withdrawn (a leave followed by an enter on another of our
+/// windows in the same batch keeps the focus where `focus_x` put or left it).
+fn on_keyboard_enter(keyboard_left: &mut bool, keyboard_on: &mut Option<Window>, w: Window) {
+    *keyboard_left = false;
+    *keyboard_on = Some(w);
+}
+
+/// wl_keyboard.leave: the desktop took the keyboard from our windows.
+fn on_keyboard_leave(keyboard_left: &mut bool, keyboard_on: &mut Option<Window>) {
+    *keyboard_left = true;
+    *keyboard_on = None;
+}
+
+/// Whether the X focus goes with the keyboard after a dispatch batch: the
+/// desktop took the keyboard (leave) and, by the end of the batch, gave it to
+/// none of our windows.
+fn x_focus_clears(keyboard_left: bool, keyboard_on: Option<Window>) -> bool {
+    keyboard_left && keyboard_on.is_none()
+}
+
+/// Whether the reverse pointer switches to relative (locked) delivery: no
+/// lock is held, the client hid the cursor and an X client grab was detected
+/// (SDL2's relative mode: XGrabPointer, hidden cursor, XI2 raw motion, no
+/// warps).
+fn relative_mode_due(no_lock: bool, blank: bool, client_grab: bool) -> bool {
+    no_lock && blank && client_grab
+}
+
+/// Whether a held pointer lock is released and absolute motion resumes: the
+/// cursor is visible again.
+fn relative_mode_ends(locked: bool, blank: bool) -> bool {
+    locked && !blank
+}
+
+/// Whether a new `client_grab` probe may be sent now: at most one every
+/// 100 ms, since motion events come at the desktop's rate.
+fn grab_probe_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(100))
 }
 
 /// A Linux BTN_* code (Wayland's wl_pointer.button) as an X button.
@@ -453,10 +497,17 @@ struct State {
     keyboard_on: Option<Window>,
     /// The last X window the reverse keyboard was focused on.
     x_focus: Option<Window>,
+    /// The desktop took the keyboard from our windows (wl_keyboard.leave)
+    /// and, by the end of the dispatch, gave it to none of them: the X
+    /// focus goes too (see `after_dispatch`).
+    keyboard_left: bool,
     enter_serial: u32,
     /// Where the reverse pointer was last put (root coordinates).
     last_pos: Option<(i16, i16)>,
     lock: Option<Lock>,
+    /// When `client_grab` last asked (it is asked at most every 100 ms while
+    /// the cursor is blank and the pointer is not locked).
+    grab_asked: Option<std::time::Instant>,
     cursor: Option<CursorImage>,
     keys_down: Vec<u8>,
     buttons_down: Vec<u8>,
@@ -568,9 +619,11 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         pointer_on: None,
         keyboard_on: None,
         x_focus: None,
+        keyboard_left: false,
         enter_serial: 0,
         last_pos: None,
         lock: None,
+        grab_asked: None,
         cursor: None,
         keys_down: Vec::new(),
         buttons_down: Vec::new(),
@@ -1343,6 +1396,16 @@ impl State {
             self.hide(w, qh);
             self.dismissed.push(w);
         }
+        // The keyboard went to a desktop window that isn't ours: take the X
+        // focus away too, as Xwayland's window manager does, so X clients see
+        // FocusOut (games pause; SDL stops passing joystick input to an
+        // unfocused game unless it asked for background events). A leave
+        // followed by an enter on another of our windows in the same batch
+        // (another X window, or an on-screen keyboard that never takes the
+        // focus) keeps the focus where `focus_x` put or left it.
+        if x_focus_clears(std::mem::take(&mut self.keyboard_left), self.keyboard_on) {
+            self.unfocus_x();
+        }
         for locked in std::mem::take(&mut self.lock_events) {
             if let Some(l) = self.lock.as_mut() {
                 l.active = locked;
@@ -1622,9 +1685,79 @@ impl State {
                 now.1
             );
             self.lock_pointer(w);
+        } else if self.lock.is_none() {
+            // no warp was seen: a client grab plus a blank cursor is the
+            // other relative-mode trigger (checked here and on cursor change)
+            let blank = self.cursor.as_ref().is_some_and(|c| c.blank);
+            if relative_mode_due(true, blank, blank && self.ask_grab()) {
+                crate::log!(
+                    "-showwindows: the client hid the cursor and grabbed the pointer (relative mode): locking the desktop's pointer for relative motion"
+                );
+                self.lock_pointer(w);
+                if self.lock.is_some() {
+                    return; // the X pointer stays put; relative motion follows once locked
+                }
+            }
         }
         self.last_pos = Some((x, y));
         let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
+    }
+
+    /// Rate-limited `client_grab` (motion events come at the desktop's rate).
+    fn ask_grab(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if !grab_probe_due(self.grab_asked, now) {
+            return false;
+        }
+        self.grab_asked = Some(now);
+        self.client_grab()
+    }
+
+    /// Whether an X client holds the reverse pointer grabbed (SDL's relative
+    /// mouse mode, Quake-style games: XGrabPointer with the cursor hidden,
+    /// motion read from XI2 raw events, no warps). X has no request that
+    /// says so; a grab of our own on the deepest window under the pointer
+    /// answers AlreadyGrabbed then, and otherwise succeeds without any
+    /// crossing event (the pointer is already in that window) and is dropped
+    /// at once.
+    fn client_grab(&self) -> bool {
+        let mut w = self.root;
+        for _ in 0..32 {
+            let Ok(Ok(r)) = self
+                .x
+                .xinput_xi_query_pointer(w, self.devs.pointer)
+                .map(|c| c.reply())
+            else {
+                return false;
+            };
+            if r.child == x11rb::NONE {
+                break;
+            }
+            w = r.child;
+        }
+        let Ok(Ok(r)) = self
+            .x
+            .xinput_xi_grab_device(
+                w,
+                x11rb::CURRENT_TIME,
+                x11rb::NONE,
+                self.devs.pointer,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                xinput::GrabOwner::NO_OWNER,
+                &[0u32],
+            )
+            .map(|c| c.reply())
+        else {
+            return false;
+        };
+        if r.status == GrabStatus::SUCCESS {
+            let _ = self
+                .x
+                .xinput_xi_ungrab_device(x11rb::CURRENT_TIME, self.devs.pointer);
+            return false;
+        }
+        r.status == GrabStatus::ALREADY_GRABBED || r.status == GrabStatus::FROZEN
     }
 
     /// Smooth scrolling (touchpad fingers, continuous devices) as wheel
@@ -2124,6 +2257,20 @@ impl State {
         }
     }
 
+    /// No X window has the reverse keyboard (the desktop's keyboard is on a
+    /// window that isn't ours): focus None, so the window that had it gets
+    /// FocusOut and keys from engine-side XTest on this master go nowhere,
+    /// as on Xwayland while a Wayland window is active.
+    fn unfocus_x(&mut self) {
+        let had = self.x_focus.take();
+        crate::vlog!(
+            "-showwindows: the desktop's keyboard left our windows; X focus None (was {had:#x?})"
+        );
+        let _ = self
+            .x
+            .xinput_xi_set_focus(x11rb::NONE, x11rb::CURRENT_TIME, self.devs.keyboard);
+    }
+
     /// The reverse master's X cursor (the pointer is on shown windows only,
     /// so its cursor is theirs), as the desktop's cursor over them.
     fn update_cursor(&mut self) {
@@ -2177,8 +2324,17 @@ impl State {
             }
         }
         if blank && self.lock.is_none() {
-            // nothing; a warp while blank locks (see motion)
-        } else if !blank && self.lock.is_some() {
+            // a warp while blank locks (see motion); so does a client's
+            // pointer grab (relative mode), checked here and on motion
+            if let Some(w) = self.pointer_on
+                && self.ask_grab()
+            {
+                crate::log!(
+                    "-showwindows: the client hid the cursor and grabbed the pointer (relative mode): locking the desktop's pointer for relative motion"
+                );
+                self.lock_pointer(w);
+            }
+        } else if relative_mode_ends(self.lock.is_some(), blank) {
             self.unlock();
         }
         self.apply_cursor();
@@ -2939,7 +3095,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 let Some(&w) = surface.data::<Window>() else {
                     return;
                 };
-                state.keyboard_on = Some(w);
+                on_keyboard_enter(&mut state.keyboard_left, &mut state.keyboard_on, w);
                 if w == state.root {
                     if let Some(f) = state.canvas.as_ref().and_then(|c| c.focus) {
                         state.focus_x(f);
@@ -2950,7 +3106,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.release_keys();
-                state.keyboard_on = None;
+                on_keyboard_leave(&mut state.keyboard_left, &mut state.keyboard_on);
                 state.dismiss_menus();
             }
             wl_keyboard::Event::Key {
@@ -2991,8 +3147,16 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for State {
         _: &WlConnection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = event {
-            state.relative.push((dx, dy));
+        // unaccelerated, as Xwayland's raw events: mouse-look reads raw
+        // motion (SDL's relative mode, XI2 RawMotion), and the X server
+        // accelerates the XTest motion for the core pointer itself
+        if let zwp_relative_pointer_v1::Event::RelativeMotion {
+            dx_unaccel,
+            dy_unaccel,
+            ..
+        } = event
+        {
+            state.relative.push((dx_unaccel, dy_unaccel));
         }
     }
 }
@@ -3156,5 +3320,58 @@ mod tests {
         forget_client(0x600000);
         assert!(!is_reverse_client(0x600000));
         assert!(!is_reverse_client(0));
+    }
+
+    #[test]
+    fn x_focus_clears_only_after_a_leave_with_no_enter() {
+        let (mut left, mut on) = (false, None);
+        // a leave without any enter before it keeps nothing to clear
+        assert!(!x_focus_clears(false, None));
+        // enter: the keyboard is on one of our windows
+        on_keyboard_enter(&mut left, &mut on, 0x1001);
+        assert_eq!(on, Some(0x1001));
+        assert!(!left);
+        assert!(!x_focus_clears(left, on));
+        // leave marks the pending clear
+        on_keyboard_leave(&mut left, &mut on);
+        assert!(on.is_none());
+        assert!(x_focus_clears(left, on));
+        // a leave followed by an enter in the same batch withdraws the clear
+        on_keyboard_enter(&mut left, &mut on, 0x1002);
+        assert!(!left);
+        assert!(!x_focus_clears(left, on));
+        // a leave with no later enter clears the X focus
+        on_keyboard_leave(&mut left, &mut on);
+        assert!(x_focus_clears(left, on));
+    }
+
+    #[test]
+    fn relative_mode_needs_blank_cursor_grab_and_no_lock() {
+        // client grab + hidden cursor + no lock: switch to relative delivery
+        assert!(relative_mode_due(true, true, true));
+        // already locked: no new lock
+        assert!(!relative_mode_due(false, true, true));
+        // cursor visible: absolute motion
+        assert!(!relative_mode_due(true, false, true));
+        // no client grab: absolute motion
+        assert!(!relative_mode_due(true, true, false));
+        // release: the cursor is visible again while locked, absolute resumes
+        assert!(relative_mode_ends(true, false));
+        assert!(!relative_mode_ends(true, true));
+        assert!(!relative_mode_ends(false, false));
+    }
+
+    #[test]
+    fn grab_probes_are_rate_limited() {
+        let now = std::time::Instant::now();
+        assert!(grab_probe_due(None, now));
+        assert!(!grab_probe_due(
+            Some(now - std::time::Duration::from_millis(50)),
+            now
+        ));
+        assert!(grab_probe_due(
+            Some(now - std::time::Duration::from_millis(150)),
+            now
+        ));
     }
 }
