@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
 };
 use wayland_client::{Connection as WlConnection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
@@ -55,6 +55,11 @@ use wayland_protocols::wp::pointer_constraints::zv1::client::{
 };
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
+};
+use wayland_protocols::wp::tablet::zv2::client::{
+    zwp_tablet_manager_v2, zwp_tablet_pad_group_v2, zwp_tablet_pad_ring_v2,
+    zwp_tablet_pad_strip_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
+    zwp_tablet_v2,
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1};
@@ -239,6 +244,20 @@ fn scroll_steps(rest: &mut f64, value: f64) -> i32 {
     steps as i32
 }
 
+/// Drops a scroll gesture's carried remainder and frame marks (the pointer
+/// entered or left a shown window, or the seat lost its pointer): the next
+/// gesture's wheel clicks are measured from nothing, not against the last
+/// one's fraction of a step.
+fn scroll_forgets(
+    rest: &mut (f64, f64),
+    source: &mut Option<wl_pointer::AxisSource>,
+    discrete_seen: &mut bool,
+) {
+    *rest = (0.0, 0.0);
+    *source = None;
+    *discrete_seen = false;
+}
+
 /// Whether a cursor image shows nothing (every pixel transparent).
 fn blank_cursor(image: &[u32]) -> bool {
     image.iter().all(|p| p >> 24 == 0)
@@ -265,6 +284,79 @@ fn x_focus_clears(keyboard_left: bool, keyboard_on: Option<Window>) -> bool {
     keyboard_left && keyboard_on.is_none()
 }
 
+/// wl_touch.down on shown window `w`: whether the first point of a touch
+/// sequence starts driving the reverse pointer (Xwayland's pointer emulation
+/// for core clients: it moves the pointer and holds button 1 until the
+/// lift). A second point down suppresses emulation, as does the cursor
+/// surface (window 0). `down` is the count of points down, `id` the new
+/// point's.
+fn touch_emulation_starts(
+    emulating: &mut Option<(i32, Window)>,
+    down: u32,
+    id: i32,
+    w: Window,
+) -> Option<Window> {
+    if w == 0 || down != 1 {
+        return None;
+    }
+    *emulating = Some((id, w));
+    Some(w)
+}
+
+/// wl_touch.motion of point `id`: whether it moves the reverse pointer (only
+/// the emulating point's motion does).
+fn touch_motion_drives(emulating: Option<(i32, Window)>, id: i32) -> bool {
+    emulating.is_some_and(|(t, _)| t == id)
+}
+
+/// wl_touch.up of point `id`: whether that was the emulating point (button 1
+/// goes up and the emulation ends); another point's lift changes nothing.
+fn touch_lift_ends(emulating: &mut Option<(i32, Window)>, id: i32) -> bool {
+    if emulating.is_some_and(|(t, _)| t == id) {
+        *emulating = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// wl_touch.cancel, or the seat lost its touch capability: every point
+/// lifted; button 1 goes up if the emulation held it.
+fn touch_emulation_ends(emulating: &mut Option<(i32, Window)>) -> bool {
+    emulating.take().is_some()
+}
+
+/// The presses of a tablet tool's frame that get injected, in frame order,
+/// after updating the buttons the tool holds (BTN_* codes): a press of a
+/// button it already holds, or a lift of one it doesn't, is dropped (the
+/// frame repeated it, or the tool left proximity in between).
+fn tool_frame_presses(buttons: &mut Vec<u32>, presses: &[(u32, bool)]) -> Vec<(u32, bool)> {
+    let mut out = Vec::new();
+    for &(code, pressed) in presses {
+        if pressed {
+            if buttons.contains(&code) {
+                continue;
+            }
+            buttons.push(code);
+        } else {
+            if !buttons.contains(&code) {
+                continue;
+            }
+            buttons.retain(|&c| c != code);
+        }
+        out.push((code, pressed));
+    }
+    out
+}
+
+/// A tablet tool left proximity (or was removed): everything it holds is
+/// released, in the order it was pressed; the reverse pointer's window goes
+/// too, unless the mouse's own pointer had entered a shown window (then the
+/// pointer stays the mouse's).
+fn tool_out_releases(buttons: &[u32], pointer_entered: bool) -> (Vec<u32>, bool) {
+    (buttons.to_vec(), !pointer_entered)
+}
+
 /// Whether the reverse pointer switches to relative (locked) delivery: no
 /// lock is held, the client hid the cursor and an X client grab was detected
 /// (SDL2's relative mode: XGrabPointer, hidden cursor, XI2 raw motion, no
@@ -285,14 +377,39 @@ fn grab_probe_due(last: Option<std::time::Instant>, now: std::time::Instant) -> 
     last.is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(100))
 }
 
-/// A Linux BTN_* code (Wayland's wl_pointer.button) as an X button.
+/// A Linux BTN_* code (Wayland's wl_pointer.button) as an X button, numbered
+/// as Xwayland numbers them: left, middle and right are 1, 2, 3; 4-7 are the
+/// wheel; every other button goes in order from BTN_SIDE = 8 (BTN_EXTRA 9,
+/// BTN_FORWARD 10, BTN_BACK 11, BTN_TASK 12 ...). The reverse master's XTest
+/// device has 10 buttons (the X server's core pointer), so 11 and up can't
+/// be injected: those are dropped (logged once by `State::button`).
 fn x_button(code: u32) -> Option<u8> {
     Some(match code {
-        0x110 => 1, // BTN_LEFT
-        0x112 => 2, // BTN_MIDDLE
-        0x111 => 3, // BTN_RIGHT
-        0x113 => 8, // BTN_SIDE (back)
-        0x114 => 9, // BTN_EXTRA (forward)
+        0x110 => 1,                                            // BTN_LEFT
+        0x112 => 2,                                            // BTN_MIDDLE
+        0x111 => 3,                                            // BTN_RIGHT
+        0x113..=0x11f => u8::try_from(8 + code - 0x113).ok()?, // BTN_SIDE ... BTN_MOUSE + 15
+        _ => return None,
+    })
+}
+
+/// The X server's core (and XTest) pointer has 10 buttons.
+const XTEST_BUTTONS: u8 = 10;
+
+/// The X button a BTN_* code injects: `x_button`'s, if the XTest device has
+/// one there (it has 10; buttons 11 and up are dropped).
+fn injectable_button(code: u32) -> Option<u8> {
+    x_button(code).filter(|&b| b <= XTEST_BUTTONS)
+}
+
+/// A tablet tool button (BTN_STYLUS, BTN_STYLUS2, BTN_STYLUS3) as the BTN_*
+/// code of the mouse button Xwayland's stylus device reports: middle, right,
+/// and side (8).
+fn tool_button(code: u32) -> Option<u32> {
+    Some(match code {
+        0x14b => 0x112, // BTN_STYLUS -> middle
+        0x14c => 0x111, // BTN_STYLUS2 -> right
+        0x149 => 0x113, // BTN_STYLUS3 -> 8
         _ => return None,
     })
 }
@@ -540,6 +657,29 @@ struct State {
     axis_discrete_seen: bool,
     /// Smooth scroll not yet sent as wheel clicks (horizontal, vertical).
     axis_rest: (f64, f64),
+    /// wl_pointer is entered on a shown surface (as against a pointer_on a
+    /// touch point or a tablet tool is driving).
+    pointer_entered: bool,
+    /// The touch screen's device, the touch point that drives the reverse
+    /// pointer (pointer emulation, as Xwayland does for core clients:
+    /// (id, window)), and how many points are down.
+    touch: Option<wl_touch::WlTouch>,
+    touch_emulating: Option<(i32, Window)>,
+    touch_down: u32,
+    /// The tablet manager and seat (a tool's events come only to a client
+    /// that has a tablet seat: mutter leaves wl_pointer while a tool is in
+    /// proximity).
+    tablet_manager: Option<zwp_tablet_manager_v2::ZwpTabletManagerV2>,
+    tablet_seat: Option<zwp_tablet_seat_v2::ZwpTabletSeatV2>,
+    /// The tablet tool in proximity of a shown window (one at a time drives
+    /// the pointer): its id and window, the buttons it holds (BTN_* codes),
+    /// and its frame's motion and presses so far.
+    tool_on: Option<(wayland_client::backend::ObjectId, Window)>,
+    tool_buttons: Vec<u32>,
+    tool_motion: Option<(f64, f64)>,
+    tool_presses: Vec<(u32, bool)>,
+    /// Buttons the XTest device has none for, already logged once.
+    dropped_button_logged: bool,
     qh: QueueHandle<State>,
 }
 
@@ -642,6 +782,17 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         axis_source: None,
         axis_discrete_seen: false,
         axis_rest: (0.0, 0.0),
+        pointer_entered: false,
+        touch: None,
+        touch_emulating: None,
+        touch_down: 0,
+        tablet_manager: None,
+        tablet_seat: None,
+        tool_on: None,
+        tool_buttons: Vec::new(),
+        tool_motion: None,
+        tool_presses: Vec::new(),
+        dropped_button_logged: false,
         qh: qh.clone(),
     };
     queue.roundtrip(&mut state)?;
@@ -1775,6 +1926,40 @@ impl State {
         }
     }
 
+    /// A tablet tool frame: the motion goes first, then the tip and buttons.
+    fn tool_frame(&mut self) {
+        let Some((_, w)) = self.tool_on.clone() else {
+            self.tool_motion = None;
+            self.tool_presses.clear();
+            return;
+        };
+        if let Some((x, y)) = self.tool_motion.take() {
+            self.motion(w, x, y);
+        }
+        let presses = std::mem::take(&mut self.tool_presses);
+        for (code, pressed) in tool_frame_presses(&mut self.tool_buttons, &presses) {
+            self.button(code, pressed);
+        }
+    }
+
+    /// The tool left proximity: let go of what it holds; the pointer stays
+    /// the mouse's if the mouse's own pointer had entered a shown window.
+    fn tool_gone(&mut self) {
+        if self.tool_on.take().is_none() {
+            return;
+        }
+        self.tool_motion = None;
+        self.tool_presses.clear();
+        let (releases, drop_pointer) = tool_out_releases(&self.tool_buttons, self.pointer_entered);
+        self.tool_buttons.clear();
+        for code in releases {
+            self.button(code, false);
+        }
+        if drop_pointer {
+            self.pointer_on = None;
+        }
+    }
+
     /// The desktop's interactive move of `w`'s shown window, for the press
     /// that is down now.
     fn begin_move(&mut self, w: Window) {
@@ -2138,7 +2323,13 @@ impl State {
     }
 
     fn button(&mut self, button: u32, pressed: bool) {
-        let Some(b) = x_button(button) else {
+        let Some(b) = injectable_button(button) else {
+            if !self.dropped_button_logged {
+                self.dropped_button_logged = true;
+                crate::log!(
+                    "-showwindows: button code {button:#x} has no X button the reverse pointer can press (XTest has 10)"
+                );
+            }
             return;
         };
         let ty = if pressed {
@@ -2765,7 +2956,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
+                "zwp_tablet_manager_v2" => {
+                    state.tablet_manager = Some(registry.bind(name, 1, qh, ()))
+                }
                 _ => {}
+            }
+            // tablets: a tool's events come only to a client that has a
+            // tablet seat (mutter leaves wl_pointer when a tool comes near),
+            // and the seat and the manager may arrive in either order
+            if state.tablet_seat.is_none()
+                && let (Some(m), Some(seat)) = (state.tablet_manager.as_ref(), state.seat.as_ref())
+            {
+                state.tablet_seat = Some(m.get_tablet_seat(seat, qh, ()));
             }
         }
     }
@@ -2797,6 +2999,12 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 crate::vlog!("-showwindows: the seat has no pointer now");
                 state.release_buttons();
                 state.pointer_on = None;
+                state.pointer_entered = false;
+                scroll_forgets(
+                    &mut state.axis_rest,
+                    &mut state.axis_source,
+                    &mut state.axis_discrete_seen,
+                );
                 if state.lock.is_some() {
                     state.unlock();
                 }
@@ -2814,6 +3022,20 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 state.keyboard_on = None;
                 if k.version() >= 3 {
                     k.release();
+                }
+            }
+            if caps.contains(wl_seat::Capability::Touch) {
+                if state.touch.is_none() {
+                    state.touch = Some(seat.get_touch(qh, ()));
+                }
+            } else if let Some(t) = state.touch.take() {
+                crate::vlog!("-showwindows: the seat has no touch now");
+                state.touch_down = 0;
+                if touch_emulation_ends(&mut state.touch_emulating) {
+                    state.button(0x110, false);
+                }
+                if t.version() >= 3 {
+                    t.release();
                 }
             }
         }
@@ -2990,8 +3212,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     return; // the cursor surface
                 }
                 state.pointer_on = Some(w);
+                state.pointer_entered = true;
                 state.enter_serial = serial;
                 state.moving = None;
+                scroll_forgets(
+                    &mut state.axis_rest,
+                    &mut state.axis_source,
+                    &mut state.axis_discrete_seen,
+                );
                 if w != state.root {
                     // the reverse pointer must hit this window, not one
                     // stacked above it on the X screen; the popups shown stay
@@ -3015,6 +3243,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             wl_pointer::Event::Leave { .. } => {
                 state.release_buttons();
                 state.pointer_on = None;
+                state.pointer_entered = false;
+                scroll_forgets(
+                    &mut state.axis_rest,
+                    &mut state.axis_source,
+                    &mut state.axis_discrete_seen,
+                );
             }
             wl_pointer::Event::Motion {
                 surface_x,
@@ -3169,6 +3403,194 @@ wayland_client::delegate_noop!(State: ignore zwp_pointer_constraints_v1::ZwpPoin
 wayland_client::delegate_noop!(State: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
 wayland_client::delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 wayland_client::delegate_noop!(State: ignore wp_viewport::WpViewport);
+wayland_client::delegate_noop!(State: ignore zwp_tablet_manager_v2::ZwpTabletManagerV2);
+wayland_client::delegate_noop!(State: ignore zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2);
+wayland_client::delegate_noop!(State: ignore zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2);
+
+/// The touch screen drives the reverse pointer, as Xwayland's pointer
+/// emulation does for core and XI 1 clients: the first touch point moves the
+/// pointer and holds button 1 until it lifts. (The engines have no XI 2.2
+/// touch device for real touch events.)
+impl Dispatch<wl_touch::WlTouch, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_touch::Event::Down {
+                surface, id, x, y, ..
+            } => {
+                state.touch_down += 1;
+                let Some(&w) = surface.data::<Window>() else {
+                    return;
+                };
+                // only the first point of a touch sequence emulates
+                if let Some(w) =
+                    touch_emulation_starts(&mut state.touch_emulating, state.touch_down, id, w)
+                {
+                    state.pointer_on = Some(w);
+                    state.motion(w, x, y);
+                    state.button(0x110, true);
+                }
+            }
+            wl_touch::Event::Motion { id, x, y, .. } => {
+                if touch_motion_drives(state.touch_emulating, id)
+                    && let Some((_, w)) = state.touch_emulating
+                {
+                    state.motion(w, x, y);
+                }
+            }
+            wl_touch::Event::Up { id, .. } => {
+                state.touch_down = state.touch_down.saturating_sub(1);
+                if touch_lift_ends(&mut state.touch_emulating, id) {
+                    state.button(0x110, false);
+                }
+            }
+            wl_touch::Event::Cancel => {
+                state.touch_down = 0;
+                if touch_emulation_ends(&mut state.touch_emulating) {
+                    state.button(0x110, false);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_tablet_v2::ZwpTabletV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        tablet: &zwp_tablet_v2::ZwpTabletV2,
+        event: zwp_tablet_v2::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_tablet_v2::Event::Removed = event {
+            tablet.destroy();
+        }
+    }
+}
+
+impl Dispatch<zwp_tablet_seat_v2::ZwpTabletSeatV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_seat_v2::ZwpTabletSeatV2,
+        _: zwp_tablet_seat_v2::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(State, zwp_tablet_seat_v2::ZwpTabletSeatV2, [
+        zwp_tablet_seat_v2::EVT_TABLET_ADDED_OPCODE => (zwp_tablet_v2::ZwpTabletV2, ()),
+        zwp_tablet_seat_v2::EVT_TOOL_ADDED_OPCODE => (zwp_tablet_tool_v2::ZwpTabletToolV2, ()),
+        zwp_tablet_seat_v2::EVT_PAD_ADDED_OPCODE => (zwp_tablet_pad_v2::ZwpTabletPadV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_pad_v2::ZwpTabletPadV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        pad: &zwp_tablet_pad_v2::ZwpTabletPadV2,
+        event: zwp_tablet_pad_v2::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_tablet_pad_v2::Event::Removed = event {
+            pad.destroy();
+        }
+    }
+
+    wayland_client::event_created_child!(State, zwp_tablet_pad_v2::ZwpTabletPadV2, [
+        zwp_tablet_pad_v2::EVT_GROUP_OPCODE => (zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()),
+    ]);
+}
+
+impl Dispatch<zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+        _: zwp_tablet_pad_group_v2::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+
+    wayland_client::event_created_child!(State, zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, [
+        zwp_tablet_pad_group_v2::EVT_RING_OPCODE => (zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()),
+        zwp_tablet_pad_group_v2::EVT_STRIP_OPCODE => (
+            zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+            ()
+        ),
+    ]);
+}
+
+/// A pen or eraser on a shown window drives the reverse pointer the way
+/// Xwayland's stylus device moves the core pointer: the tip is button 1,
+/// BTN_STYLUS / BTN_STYLUS2 / BTN_STYLUS3 are 2 / 3 / 8. Pressure and tilt
+/// can't go through XTest; an engine with a real tablet device would be
+/// needed for them.
+impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for State {
+    fn event(
+        state: &mut Self,
+        tool: &zwp_tablet_tool_v2::ZwpTabletToolV2,
+        event: zwp_tablet_tool_v2::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
+                let Some(&w) = surface.data::<Window>() else {
+                    return;
+                };
+                if w == 0 || state.tool_on.is_some() {
+                    return; // another tool drives the pointer
+                }
+                state.tool_on = Some((tool.id(), w));
+                state.pointer_on = Some(w);
+            }
+            _ if state
+                .tool_on
+                .as_ref()
+                .is_none_or(|(id, _)| *id != tool.id()) =>
+            {
+                if matches!(event, zwp_tablet_tool_v2::Event::Removed) {
+                    tool.destroy();
+                }
+            }
+            zwp_tablet_tool_v2::Event::ProximityOut => state.tool_gone(),
+            zwp_tablet_tool_v2::Event::Motion { x, y } => state.tool_motion = Some((x, y)),
+            zwp_tablet_tool_v2::Event::Down { .. } => state.tool_presses.push((0x110, true)),
+            zwp_tablet_tool_v2::Event::Up => state.tool_presses.push((0x110, false)),
+            zwp_tablet_tool_v2::Event::Button {
+                button,
+                state: WEnum::Value(bs),
+                ..
+            } => {
+                if let Some(code) = tool_button(button) {
+                    state
+                        .tool_presses
+                        .push((code, bs == zwp_tablet_tool_v2::ButtonState::Pressed));
+                }
+            }
+            zwp_tablet_tool_v2::Event::Frame { .. } => state.tool_frame(),
+            zwp_tablet_tool_v2::Event::Removed => {
+                state.tool_gone();
+                tool.destroy();
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wl_surface::WlSurface, Window> for State {
     fn event(
@@ -3272,9 +3694,124 @@ mod tests {
         assert_eq!(x_button(0x110), Some(1));
         assert_eq!(x_button(0x111), Some(3));
         assert_eq!(x_button(0x112), Some(2));
-        assert_eq!(x_button(0x113), Some(8));
-        assert_eq!(x_button(0x114), Some(9));
-        assert_eq!(x_button(0x115), None);
+        // BTN_SIDE .. BTN_MOUSE + 15 in order from 8, as Xwayland numbers
+        // them (BTN_SIDE 8, BTN_EXTRA 9, BTN_FORWARD 10, BTN_BACK 11 ...)
+        for (code, b) in (0x113..=0x11f).zip(8..) {
+            assert_eq!(x_button(code), Some(b), "code {code:#x}");
+        }
+        assert_eq!(x_button(0x11f), Some(20));
+        assert_eq!(x_button(0x120), None); // BTN_TOOL_PEN and up: no button
+        // the reverse master's XTest device has 10 buttons: 11 and up are
+        // not injectable (dropped, logged once, by State::button)
+        assert_eq!(injectable_button(0x114), Some(9));
+        assert_eq!(injectable_button(0x115), Some(10));
+        assert_eq!(injectable_button(0x116), None);
+        assert_eq!(injectable_button(0x11f), None);
+        assert_eq!(injectable_button(0x120), None);
+    }
+
+    #[test]
+    fn touch_emulation_first_point_drives_and_lift_releases() {
+        let mut emulating = None;
+        // the first point of a sequence on a shown window drives the pointer
+        assert_eq!(
+            touch_emulation_starts(&mut emulating, 1, 0, 0x2001),
+            Some(0x2001)
+        );
+        assert_eq!(emulating, Some((0, 0x2001)));
+        // its motion drives; another point's does not
+        assert!(touch_motion_drives(emulating, 0));
+        assert!(!touch_motion_drives(emulating, 1));
+        // a second point down suppresses emulation (nothing new drives)
+        assert_eq!(touch_emulation_starts(&mut emulating, 2, 1, 0x2001), None);
+        assert_eq!(emulating, Some((0, 0x2001)));
+        // another point's lift changes nothing; the emulating point's lift
+        // releases button 1 and ends the emulation
+        assert!(!touch_lift_ends(&mut emulating, 1));
+        assert_eq!(emulating, Some((0, 0x2001)));
+        assert!(touch_lift_ends(&mut emulating, 0));
+        assert_eq!(emulating, None);
+        // a new sequence starts from nothing
+        assert_eq!(
+            touch_emulation_starts(&mut emulating, 1, 7, 0x2002),
+            Some(0x2002)
+        );
+        // cancel (or the seat losing touch) ends it
+        assert!(touch_emulation_ends(&mut emulating));
+        assert_eq!(emulating, None);
+        assert!(!touch_emulation_ends(&mut emulating));
+        // the cursor surface (window 0) never emulates
+        assert_eq!(touch_emulation_starts(&mut emulating, 1, 0, 0), None);
+        assert_eq!(emulating, None);
+    }
+
+    #[test]
+    fn tool_buttons_map_to_mouse_buttons() {
+        assert_eq!(tool_button(0x14b), Some(0x112)); // BTN_STYLUS -> middle
+        assert_eq!(tool_button(0x14c), Some(0x111)); // BTN_STYLUS2 -> right
+        assert_eq!(tool_button(0x149), Some(0x113)); // BTN_STYLUS3 -> side (8)
+        assert_eq!(tool_button(0x110), None); // the tip is the Down event
+        assert_eq!(tool_button(0x14d), None);
+    }
+
+    #[test]
+    fn a_tool_frame_presses_in_order_without_repeats() {
+        let mut buttons = Vec::new();
+        // the tip and a stylus button go out in frame order
+        assert_eq!(
+            tool_frame_presses(&mut buttons, &[(0x110, true), (0x14b, true)]),
+            [(0x110, true), (0x14b, true)]
+        );
+        assert_eq!(buttons, [0x110, 0x14b]);
+        // a repeated press, and a lift of a button not held, are dropped
+        assert_eq!(
+            tool_frame_presses(&mut buttons, &[(0x110, true), (0x111, false)]),
+            []
+        );
+        assert_eq!(buttons, [0x110, 0x14b]);
+        // the lift of a held button goes out
+        assert_eq!(
+            tool_frame_presses(&mut buttons, &[(0x110, false)]),
+            [(0x110, false)]
+        );
+        assert_eq!(buttons, [0x14b]);
+        // so does its press again
+        assert_eq!(
+            tool_frame_presses(&mut buttons, &[(0x14b, false), (0x14b, true)]),
+            [(0x14b, false), (0x14b, true)]
+        );
+        assert_eq!(buttons, [0x14b]);
+    }
+
+    #[test]
+    fn a_tool_out_releases_all_and_keeps_the_mouse_pointer() {
+        // proximity-out releases everything it holds, in press order, and
+        // drops the pointer's window it drove
+        assert_eq!(
+            tool_out_releases(&[0x110, 0x14b, 0x111], false),
+            (vec![0x110, 0x14b, 0x111], true)
+        );
+        // but the mouse's own pointer had entered a shown window: the
+        // pointer's window stays (the buttons still go up)
+        assert_eq!(tool_out_releases(&[0x110], true), (vec![0x110], false));
+        assert_eq!(tool_out_releases(&[], false), (Vec::<u32>::new(), true));
+    }
+
+    #[test]
+    fn a_scroll_gesture_is_forgotten_when_the_pointer_changes_window() {
+        let mut rest = (3.0, -2.0);
+        let mut source = Some(wl_pointer::AxisSource::Finger);
+        let mut discrete_seen = true;
+        scroll_forgets(&mut rest, &mut source, &mut discrete_seen);
+        assert_eq!(rest, (0.0, 0.0));
+        assert_eq!(source, None);
+        assert!(!discrete_seen);
+        // a fresh gesture starts from nothing
+        let mut rest = (0.0, 0.0);
+        assert_eq!(scroll_steps(&mut rest.1, 4.0), 0);
+        assert!((rest.1 - 4.0).abs() < 1e-9);
+        scroll_forgets(&mut rest, &mut source, &mut discrete_seen);
+        assert_eq!(rest, (0.0, 0.0));
     }
 
     #[test]

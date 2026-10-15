@@ -4,6 +4,12 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 
 ## Unreleased
 
+### Added
+
+- `-showwindows`: extra mouse buttons are injected, numbered as Xwayland numbers them (back = 8, forward = 9, then 10); buttons 11 and up are not delivered (the reverse master's XTest device has 10).
+- `-showwindows`: a touch screen drives the reverse pointer Xwayland-style: the first touch point moves it and holds button 1 until the lift; a second point down suppresses the emulation.
+- `-showwindows`: a pen or eraser drives the reverse pointer while it is over a shown window: motion, the tip as button 1, the stylus buttons as middle, right and 8, and everything released when it leaves proximity (pressure and tilt are not delivered).
+
 ### Changed
 
 - Repeating a single-value command-line option with different values is now an error naming the option and both values. Equal values warn once per option.
