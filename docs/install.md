@@ -13,10 +13,10 @@ No xdg-desktop-portal and no permission dialog is involved. That is why xwlbridg
 
 For RealVNC Server (its UI on your desktop, the systemd user unit, ports, authentication), read [realvnc-server-6.md](realvnc-server-6.md) after this page.
 
-The build and the runtime packages below were checked in a clean container of each distribution listed: with this
-release on Ubuntu 26.04, Debian 13, Fedora 44 and AlmaLinux 10 (351 of 351 tests each), the others with an earlier
-version of the code. This release was checked on fresh Ubuntu 26.04.1 (the bundle) and AlmaLinux 10.2 (a
-source build) virtual machines.
+The build and the runtime packages below were checked in a clean container of each distribution listed: with 0.1.0
+on Ubuntu 26.04, Debian 13, Fedora 44 and AlmaLinux 10 (351 of 351 tests each), the others with an earlier version of
+the code. 0.1.0 was checked on fresh Ubuntu 26.04.1 (the bundle) and AlmaLinux 10.2 (a source build) virtual machines;
+0.1.1 changes no build or runtime dependency.
 
 ## Install the release bundle (recommended)
 
@@ -170,7 +170,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 git clone https://github.com/kulogix/xwlbridge && cd xwlbridge
 rustup toolchain install
 cargo build --profile dist --features gnome,xvfb   # about a minute; the stripped binary the bundle uses
-cargo test --release --features gnome,xvfb         # 351 tests
+cargo test --release --features gnome,xvfb         # 374 tests
 packaging/install.sh
 ```
 

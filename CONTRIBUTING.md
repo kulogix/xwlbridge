@@ -19,8 +19,8 @@ bash packaging/tests/test_ctl.sh
 python3 -m unittest discover -s tools/x11-a11y-proxy/tests -p test_unit.py
 ```
 
-- The first command runs 351 unit tests. They need no display and no RealVNC.
-- `cargo test` runs 228 tests with default features.
+- The first command runs 374 unit tests. They need no display and no RealVNC.
+- `cargo test` runs 236 tests with default features.
 - `test_ctl.sh` runs 99 checks of `xwlbridge-ctl`, `install.sh`, `uninstall.sh` and migrate. It uses fakes only.
 - The proxy unit tests need PyGObject with GTK 4 and Atspi typelibs.
 - Container tests in `tools/x11-a11y-proxy/tests/*.sh` need a GNOME test-bed image (see `tools/x11-a11y-proxy/tests/bed/README.md`).

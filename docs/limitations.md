@@ -1,6 +1,6 @@
 # Limitations
 
-These are the known limits of xwlbridge 0.1.0.
+These are the known limits of xwlbridge 0.1.1.
 
 | Limitation | Affects | Workaround / status |
 |---|---|---|
@@ -15,15 +15,15 @@ These are the known limits of xwlbridge 0.1.0.
 | One RandR output for the whole desktop (two monitors appear as one combined screen). | Stock engines | None. |
 | Runs only inside a logged-in GNOME session, not at the login screen (GDM). While the screen is locked GNOME closes remote access. | All | Viewers see a padlock unless the lock-screen extension in `contrib/gnome-shell` is enabled. |
 | A restart of the bridge or its engine ends every X client on its display. | All | Restart the clients. |
-| `-showwindows` and `-showscreen` are experimental. No title bars, X window positions are not kept, AT-SPI coordinates are engine coordinates, XEmbed tray icons are not shown. See [no-split.md](no-split.md). | Stock engines | Settings reach engine apps only with the proxy's `--settings-only` mirror. |
+| `-showwindows` and `-showscreen` are experimental. No title bars, X window positions are not kept when a window opens (GNOME places toplevels; popups keep theirs), AT-SPI coordinates are engine coordinates, XEmbed tray icons are not shown. See [no-split.md](no-split.md). | Stock engines | Settings reach engine apps only with the proxy's `--settings-only` mirror. |
 | Accessibility proxy gaps: key repeat at about 2/3 of the native rate, GTK 4 apps must be started through the proxy, and others. See [accessibility.md](accessibility.md). | Screen reader use | Details in that file. |
-| Old X11-only remote-access apps need helpers. See [legacy-remote-access-apps.md](legacy-remote-access-apps.md). | TeamViewer before 15.29 | Pass `-xtestdrivers default,TeamViewer_Desktop`. |
+| Old X11-only remote-access apps need helpers. See [legacy-remote-access-apps.md](legacy-remote-access-apps.md). | TeamViewer before 15.29 | From 0.1.1 TeamViewer's capture process is a default desktop driver, so no `-xtestdrivers` is needed. With 0.1.0, pass `-xtestdrivers default,TeamViewer_Desktop`. |
 | Doctor gaps: it does not check the firewall, its install hints are apt-centric, and it reports the configured engine. | `xwlbridge-ctl doctor` | Check the firewall by hand. |
 | GNOME 45 and older: no input. | Old GNOME | Use GNOME on Xorg there. |
 | KDE Plasma has no backend. | KDE | None. |
 | The default (no-feature) build has only the wlroots backend. | Source builds | Build with `--features gnome`. |
 | `rfb_port` and `server_args` go on RealVNC's command line, which RealVNC forgets on reload (measured: `rfb_port=5901` went back to 5900). | RealVNC service | Set parameters in `~/.vnc/config.d/vncserver-x11` and use `rfb_port=realvnc`. Not changed in this release. |
-| `-engine xwayland`: a few percent of frames can be torn in fast motion. | `xwayland` engine | Known; not fixed in 0.1.0. |
+| `-engine xwayland`: a few percent of frames can be torn in fast motion. | `xwayland` engine | Known; not fixed in 0.1.1. |
 
 ## Not tested
 
@@ -35,11 +35,3 @@ These are the known limits of xwlbridge 0.1.0.
 - The RealVNC tray and UI on EL10.
 - The renamed legacy remote-access helper files with TeamViewer.
 - TeamViewer 15.29 to 15.7x (portal-based).
-
-## Fixed after 0.1.0 on a development branch only
-
-Without `-xtestdrivers`, keys typed by TeamViewer stay on display :20 while its own panel there has the X focus. A development branch adds `TeamViewer_Desktop` to the default drivers. This is not in 0.1.0. In 0.1.0 pass:
-
-```
--xtestdrivers default,TeamViewer_Desktop
-```

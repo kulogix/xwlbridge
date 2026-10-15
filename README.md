@@ -224,7 +224,7 @@ xwd, scrot, import and maim work on the bridge. On the stock engines see the one
 
 ### X11-only remote-access apps
 
-TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021) worked through the bridge on Ubuntu 26.04 and AlmaLinux 10.2, with helpers from `contrib/legacy-remote-access/` (in a clone of this repository; the release bundle does not contain them) and `-xtestdrivers default,TeamViewer_Desktop`. Old builds have known security holes. See [docs/legacy-remote-access-apps.md](docs/legacy-remote-access-apps.md).
+TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021) worked through the bridge on Ubuntu 26.04 and AlmaLinux 10.2, with helpers from `contrib/legacy-remote-access/` (in a clone of this repository; the release bundle does not contain them) and, with 0.1.0, `-xtestdrivers default,TeamViewer_Desktop`. From 0.1.1 TeamViewer's capture process is a default desktop driver, so that flag is not needed. Old builds have known security holes. See [docs/legacy-remote-access-apps.md](docs/legacy-remote-access-apps.md).
 
 ### Keeping an X app entirely on the bridge
 

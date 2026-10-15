@@ -3,7 +3,7 @@
 This page is for screen-reader users who run X apps that live on the bridge's display. There are two ways to use such apps with a screen reader on GNOME:
 
 1. `-showwindows`: the app's windows are shown natively on the desktop. Their accessibility is then Xwayland's.
-2. The proxy `tools/x11-a11y-proxy` (supported in 0.1.0). Use it for apps whose accessibility tree must stay off the desktop, or that have no tree.
+2. The proxy `tools/x11-a11y-proxy` (supported in 0.1.1). Use it for apps whose accessibility tree must stay off the desktop, or that have no tree.
 
 See [../tools/x11-a11y-proxy/README.md](../tools/x11-a11y-proxy/README.md) for the proxy itself.
 

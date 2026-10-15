@@ -17,5 +17,5 @@ number otherwise). The how-to, what was tested and the known limits are in
 | `xwlbridge-xdg-runtime.sh` | `/etc/profile.d/` | RHEL 10: `XDG_RUNTIME_DIR` for processes a daemon starts with `su -` |
 
 Status: experimental. These are the files of the recipe tested with TeamViewer 15.20.6 on Ubuntu 26.04 (GNOME 50)
-and AlmaLinux 10.2 (GNOME 49); for this release they were renamed and were not re-run with TeamViewer afterwards.
+and AlmaLinux 10.2 (GNOME 49); they were renamed for 0.1.0 and were not re-run with TeamViewer afterwards.
 They do not get around any vendor check: check the vendor's licence for your use.

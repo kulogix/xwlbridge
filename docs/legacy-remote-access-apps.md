@@ -37,7 +37,7 @@ AnyDesk incoming sessions needed the logind proxy plus an `LD_PRELOAD` environme
 
 ## Requirements
 
-- xwlbridge 0.1.0, built with `--features gnome,xvfb` (see [install.md](install.md)), with `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`.
+- xwlbridge 0.1.1, built with `--features gnome,xvfb` (see [install.md](install.md)), with `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`.
 - An engine that is a complete X server:
 
   | distribution | engine |
@@ -70,13 +70,12 @@ Use the packaged display service. Do not write a unit by hand.
 ```sh
 xwlbridge-ctl config set display 20             # used by xwlbridge.service only
 xwlbridge-ctl config set engine xvnc            # RHEL 10: xwayland
-xwlbridge-ctl config set bridge_args '-xtestdrivers default,TeamViewer_Desktop'
 xwlbridge-ctl --display enable
 xwlbridge-ctl --display restart
 xwlbridge run -display 20 -- xdpyinfo | head -5   # a display the size of your desktop
 ```
 
-`-xtestdrivers` names the programs whose XTest input is meant for the desktop. Without it, keys typed by TeamViewer stay on `:20` while TeamViewer's own panel there has the X focus. Adding `TeamViewer_Desktop` to the default drivers is fixed only on a development branch. It is not in 0.1.0, so pass `-xtestdrivers default,TeamViewer_Desktop` as shown.
+`-xtestdrivers` names the programs whose XTest input is meant for the desktop. From 0.1.1, TeamViewer's capture process is a default desktop driver, so its keys reach the desktop without naming it and nothing needs to be set here. With 0.1.0, keys typed by TeamViewer stayed on `:20` while its own panel there had the X focus; there, also run `xwlbridge-ctl config set bridge_args '-xtestdrivers default,TeamViewer_Desktop'`.
 
 ## 2. The login1 proxy
 
@@ -183,7 +182,7 @@ The frame rates and delays were measured on busy VMs without a GPU. The bridge u
 
 AlmaLinux 10.2: it worked through the bridge with `-engine xwayland`, unattended, including reboot and logout/login.
 
-The helper files were renamed for this release and were not re-run with TeamViewer after the renaming.
+The helper files were renamed for 0.1.0 and were not re-run with TeamViewer after the renaming.
 
 Known gaps on the bridge side:
 - AltGr (level-3) characters that TeamViewer types with an XKB latch arrive as the base key.
@@ -199,7 +198,7 @@ Known gaps on the bridge side:
 |---|---|---|
 | the viewer stays at "Connecting..." | the vendor daemon still sees a Wayland session | step 2: check the proxy with the `busctl` commands, check the drop-in with `systemctl cat teamviewerd`, then restart the daemon |
 | black picture or "The screen cannot be captured at the moment" | the vendor's windows on `:20` have no `WM_STATE` | step 3: `systemctl --user status xwlbridge-wm-state` |
-| mouse works, keys do nothing | the capture process is not a desktop driver | check `bridge_args` in step 1 |
+| mouse works, keys do nothing | the capture process is not a desktop driver | from 0.1.1, TeamViewer's capture process is a default driver; with 0.1.0, set `bridge_args '-xtestdrivers default,TeamViewer_Desktop'` (step 1) |
 | it worked until the bridge restarted; now every connection fails | the daemon kept the old display's state | step 4, or restart `teamviewerd` |
 | the session ends about 20 s after connecting (RHEL 10) | no `XDG_RUNTIME_DIR` in the `su -` shell | step 4: the profile snippet |
 | the helper units are inactive after a reboot | a unit ordering problem | keep `WantedBy=xwlbridge.service` in the WM_STATE unit |
