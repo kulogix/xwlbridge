@@ -6,9 +6,9 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 
 ### Fixed
 
-- `-showwindows`: app-drawn title-bar drag hand-over keeps the pointer mapping stable while a button is held and continues forwarding motion, including after release.
-- `-showwindows`: keyboard enter sets X focus for globally active clients such as Wine and sends WM_TAKE_FOCUS when advertised; leaving all shown windows still clears focus.
-- `-showwindows`: popup anchors use the parent's current shown origin, including its X border, and compositor-adjusted popup positions are followed on X before subsequent pointer motion.
+- `-showwindows`: dragging a window that moves itself (a Qt dock such as OBS's, a toolkit's drag handle) no longer loses the drag: 0.1.1 handed it to the desktop's interactive move, whose grab took the pointer away mid-drag, so a Qt dock re-docked and the main window could be dragged off-screen. The client's own move now carries the drag inside X, with the pointer mapping held steady until release; the window does not follow on the desktop (as in 0.1.0). `_NET_WM_MOVERESIZE` requests still start the desktop's move.
+- `-showwindows`: Wine (and other clients that advertise WM_TAKE_FOCUS with input false) get the X input focus again, and WM_TAKE_FOCUS is sent when advertised; leaving all shown windows still clears the focus.
+- `-showwindows`: popups are shown where the X client placed them again (no slide onto the monitor): the 0.1.1 slide let a tall menu move 25 px while the client kept its own position, so a maximised LibreOffice opened Character for Format > Paragraph...; a popup that does not fit is clipped instead. Popups are anchored to the parent's current position.
 
 ## 0.1.1 (2026-10-15)
 

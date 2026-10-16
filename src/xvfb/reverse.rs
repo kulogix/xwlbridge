@@ -1205,13 +1205,20 @@ impl State {
         positioner.set_offset(ox, oy);
         positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
         positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
-        // the X client placed it for the X screen; on the desktop it may not
-        // fit the monitor there: let the compositor slide it in (the X window
-        // follows, see `place_popup`)
-        positioner.set_constraint_adjustment(
-            xdg_positioner::ConstraintAdjustment::SlideX
-                | xdg_positioner::ConstraintAdjustment::SlideY,
-        );
+        // No constraint adjustment: the X client has already placed the popup
+        // to fit the X screen, which is the size of the desktop, so the
+        // position that keeps the popup at the parent's shown offset — the
+        // invariant the reverse pointer mapping and `place_popup` assume —
+        // fits the desktop too. Letting the compositor slide it (a popup
+        // taller than the work area: a 720-line menu in a 688-px work area)
+        // breaks that invariant: the compositor shows the popup 25 px lower
+        // and reports the slid offset, the X window follows there, but the
+        // client re-asserts its own position and the mapping is then off by
+        // the adjustment — a maximised LibreOffice's Format > Paragraph...
+        // click landed one menu row off (Character opened). 0.1.0 showed
+        // these popups unadjusted and is correct; a popup that would overflow
+        // the desktop is clipped instead of misplaced.
+        positioner.set_constraint_adjustment(xdg_positioner::ConstraintAdjustment::empty());
         let compositor = self.compositor.as_ref().expect("checked at start");
         let surface = compositor.create_surface(qh, w);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, w);
@@ -1387,9 +1394,10 @@ impl State {
                 }
                 // a client moving its own top-level while a button is held on
                 // it (a drag handle, a toolkit's emulated move without a
-                // window manager): the desktop moves the shown window instead;
-                // left to X, the move would shift the pointer mapping and run
-                // away
+                // window manager): the client carries its own drag; keep the
+                // pointer mapping stable while it does (`begin_move`), but do
+                // not hand the drag to the desktop's interactive move — its
+                // grab takes the pointer off the window's surface mid-drag
                 if !self.screen_mode()
                     && self.moving.is_none()
                     && !self.buttons_down.is_empty()
@@ -1954,25 +1962,26 @@ impl State {
         }
     }
 
-    /// The desktop's interactive move of `w`'s shown window, for the press
-    /// that is down now.
+    /// A client that moves its own X window while a button is held on it (a
+    /// drag handle, a toolkit's emulated move without a window manager)
+    /// carries its own drag: keep the pointer mapping stable while it does
+    /// (its X position is not mirrored into it until the button comes up, so
+    /// its own move loop follows the drag once, not twice), and do not hand
+    /// the drag to the desktop's interactive move. That hand-over was tried
+    /// (0.1.1..59996af) and loses the drag: the desktop's move grab takes the
+    /// pointer off the window's surface mid-drag, the held buttons are
+    /// released under the pointer's last position, and a client running its
+    /// own move loop (Qt docks: OBS) sees a drag that ends after one step at
+    /// the drag's start point — over its own dock area — and re-docks: the
+    /// dock's window went away 5 frames into the drag, the rest of the drag
+    /// ran on the main window and dragged it off-screen.
     fn begin_move(&mut self, w: Window) {
-        let (
-            Some(seat),
-            Some(Shown {
-                role: Role::Toplevel(t),
-                ..
-            }),
-        ) = (self.seat.as_ref(), self.windows.get(&w))
-        else {
+        if self.moving.is_some() {
             return;
-        };
-        t._move(seat, self.press_serial);
+        }
         self.moving = Some(w);
         self.moving_pos = None;
-        crate::log!(
-            "-showwindows: {w:#x} moves itself with the pointer: the desktop moves its window instead"
-        );
+        crate::log!("-showwindows: {w:#x} moves itself with the pointer: its own move carries it");
     }
 
     fn end_move(&mut self) {
