@@ -1,6 +1,6 @@
 [package]
 name = "xwlbridge"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "X11-Wayland desktop bridge: an X display that mirrors a Wayland desktop, for X11 screen capture, remote desktop and automation tools"

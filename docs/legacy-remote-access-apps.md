@@ -37,7 +37,7 @@ AnyDesk incoming sessions needed the logind proxy plus an `LD_PRELOAD` environme
 
 ## Requirements
 
-- xwlbridge 0.1.1, built with `--features gnome,xvfb` (see [install.md](install.md)), with `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`.
+- xwlbridge 0.1.2, built with `--features gnome,xvfb` (see [install.md](install.md)), with `xwlbridge` and `xwlbridge-ctl` in `~/.local/bin`.
 - An engine that is a complete X server:
 
   | distribution | engine |

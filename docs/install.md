@@ -16,7 +16,7 @@ For RealVNC Server (its UI on your desktop, the systemd user unit, ports, authen
 The build and the runtime packages below were checked in a clean container of each distribution listed: with 0.1.0
 on Ubuntu 26.04, Debian 13, Fedora 44 and AlmaLinux 10 (351 of 351 tests each), the others with an earlier version of
 the code. 0.1.0 was checked on fresh Ubuntu 26.04.1 (the bundle) and AlmaLinux 10.2 (a source build) virtual machines;
-0.1.1 changes no build or runtime dependency.
+0.1.1 and 0.1.2 change no build or runtime dependency.
 
 ## Install the release bundle (recommended)
 
