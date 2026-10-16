@@ -2,6 +2,14 @@
 
 All notable changes to xwlbridge are listed here. The format follows Keep a Changelog.
 
+## Unreleased
+
+### Fixed
+
+- `-showwindows`: app-drawn title-bar drag hand-over keeps the pointer mapping stable while a button is held and continues forwarding motion, including after release.
+- `-showwindows`: keyboard enter sets X focus for globally active clients such as Wine and sends WM_TAKE_FOCUS when advertised; leaving all shown windows still clears focus.
+- `-showwindows`: popup anchors use the parent's current shown origin, including its X border, and compositor-adjusted popup positions are followed on X before subsequent pointer motion.
+
 ## 0.1.1 (2026-10-15)
 
 ### Added

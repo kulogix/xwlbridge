@@ -191,6 +191,32 @@ fn popup_anchor(dx: i32, dy: i32, pw: u16, ph: u16) -> ((i32, i32), (i32, i32)) 
     ((ax, ay), (dx - ax, dy - ay))
 }
 
+/// Named X pixmaps include the border: their shown origin is one border
+/// width before the client origin returned by TranslateCoordinates.
+fn shown_origin(client: (i16, i16), border: u16) -> (i32, i32) {
+    (
+        i32::from(client.0) - i32::from(border),
+        i32::from(client.1) - i32::from(border),
+    )
+}
+
+/// Popup positions and xdg_popup.configure use the same shown-parent origin.
+fn popup_position(parent: (i32, i32), offset: (i32, i32)) -> (i32, i32) {
+    (parent.0 + offset.0, parent.1 + offset.1)
+}
+
+/// Keep the pointer mapping stable while the compositor owns a client drag.
+fn mirror_position(moving: Option<Window>, w: Window, buttons: &[u8]) -> bool {
+    moving != Some(w) || buttons.is_empty()
+}
+
+/// A globally active client (Wine included) needs both focus and its protocol
+/// notification. A No Input window still leaves the previous focus alone.
+fn focus_actions(input: bool, protocols: &[u32], take_focus: u32) -> (bool, bool) {
+    let take = protocols.contains(&take_focus);
+    (input || take, take)
+}
+
 /// Whether an override-redirect window is a toolkit's invisible helper (off
 /// the screen, or at most 2x2) rather than something to show.
 fn helper_window(x: i32, y: i32, w: i32, h: i32, screen: (u16, u16)) -> bool {
@@ -635,8 +661,6 @@ struct State {
     close: Vec<Window>,
     /// Sizes the compositor asked for.
     resize: Vec<(Window, i32, i32)>,
-    /// Popups the compositor placed: (window, x, y) relative to the parent.
-    placed: Vec<(Window, i32, i32)>,
     /// Popups the compositor dismissed.
     popup_done: Vec<Window>,
     /// Pointer-lock state changes: (window, locked).
@@ -647,9 +671,11 @@ struct State {
     states: Vec<(Window, bool, bool)>,
     /// Serial of the last button press on a shown window (for an interactive move).
     press_serial: u32,
-    /// A window that moved itself with the pointer, being moved by the desktop
-    /// instead: its motion is not forwarded until the pointer comes back.
+    /// A window handed to the desktop's interactive move: its X position is
+    /// not mirrored into the pointer mapping while a button is held.
     moving: Option<Window>,
+    /// Latest X position suppressed during the hand-over, restored on release.
+    moving_pos: Option<(i16, i16)>,
     /// The current pointer frame's axis source, and whether it had discrete steps.
     axis_source: Option<wl_pointer::AxisSource>,
     axis_discrete_seen: bool,
@@ -769,13 +795,13 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         throttle: std::env::var_os("XWLBRIDGE_SHOW_NOTHROTTLE").is_none_or(|v| v.is_empty()),
         close: Vec::new(),
         resize: Vec::new(),
-        placed: Vec::new(),
         popup_done: Vec::new(),
         lock_events: Vec::new(),
         relative: Vec::new(),
         states: Vec::new(),
         press_serial: 0,
         moving: None,
+        moving_pos: None,
         axis_source: None,
         axis_discrete_seen: false,
         axis_rest: (0.0, 0.0),
@@ -980,6 +1006,14 @@ impl State {
         Ok((g.x, g.y, width, height, g.depth, dmg))
     }
 
+    /// Query rather than use a ConfigureNotify that may still be queued (for
+    /// example, the parent's position just after maximising).
+    fn shown_origin(&self, w: Window) -> Result<(i32, i32), AnyError> {
+        let g = self.x.get_geometry(w)?.reply()?;
+        let p = self.x.translate_coordinates(w, self.root, 0, 0)?.reply()?;
+        Ok(shown_origin((p.dst_x, p.dst_y), g.border_width))
+    }
+
     /// Gives `w`'s client the reverse master as its ClientPointer, so its
     /// pointer grabs, warps and queries follow the desktop's input on it.
     fn adopt_client(&mut self, w: Window) {
@@ -1160,8 +1194,9 @@ impl State {
             return Ok(());
         };
         let (x, y, width, height, depth, dmg) = self.watch(w)?;
+        let origin = self.shown_origin(parent)?;
         let p = self.windows.get(&parent).expect("found above");
-        let (dx, dy) = (i32::from(x) - i32::from(p.x), i32::from(y) - i32::from(p.y));
+        let (dx, dy) = (i32::from(x) - origin.0, i32::from(y) - origin.1);
         let ((ax, ay), (ox, oy)) = popup_anchor(dx, dy, p.width, p.height);
         let wm_base = self.wm_base.as_ref().expect("checked at start");
         let positioner = wm_base.create_positioner(qh, ());
@@ -1172,7 +1207,7 @@ impl State {
         positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
         // the X client placed it for the X screen; on the desktop it may not
         // fit the monitor there: let the compositor slide it in (the X window
-        // follows, see `placed`)
+        // follows, see `place_popup`)
         positioner.set_constraint_adjustment(
             xdg_positioner::ConstraintAdjustment::SlideX
                 | xdg_positioner::ConstraintAdjustment::SlideY,
@@ -1375,8 +1410,25 @@ impl State {
                     self.consider(e.window, qh);
                     return;
                 }
+                // A queued notification can predate a compositor popup slide.
+                // Use the server's current position, not that stale event.
+                let pos = if self
+                    .windows
+                    .get(&e.window)
+                    .is_some_and(|s| matches!(s.role, Role::Popup { .. }))
+                {
+                    self.shown_origin(e.window)
+                        .map(|(x, y)| (x as i16, y as i16))
+                        .unwrap_or((e.x, e.y))
+                } else {
+                    (e.x, e.y)
+                };
                 if let Some(s) = self.windows.get_mut(&e.window) {
-                    (s.x, s.y) = (e.x, e.y);
+                    if mirror_position(self.moving, e.window, &self.buttons_down) {
+                        (s.x, s.y) = pos;
+                    } else {
+                        self.moving_pos = Some(pos);
+                    }
                     if (w, h) != (s.width, s.height) {
                         if frame_bytes(w, h).is_none() {
                             crate::warning!(
@@ -1519,26 +1571,6 @@ impl State {
                 self.set_net_wm_state(w, maximized, fullscreen);
             }
         }
-        for (w, px, py) in std::mem::take(&mut self.placed) {
-            // the compositor put the popup elsewhere: move the X window there,
-            // so the reverse pointer finds it where the desktop shows it
-            if let Some(s) = self.windows.get(&w)
-                && let Role::Popup { parent, .. } = s.role
-                && let Some(p) = self.windows.get(&parent)
-            {
-                let (nx, ny) = (i32::from(p.x) + px, i32::from(p.y) + py);
-                if (nx, ny) != (i32::from(s.x), i32::from(s.y)) {
-                    crate::vlog!(
-                        "-showwindows: popup {w:#x} placed at {nx},{ny}, not {},{}",
-                        s.x,
-                        s.y
-                    );
-                    let _ = self
-                        .x
-                        .configure_window(w, &ConfigureWindowAux::new().x(nx).y(ny));
-                }
-            }
-        }
         for w in std::mem::take(&mut self.popup_done) {
             crate::log!("-showwindows: the desktop dismissed popup {w:#x}");
             self.hide(w, qh);
@@ -1575,6 +1607,29 @@ impl State {
             .collect();
         for w in dirty {
             self.paint(w);
+        }
+    }
+
+    /// Apply a popup configure before any later pointer event in this batch.
+    fn place_popup(&mut self, w: Window, px: i32, py: i32) {
+        if let Some(s) = self.windows.get(&w)
+            && let Role::Popup { parent, .. } = s.role
+            && let Ok(origin) = self.shown_origin(parent)
+        {
+            let (nx, ny) = popup_position(origin, (px, py));
+            if (nx, ny) != (i32::from(s.x), i32::from(s.y)) {
+                crate::vlog!(
+                    "-showwindows: popup {w:#x} placed at {nx},{ny}, not {},{}",
+                    s.x,
+                    s.y
+                );
+                let _ = self
+                    .x
+                    .configure_window(w, &ConfigureWindowAux::new().x(nx).y(ny));
+                if let Some(s) = self.windows.get_mut(&w) {
+                    (s.x, s.y) = (nx as i16, ny as i16);
+                }
+            }
         }
     }
 
@@ -1811,9 +1866,6 @@ impl State {
 
     /// Moves the reverse pointer to surface-local `(sx, sy)` of `w`.
     fn motion(&mut self, w: Window, sx: f64, sy: f64) {
-        if self.moving == Some(w) {
-            return;
-        }
         let Some((x, y)) = self.to_root(w, sx, sy) else {
             return;
         };
@@ -1917,9 +1969,19 @@ impl State {
         };
         t._move(seat, self.press_serial);
         self.moving = Some(w);
+        self.moving_pos = None;
         crate::log!(
             "-showwindows: {w:#x} moves itself with the pointer: the desktop moves its window instead"
         );
+    }
+
+    fn end_move(&mut self) {
+        if let Some(w) = self.moving.take()
+            && let Some((x, y)) = self.moving_pos.take()
+            && let Some(s) = self.windows.get_mut(&w)
+        {
+            (s.x, s.y) = (x, y);
+        }
     }
 
     /// Tells clients (EWMH) which window-manager requests the desktop carries
@@ -2165,6 +2227,7 @@ impl State {
                         e.window
                     );
                     self.moving = Some(e.window);
+                    self.moving_pos = None;
                     return;
                 }
                 _ => return,
@@ -2174,7 +2237,6 @@ impl State {
                 "-showwindows: {:#x} asks for a resize ({edge:?}): the desktop resizes its window",
                 e.window
             );
-            self.moving = Some(e.window);
         }
     }
 
@@ -2306,6 +2368,9 @@ impl State {
             }
         } else {
             self.buttons_down.retain(|&x| x != b);
+            if self.buttons_down.is_empty() {
+                self.end_move();
+            }
         }
         crate::vlog!(
             "-showwindows: button {b} {} on {:?}",
@@ -2379,27 +2444,26 @@ impl State {
         for b in std::mem::take(&mut self.buttons_down) {
             let _ = xtest::fake_input(&self.x, BUTTON_RELEASE, b, 0, self.root, 0, 0, 0);
         }
+        self.end_move();
     }
 
     /// Gives `w` the reverse keyboard the way an ICCCM window manager gives
-    /// the keyboard (§4.1.7): set the focus if its WM_HINTS input is true
-    /// (Passive, Locally Active), and send WM_TAKE_FOCUS if it lists it
-    /// (Locally and Globally Active: Java focuses itself then). A window with
-    /// input false is never focused by us, so an on-screen keyboard (GTK's
-    /// accept-focus false; it ignores WM_TAKE_FOCUS) leaves the keyboard with
-    /// the window that had it, where its XTest keys then go.
+    /// the keyboard (§4.1.7): focus input-taking windows, including globally
+    /// active clients, and send WM_TAKE_FOCUS only when advertised. No Input
+    /// windows (on-screen keyboards) leave the previous focus alone.
     fn focus_x(&mut self, w: Window) {
         if self.x_focus == Some(w) {
             return;
         }
         let (input, _) = self.hints(w);
-        if input {
+        let (set, take) = focus_actions(input, &self.protocols(w), self.atoms.wm_take_focus);
+        if set {
             self.x_focus = Some(w);
             let _ = self
                 .x
                 .xinput_xi_set_focus(w, x11rb::CURRENT_TIME, self.devs.keyboard);
         }
-        if self.protocols(w).contains(&self.atoms.wm_take_focus) {
+        if take {
             let ev = ClientMessageEvent::new(
                 32,
                 w,
@@ -3113,7 +3177,7 @@ impl Dispatch<xdg_popup::XdgPopup, Window> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_popup::Event::Configure { x, y, .. } => state.placed.push((*w, x, y)),
+            xdg_popup::Event::Configure { x, y, .. } => state.place_popup(*w, x, y),
             xdg_popup::Event::PopupDone => state.popup_done.push(*w),
             _ => {}
         }
@@ -3177,7 +3241,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.pointer_on = Some(w);
                 state.pointer_entered = true;
                 state.enter_serial = serial;
-                state.moving = None;
                 scroll_forgets(
                     &mut state.axis_rest,
                     &mut state.axis_source,
@@ -3231,8 +3294,6 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 let pressed = bs == wl_pointer::ButtonState::Pressed;
                 if pressed {
                     state.press_serial = serial;
-                } else {
-                    state.moving = None;
                 }
                 state.button(button, pressed);
             }
@@ -3803,6 +3864,62 @@ mod tests {
         // a submenu left of it
         assert_eq!(popup_anchor(-50, 30, 300, 200), ((0, 30), (-50, 0)));
         assert_eq!(popup_anchor(40, 50, 300, 200), ((40, 50), (0, 0)));
+    }
+
+    #[test]
+    fn handover_suspends_only_the_held_windows_position_mirroring() {
+        let w = 0x1001;
+        assert!(mirror_position(None, w, &[1]));
+        assert!(!mirror_position(Some(w), w, &[1]));
+        assert!(!mirror_position(Some(w), w, &[1, 3]));
+        assert!(mirror_position(Some(w), 0x1002, &[1]));
+        // Even if the hand-over marker remains, release resumes mirroring.
+        assert!(mirror_position(Some(w), w, &[]));
+    }
+
+    #[test]
+    fn keyboard_enter_focuses_globally_active_clients_and_notifies_only_if_advertised() {
+        let (mut left, mut on) = (true, None);
+        on_keyboard_enter(&mut left, &mut on, 0x1001);
+        assert_eq!(on, Some(0x1001));
+        assert!(!x_focus_clears(left, on));
+        let take = 42;
+        // Wine may set input false and advertise WM_TAKE_FOCUS: do both.
+        assert_eq!(focus_actions(false, &[7, take], take), (true, true));
+        assert_eq!(focus_actions(true, &[take], take), (true, true));
+        assert_eq!(focus_actions(true, &[7], take), (true, false));
+        assert_eq!(focus_actions(true, &[], take), (true, false));
+        // A No Input window must not steal focus from its typing target.
+        assert_eq!(focus_actions(false, &[], take), (false, false));
+    }
+
+    #[test]
+    fn popup_anchor_uses_current_shown_origin_including_border() {
+        // Maximising moved the parent from its old floating position to 0,0.
+        // TranslateCoordinates returns the client origin, inside its border.
+        let origin = shown_origin((2, 2), 2);
+        assert_eq!(origin, (0, 0));
+        let popup = (120, 48);
+        let offset = (popup.0 - origin.0, popup.1 - origin.1);
+        assert_eq!(
+            popup_anchor(offset.0, offset.1, 1920, 1080),
+            ((120, 48), (0, 0))
+        );
+        assert_eq!(popup_position(origin, offset), popup);
+        // A bordered floating parent and a nested popup use the same rule.
+        assert_eq!(shown_origin((103, 203), 3), (100, 200));
+        assert_eq!(shown_origin((-8, 32), 2), (-10, 30));
+    }
+
+    #[test]
+    fn popup_follows_compositor_slide_in_parent_coordinates() {
+        let origin = shown_origin((102, 202), 2);
+        let requested = (700, 500);
+        let adjusted = (650, 450);
+        assert_eq!(popup_position(origin, requested), (800, 700));
+        assert_eq!(popup_position(origin, adjusted), (750, 650));
+        // A submenu follows its already adjusted parent's shown origin.
+        assert_eq!(popup_position((750, 650), (-100, 24)), (650, 674));
     }
 
     #[test]
