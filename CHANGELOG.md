@@ -6,6 +6,7 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 
 ### Fixed
 
+- `-showwindows`: the compositor's liveness pings are answered on a thread of their own, so an X client holding a server grab (a screenshot tool selecting a region) can no longer make GNOME offer to force-quit the bridge - which would have closed every X app on the display at once.
 - X bells on the stock engines (Xvfb, Xvnc: -showwindows, -showscreen and the RealVNC service) ring the desktop's system bell, as the built-in engine already did; before, they made no sound at all. A bell rung for its event only (XkbBell event_only) stays silent, and GNOME's audible/visual bell settings apply.
 
 ## 0.1.2 (2026-10-16)

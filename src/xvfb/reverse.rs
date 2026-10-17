@@ -619,6 +619,8 @@ struct State {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    /// The queue xdg_wm_base's pings are answered on (`spawn_pinger`).
+    ping_qh: QueueHandle<Pinger>,
     seat: Option<wl_seat::WlSeat>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -757,6 +759,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         .map_err(|e| format!("no Wayland display to show windows on: {e}"))?;
     let mut queue: EventQueue<State> = wl.new_event_queue();
     let qh = queue.handle();
+    let ping_qh = spawn_pinger(&wl);
     wl.display().get_registry(&qh, ());
     let mut state = State {
         x,
@@ -768,6 +771,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         compositor: None,
         shm: None,
         wm_base: None,
+        ping_qh,
         seat: None,
         pointer: None,
         keyboard: None,
@@ -2980,7 +2984,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
                 }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
-                "xdg_wm_base" => state.wm_base = Some(registry.bind(name, version.min(2), qh, ())),
+                "xdg_wm_base" => {
+                    state.wm_base = Some(registry.bind(name, version.min(2), &state.ping_qh, ()))
+                }
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, version.min(5), qh, ()))
                 }
@@ -3078,7 +3084,11 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
     }
 }
 
-impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
+/// Answers the compositor's xdg_wm_base pings on a queue and thread of its
+/// own (see `spawn_pinger`).
+struct Pinger;
+
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for Pinger {
     fn event(
         _: &mut Self,
         wm_base: &xdg_wm_base::XdgWmBase,
@@ -3089,8 +3099,33 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
     ) {
         if let xdg_wm_base::Event::Ping { serial } = event {
             wm_base.pong(serial);
+            crate::vlog!("-showwindows: answered the compositor's ping {serial}");
         }
     }
+}
+
+/// The compositor pings this client to see that it is alive, and offers to
+/// force-quit one that does not answer within seconds - which would kill the
+/// bridge and every X client on its display at once. The main loop can wait
+/// on the X server (a reply held up while another X client grabs the
+/// server, e.g. a screenshot tool selecting a region), so pings are answered
+/// here, on a queue of their own: xdg_wm_base is bound to it (objects made
+/// from it name their own queue, the main one). Meanwhile shown windows just
+/// do not update, as every X window freezes on Xorg during a server grab.
+fn spawn_pinger(wl: &WlConnection) -> QueueHandle<Pinger> {
+    let mut queue: EventQueue<Pinger> = wl.new_event_queue();
+    let qh = queue.handle();
+    let conn = wl.clone();
+    let _ = std::thread::Builder::new()
+        .name("showwindows-ping".into())
+        .spawn(move || {
+            while queue.blocking_dispatch(&mut Pinger).is_ok() {
+                if conn.flush().is_err() {
+                    break;
+                }
+            }
+        });
+    qh
 }
 
 impl Dispatch<xdg_surface::XdgSurface, Window> for State {
