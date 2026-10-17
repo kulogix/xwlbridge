@@ -2,6 +2,12 @@
 
 All notable changes to xwlbridge are listed here. The format follows Keep a Changelog.
 
+## Unreleased
+
+### Fixed
+
+- X bells on the stock engines (Xvfb, Xvnc: -showwindows, -showscreen and the RealVNC service) ring the desktop's system bell, as the built-in engine already did; before, they made no sound at all. A bell rung for its event only (XkbBell event_only) stays silent, and GNOME's audible/visual bell settings apply.
+
 ## 0.1.2 (2026-10-16)
 
 ### Fixed

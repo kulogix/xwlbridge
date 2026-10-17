@@ -35,7 +35,7 @@ zbus = { version = "5.19.0", optional = true, default-features = false, features
 reis = { version = "0.7.1", optional = true }
 # Xvfb engine (-engine xvfb): a stock Xorg server carries the X protocol, and an
 # agent (an X client of it) mirrors the desktop into it and forwards input back.
-x11rb = { version = "0.13", optional = true, features = ["xinput", "shm", "xfixes", "res", "render", "xtest", "record", "randr", "composite", "damage"] }
+x11rb = { version = "0.13", optional = true, features = ["xinput", "shm", "xfixes", "res", "render", "xtest", "record", "randr", "composite", "damage", "xkb"] }
 
 [dev-dependencies]
 # XKB replies are encoded by hand (src/bridge/x11/xkb.rs); the tests parse them

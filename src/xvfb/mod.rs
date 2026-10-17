@@ -76,7 +76,7 @@ use x11rb::protocol::xproto::{
     ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Family,
     HostMode, ImageFormat, NotifyDetail, NotifyMode, StackMode, Window, WindowClass,
 };
-use x11rb::protocol::{Event, composite, randr, res, shm, xtest};
+use x11rb::protocol::{Event, composite, randr, res, shm, xkb, xtest};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -883,6 +883,37 @@ impl Target {
 }
 
 /// The XTest slave devices: their raw events are injected input.
+/// Asks the engine's X server for its bells (XKB BellNotify). Without XKB
+/// (no stock engine lacks it) bells stay silent, as they were.
+fn select_bells(conn: &RustConnection) {
+    use x11rb::protocol::xkb::ConnectionExt as _;
+    let supported = conn
+        .xkb_use_extension(1, 0)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some_and(|r| r.supported);
+    if !supported {
+        crate::vlog!("xvfb: no XKB on the engine display: X bells stay silent");
+        return;
+    }
+    if let Err(e) = conn.xkb_select_events(
+        xkb::ID::USE_CORE_KBD.into(),
+        xkb::EventType::from(0u16),
+        xkb::EventType::BELL_NOTIFY,
+        xkb::MapPart::from(0u16),
+        xkb::MapPart::from(0u16),
+        &xkb::SelectEventsAux::new(),
+    ) {
+        crate::warning!("xvfb: can't select X bells: {e}");
+    }
+}
+
+/// Whether an X bell makes a sound: a client may ring for the event only
+/// (XkbBell with event_only, to play its own sound), which must stay silent.
+fn bell_sounds(e: &xkb::BellNotifyEvent) -> bool {
+    !e.event_only
+}
+
 fn xtest_devices(conn: &RustConnection) -> Result<Vec<u16>, AnyError> {
     let infos = conn
         .xinput_xi_query_device(xinput::Device::ALL)?
@@ -1331,6 +1362,10 @@ impl Agent {
                 },
             ],
         )?;
+        // the X bell: XKB reports every bell (a core Bell or an XkbBell) as
+        // BellNotify; Xvfb and Xvnc have no speaker, so it rings the
+        // desktop's system bell instead (see `bell_sounds`)
+        select_bells(&conn);
         let mut reverse = None;
         let mut kfocus = None;
         // -showwindows shows this display's windows on the desktop, which
@@ -2097,6 +2132,11 @@ impl Agent {
             }
             Event::FocusOut(e) if Some(e.event) == self.kfocus => {
                 self.target.own_focus_event(false, e.mode, e.detail)
+            }
+            Event::XkbBellNotify(e) => {
+                if bell_sounds(&e) {
+                    crate::bridge::bell::ring();
+                }
             }
             Event::XinputHierarchy(_) => match xtest_devices(&self.conn) {
                 Ok(d) => {
@@ -3104,6 +3144,27 @@ fn include_keymap(text: &str, group: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bell_sounds_unless_the_client_asked_for_the_event_only() {
+        let bell = |event_only| super::xkb::BellNotifyEvent {
+            response_type: 0,
+            xkb_type: 8,
+            sequence: 0,
+            time: 0,
+            device_id: 3,
+            bell_class: super::xkb::BellClassResult::KBD_FEEDBACK_CLASS,
+            bell_id: 0,
+            percent: 50,
+            pitch: 400,
+            duration: 100,
+            name: 0,
+            window: 0,
+            event_only,
+        };
+        assert!(super::bell_sounds(&bell(false)));
+        assert!(!super::bell_sounds(&bell(true)));
+    }
+
     /// Held by the tests that spawn processes while they bind sockets: a child
     /// forked by one test holds the other's listening socket until it execs, and
     /// a connect() in that window is answered, so the socket seemed alive (the
