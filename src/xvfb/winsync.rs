@@ -1142,7 +1142,8 @@ pub mod bus {
 /// - `GetMonitors() -> a(i(iiii)(iiii)db)`: index, geometry, work area,
 ///   scale, primary;
 /// - signals, sent only to the bus names of the process owning the window
-///   (a caller becomes a recipient with its first call):
+///   (a caller becomes a recipient with its first call of anything but
+///   `Version` and `Features`: here the `GetMonitors` sent on `Available`):
 ///   `Changed(s tag, (iiii) rect, i monitor, i workspace, u flags,
 ///   u serial)` (coalesced, one per window per main-loop turn, only when
 ///   something differs; the serial is one counter for all), `Restacked(as
@@ -1515,7 +1516,8 @@ pub mod bus {
                 Ok(p) => p,
                 Err(e) => return self.unavailable(&format!("can't reach the extension: {e}")),
             };
-            // the first call also makes us a recipient of its signals
+            // (Version and Features do not make us a recipient of its
+            // signals: the GetMonitors and GetState after Available do)
             let version = match proxy.call::<_, _, u32>("Version", &()) {
                 Ok(v) => v,
                 Err(e) => return self.unavailable(&format!("can't read its Version: {e}")),
