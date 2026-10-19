@@ -666,6 +666,19 @@ pub fn restack_plan(desktop: &[Xid], x: &[Xid]) -> Vec<(Xid, Stack)> {
     ops
 }
 
+/// Whether a ConfigureNotify of a shown window may be a restack: its
+/// geometry is the one it had (`(position, width, height, sibling below)`
+/// before and after; a move or resize is not, and a configure of ours that
+/// moved it is not either), or the sibling below it changed. The stacking
+/// itself is then checked against the desktop's (`raised_over_desktop`).
+pub fn restack_event(
+    before: ((i16, i16), u16, u16, Option<Xid>),
+    after: ((i16, i16), u16, u16, Xid),
+) -> bool {
+    let same_geometry = (before.0, before.1, before.2) == (after.0, after.1, after.2);
+    same_geometry || before.3.is_some_and(|b| b != after.3)
+}
+
 /// Whether X's order `x` (after a client restacked `xid`) has `xid` above a
 /// window the desktop has above it (`desktop`, bottom to top): the client
 /// raised it (XRaiseWindow, a restack to Above or TopIf), which is a request
@@ -2423,6 +2436,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn restacks_are_told_from_moves() {
+        let before = ((10, 20), 100, 50, Some(7));
+        assert!(
+            restack_event(before, ((10, 20), 100, 50, 7)),
+            "XRaiseWindow with the same sibling below"
+        );
+        assert!(
+            restack_event(before, ((10, 20), 100, 50, 9)),
+            "a new sibling below"
+        );
+        assert!(!restack_event(before, ((11, 20), 100, 50, 7)), "a move");
+        assert!(!restack_event(before, ((10, 20), 101, 50, 7)), "a resize");
+        assert!(
+            restack_event(before, ((11, 20), 100, 50, 9)),
+            "a move and a restack"
+        );
+        assert!(
+            restack_event(((10, 20), 100, 50, None), ((10, 20), 100, 50, 7)),
+            "first seen"
+        );
+        assert!(!restack_event(
+            ((10, 20), 100, 50, None),
+            ((0, 0), 100, 50, 7)
+        ));
     }
 
     #[test]

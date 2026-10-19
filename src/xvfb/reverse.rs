@@ -1657,9 +1657,15 @@ impl State {
                 let desk = self.sync.as_ref().and_then(|sync| sync.geo.desk(e.window));
                 let mut restacked = false;
                 if let Some(s) = self.windows.get_mut(&e.window) {
+                    // a restack (or nothing): the same geometry, or a new
+                    // sibling below (an XRaiseWindow keeps the sibling when
+                    // the window that was on top is the one below it now)
+                    restacked = winsync::restack_event(
+                        (s.at, s.width, s.height, s.above),
+                        (pos, w, h, e.above_sibling),
+                    );
                     s.at = pos;
                     s.border = e.border_width;
-                    restacked = s.above.is_some_and(|a| a != e.above_sibling);
                     s.above = Some(e.above_sibling);
                     if synced {
                         // the pointer maps from where the desktop has it
