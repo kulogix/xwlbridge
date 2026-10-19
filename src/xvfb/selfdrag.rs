@@ -38,9 +38,11 @@
 //!   where that motion takes it, and a match proves the origin, so older ones
 //!   are out from then on (the desktop's moves only go forward). Without (a
 //!   tablet, QEMU's usb-tablet, a VNC or RDP viewer's pointer through
-//!   RemoteDesktop or EIS; touch), where its track leads (`Track::predict`:
-//!   on at its velocity, slowing down to a stop if it slows, or its last step
-//!   again when the event times have been unreliable).
+//!   RemoteDesktop or EIS; touch), where its track leads
+//!   (`Track::expectations`: on at its velocity, slowing down to a stop if it
+//!   slows, and its last step again; either may be right, as event times can
+//!   be jittered and steps irregular, so a candidate is scored against both,
+//!   each as good as it has been lately).
 //!
 //! Model-checked against a simulation (tests below): the compositor (moves
 //! taking effect once applied or once laid out at the next frame, events made
@@ -172,6 +174,7 @@ impl Track {
     /// Where the pointer is likely to be at `time`: where it is after a
     /// pause; else by the prediction that has been closer lately: on at its
     /// velocity from the last timed position, or its last step once more.
+    #[cfg(test)]
     pub fn predict(&self, time: Option<u32>) -> Option<Pos> {
         let pos = self.pos?;
         if self.paused(time) {
@@ -197,13 +200,25 @@ impl Track {
         }
     }
 
-    /// How far off `predict` has been lately (px).
-    pub fn spread(&self, time: Option<u32>) -> f64 {
-        let err = match self.by_time(time) {
-            Some(_) if self.err_time <= self.err_step => self.err_time,
-            _ => self.err_step,
+    /// Where the pointer may be at `time`, each with how far off that
+    /// prediction has been lately (px): by velocity and time, and by the last
+    /// step; where it is after a pause.
+    pub fn expectations(&self, time: Option<u32>) -> Vec<(Pos, f64)> {
+        let Some(pos) = self.pos else {
+            return Vec::new();
         };
-        err.sqrt().max(MIN_SPREAD)
+        if self.paused(time) {
+            return vec![(pos, MIN_SPREAD)];
+        }
+        let spread = |err: f64| err.sqrt().max(MIN_SPREAD);
+        let mut v = Vec::with_capacity(2);
+        if let Some(p) = self.by_time(time) {
+            v.push((p, spread(self.err_time)));
+        }
+        if let Some(p) = self.by_step() {
+            v.push((p, spread(self.err_step)));
+        }
+        v
     }
 
     fn paused(&self, time: Option<u32>) -> bool {
@@ -463,16 +478,31 @@ impl SelfDrag {
                 elapsed(Some(t), Some(sent)).is_some_and(|d| d > SENT_AFTER_MS)
             })
         };
-        let (expect, spread) = match (f.rel, self.track.pos()) {
-            (Some(d), Some(p)) => (Some((p.0 + d.0, p.1 + d.1)), REL_SPREAD),
-            _ => (self.track.predict(f.time), self.track.spread(f.time)),
+        let expects: Vec<(Pos, f64)> = match (f.rel, self.track.pos()) {
+            (Some(d), Some(p)) => vec![((p.0 + d.0, p.1 + d.1), REL_SPREAD)],
+            _ => self.track.expectations(f.time),
         };
-        // the most likely origin: its candidate near the expected position,
-        // and not sent after the event was made
+        // the most likely origin: its candidate near where the pointer is
+        // expected (a mixture of the expectations, each as good as it has
+        // been lately), and not sent after the event was made
         let cost = |c: Pos, o: &Origin| {
-            let d = expect.map_or(0.0, |e| (c.0 - e.0).powi(2) + (c.1 - e.1).powi(2));
-            d / (2.0 * spread * spread) + if late(o) { SENT_AFTER_COST } else { 0.0 }
+            let terms: Vec<f64> = expects
+                .iter()
+                .map(|&(e, s)| {
+                    let d = (c.0 - e.0).powi(2) + (c.1 - e.1).powi(2);
+                    -d / (2.0 * s * s) - 2.0 * s.ln()
+                })
+                .collect();
+            let top = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let near = if terms.is_empty() {
+                0.0
+            } else {
+                -(top + terms.iter().map(|t| (t - top).exp()).sum::<f64>().ln())
+            };
+            near + if late(o) { SENT_AFTER_COST } else { 0.0 }
         };
+        // what a frame's relative motion says, which proves an origin
+        let rel_expect = expects.first().map(|e| e.0).filter(|_| f.rel.is_some());
         let mut best: Option<(usize, f64, Pos)> = None;
         let mut candidates = 0;
         for (i, o) in self.origins.iter().enumerate() {
@@ -483,15 +513,13 @@ impl SelfDrag {
             let c = (f64::from(o.at.0) + s.0, f64::from(o.at.1) + s.1);
             let k = cost(c, o);
             // the oldest of equals; without an expectation, the newest
-            if best.is_none_or(|b| k < b.1 || (expect.is_none() && k <= b.1)) {
+            if best.is_none_or(|b| k < b.1 || (expects.is_empty() && k <= b.1)) {
                 best = Some((i, k, c));
             }
         }
         let (i, _, pos) = best?;
-        let proved = f.rel.is_some()
-            && expect.is_some_and(|e| {
-                (pos.0 - e.0).abs() < REL_MATCH && (pos.1 - e.1).abs() < REL_MATCH
-            });
+        let proved = rel_expect
+            .is_some_and(|e| (pos.0 - e.0).abs() < REL_MATCH && (pos.1 - e.1).abs() < REL_MATCH);
         if proved {
             // the relative motion proves the origin the compositor used
             self.laid_out(self.base + i);
@@ -700,15 +728,15 @@ mod tests {
         let t = t0();
         let track = |err: f64| Track {
             pos: Some((410.0, 280.0)),
-            step: Some((8.5, 0.0)),
+            step: Some((9.8, 0.0)),
             timed: Some(((410.0, 280.0), 1030)),
-            velocity: Some(((8.5 / 30.0, 0.0), 30)),
+            velocity: Some(((9.8 / 30.0, 0.0), 30)),
             accel: None,
             untimed: 0,
             err_time: err,
             err_step: err + 5.0,
         };
-        // the prediction 418.5 is nearer the newer origin's candidate (420)
+        // both predictions say 419.8: the newer origin's candidate (420)
         let drag = |err: f64, sent: u32| {
             let mut d = SelfDrag::new((300, 200), track(err), None);
             d.sent((305, 200), Some(sent));
@@ -739,6 +767,27 @@ mod tests {
             drag(0.0, 1063).frame(f, t, Some(1064)),
             Some((420.0, 280.0))
         );
+    }
+
+    /// Either prediction may be the right one (event times jittered or not):
+    /// a candidate one of them expects wins over one neither does.
+    #[test]
+    fn a_candidate_either_prediction_expects_wins() {
+        let t = t0();
+        // stepping 2 px; this event came late (9 ms, steps were 4 ms): by
+        // time 422.5 (nearer the newer origin's 424), by the last step 420
+        let mut tr = Track::default();
+        tr.update((414.0, 280.0), Some(1000));
+        tr.update((416.0, 280.0), Some(1004));
+        tr.update((418.0, 280.0), Some(1008));
+        let mut d = SelfDrag::new((300, 200), tr, None);
+        d.sent((304, 200), Some(1009));
+        let f = Frame {
+            surface: Some((120.0, 80.0)),
+            rel: None,
+            time: Some(1017),
+        };
+        assert_eq!(d.frame(f, t, Some(1018)), Some((420.0, 280.0)));
     }
 
     /// Jittered times (the compositor stamps a network pointer's arrival):
