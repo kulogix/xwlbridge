@@ -209,6 +209,22 @@ fn popup_position(parent: (i32, i32), offset: (i32, i32)) -> (i32, i32) {
 }
 
 /// Keep the pointer mapping stable while the compositor owns a client drag.
+/// The root position of a held self-drag driven by relative motion: where
+/// the pointer was when the client began moving its window (`start`) plus
+/// the pointer's motion since (`acc`), on the X screen.
+fn drag_root(start: (i16, i16), acc: (f64, f64), screen: (u16, u16)) -> (i16, i16) {
+    let x = (f64::from(start.0) + acc.0).floor() as i32;
+    let y = (f64::from(start.1) + acc.1).floor() as i32;
+    (
+        x.clamp(0, i32::from(screen.0) - 1) as i16,
+        y.clamp(0, i32::from(screen.1) - 1) as i16,
+    )
+}
+
+/// The relative pointer of a held button on a synced toplevel (its user
+/// data): it drives the X pointer while the client moves its own window.
+struct DragRel;
+
 fn mirror_position(moving: Option<Window>, w: Window, buttons: &[u8]) -> bool {
     moving != Some(w) || buttons.is_empty()
 }
@@ -807,6 +823,14 @@ struct State {
     /// The shown window the first of the held buttons went down on: X is
     /// authoritative for its geometry until the last comes up.
     held_on: Option<Window>,
+    /// While a button is held on a synced toplevel: a relative pointer, and
+    /// once the client moves the window itself, the drag it drives (the root
+    /// position at the start, the motion since). Surface-local motion is no
+    /// use then: the surface moves under the pointer when the desktop
+    /// carries out the client's move, and its new position reaches us over
+    /// D-Bus, possibly after the Wayland events relative to it.
+    drag_rel: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
+    drag: Option<((i16, i16), (f64, f64))>,
     /// A window handed to the desktop's interactive move: its X position is
     /// not mirrored into the pointer mapping while a button is held.
     moving: Option<Window>,
@@ -952,6 +976,8 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         states: Vec::new(),
         press_serial: 0,
         held_on: None,
+        drag_rel: None,
+        drag: None,
         moving: None,
         moving_pos: None,
         axis_source: None,
@@ -2295,6 +2321,12 @@ impl State {
         }
         self.moving = Some(w);
         self.moving_pos = None;
+        if self.synced_toplevel(w)
+            && self.drag_rel.is_some()
+            && let Some(start) = self.last_pos
+        {
+            self.drag = Some((start, (0.0, 0.0)));
+        }
         if self.synced_toplevel(w) {
             crate::log!(
                 "-showwindows: {w:#x} moves itself with the pointer: its desktop window follows"
@@ -2307,6 +2339,7 @@ impl State {
     }
 
     fn end_move(&mut self) {
+        self.drag = None;
         if let Some(w) = self.moving.take()
             && let Some((x, y)) = self.moving_pos.take()
             && let Some(s) = self.windows.get_mut(&w)
@@ -2715,9 +2748,18 @@ impl State {
             // the window the press went on, also when the release comes
             // over another one
             let w = if was_held {
+                self.drop_drag_pointer();
                 self.held_on.take()
             } else {
                 self.held_on = self.pointer_on;
+                if let Some(w) = self.pointer_on
+                    && self.synced_toplevel(w)
+                    && self.pointer_entered
+                    && let (Some(m), Some(p)) =
+                        (self.relative_manager.as_ref(), self.pointer.as_ref())
+                {
+                    self.drag_rel = Some(m.get_relative_pointer(p, &self.qh, DragRel));
+                }
                 self.pointer_on
             };
             self.sync_held(w, !was_held);
@@ -2728,6 +2770,28 @@ impl State {
             self.pointer_on
         );
         let _ = xtest::fake_input(&self.x, ty, b, 0, self.root, 0, 0, 0);
+    }
+
+    fn drop_drag_pointer(&mut self) {
+        self.drag = None;
+        if let Some(r) = self.drag_rel.take() {
+            r.destroy();
+        }
+    }
+
+    /// Relative motion during a held self-drag (`drag`): the X pointer goes
+    /// where the desktop's pointer is, whatever the surface did meanwhile.
+    fn drag_motion(&mut self, dx: f64, dy: f64) {
+        let Some((start, acc)) = self.drag.as_mut() else {
+            return;
+        };
+        *acc = (acc.0 + dx, acc.1 + dy);
+        let (x, y) = drag_root(*start, *acc, self.screen);
+        if self.last_pos == Some((x, y)) {
+            return;
+        }
+        self.last_pos = Some((x, y));
+        let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
     }
 
     fn wheel(&mut self, axis: wl_pointer::Axis, steps: i32) {
@@ -2796,6 +2860,7 @@ impl State {
             let _ = xtest::fake_input(&self.x, BUTTON_RELEASE, b, 0, self.root, 0, 0, 0);
         }
         self.end_move();
+        self.drop_drag_pointer();
         if was_held {
             let w = self.held_on.take();
             self.sync_held(w, false);
@@ -4457,7 +4522,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 surface_y,
                 ..
             } => {
-                if let Some(w) = state.pointer_on {
+                if let Some(w) = state.pointer_on
+                    && state.drag.is_none()
+                {
                     state.motion(w, surface_x, surface_y);
                 }
             }
@@ -4585,6 +4652,22 @@ impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for State {
             zwp_locked_pointer_v1::Event::Locked => state.lock_events.push(true),
             zwp_locked_pointer_v1::Event::Unlocked => state.lock_events.push(false),
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, DragRel> for State {
+    fn event(
+        state: &mut Self,
+        _: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        event: zwp_relative_pointer_v1::Event,
+        _: &DragRel,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        // accelerated, as the desktop's pointer moves
+        if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = event {
+            state.drag_motion(dx, dy);
         }
     }
 }
@@ -5099,6 +5182,21 @@ mod tests {
         // a submenu left of it
         assert_eq!(popup_anchor(-50, 30, 300, 200), ((0, 30), (-50, 0)));
         assert_eq!(popup_anchor(40, 50, 300, 200), ((40, 50), (0, 0)));
+    }
+
+    #[test]
+    fn a_held_self_drag_follows_the_relative_motion() {
+        let screen = (1280, 720);
+        assert_eq!(drag_root((100, 100), (0.0, 0.0), screen), (100, 100));
+        assert_eq!(drag_root((100, 100), (30.5, -10.25), screen), (130, 89));
+        // sub-pixel motion adds up instead of being lost per event
+        let mut acc = (0.0, 0.0);
+        for _ in 0..10 {
+            acc.0 += 0.4;
+        }
+        assert_eq!(drag_root((100, 100), acc, screen), (104, 100));
+        // on the X screen
+        assert_eq!(drag_root((10, 700), (-50.0, 90.0), screen), (0, 719));
     }
 
     #[test]
