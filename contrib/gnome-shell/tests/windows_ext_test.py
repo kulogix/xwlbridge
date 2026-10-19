@@ -326,8 +326,12 @@ def main():
     # -- clamp to the work area of the window's monitor
     reply = ext.call('MoveResize', '(siiiiu)', tag_a, wa0[0] - 400, wa0[1] + 50, 0, 0, 1)
     check('clamp: x pulled back to the work area', tuple(reply[0][:2]) == (wa0[0], wa0[1] + 50), (reply, wa0))
-    reply = ext.call('MoveResize', '(siiiiu)', tag_a, wa0[0] + wa0[2] - 100, wa0[1], 0, 0, 1)
+    # (A is 500 wide: mostly on monitor 0, then mostly past its right edge, on monitor 1)
+    reply = ext.call('MoveResize', '(siiiiu)', tag_a, wa0[0] + wa0[2] - 300, wa0[1], 0, 0, 1)
     check('clamp: right edge kept inside', reply[0][0] + reply[0][2] == wa0[0] + wa0[2], (reply, wa0))
+    wa1_ = mons[1][2]
+    reply = ext.call('MoveResize', '(siiiiu)', tag_a, wa0[0] + wa0[2] - 100, wa0[1], 0, 0, 1)
+    check('clamp: mostly on the next monitor -> inside that one', reply[0][0] == wa1_[0], (reply, wa1_))
     reply = ext.call('MoveResize', '(siiiiu)', tag_a, 0, 0, 9000, 9000, 1)
     check('clamp: size limited to the work area', tuple(reply[0]) == tuple(wa0), (reply, wa0))
     ok = pump(wl, 5, lambda: (c := last_changed(ext, tag_a)) is not None and tuple(c[1]) == tuple(wa0))
