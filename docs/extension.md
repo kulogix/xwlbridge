@@ -48,8 +48,9 @@ While the extension is there:
   not repaint) and one at a time. If the desktop keeps the window elsewhere (an edge, a size limit, a maximised
   window), the X window is put back there and gets the synthetic ConfigureNotify an X window manager sends
   (ICCCM 4.1.5). During a drag with a button held the X app is in charge; the window moves under the pointer and
-  the pointer keeps mapping from where the desktop has the window, so the app's drag loop sees the pointer where
-  it is.
+  the X pointer is kept where the desktop's pointer is (the bridge works out which of the window's positions each
+  pointer event is relative to: from the relative motion for a mouse or touchpad, from the pointer's track for a
+  tablet, a VNC or RDP viewer's pointer and touch), so the app's drag loop sees the pointer where it is.
 - **The desktop window moves the X window.** A user's move, tiling, maximising, a monitor change: the X window
   is configured to the same position (the size follows the desktop's configure, as before), with the synthetic
   ConfigureNotify.
@@ -177,4 +178,4 @@ side, and from the desktop by a probe extension): placement at map, self-moves a
 an animation's coalescing, a self-resize, stacking both ways, raise gating, keep-above, the extension going and
 coming back (as at the lock screen) and maximise (22 checks); `off` checks the 0.1.2 behaviour with
 `XWLBRIDGE_WINDOWS_EXTENSION=off` (5 checks). A held-button drag is not covered: the headless shell has no
-pointer.
+pointer; `src/xvfb/selfdrag.rs` checks the bridge's rule for it against a simulation of the compositor.

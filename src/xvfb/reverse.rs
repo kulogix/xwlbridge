@@ -80,6 +80,7 @@ use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use super::selfdrag;
 use super::winsync::{self, Due, Raise, Rect, Request};
 use super::{AnyError, Auth};
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
@@ -208,23 +209,51 @@ fn popup_position(parent: (i32, i32), offset: (i32, i32)) -> (i32, i32) {
     (parent.0 + offset.0, parent.1 + offset.1)
 }
 
-/// Keep the pointer mapping stable while the compositor owns a client drag.
-/// The root position of a held self-drag driven by relative motion: where
-/// the pointer was when the client began moving its window (`start`) plus
-/// the pointer's motion since (`acc`), on the X screen.
-fn drag_root(start: (i16, i16), acc: (f64, f64), screen: (u16, u16)) -> (i16, i16) {
-    let x = (f64::from(start.0) + acc.0).floor() as i32;
-    let y = (f64::from(start.1) + acc.1).floor() as i32;
-    (
-        x.clamp(0, i32::from(screen.0) - 1) as i16,
-        y.clamp(0, i32::from(screen.1) - 1) as i16,
-    )
-}
-
 /// The relative pointer of a held button on a synced toplevel (its user
-/// data): it drives the X pointer while the client moves its own window.
+/// data): its motion picks where the desktop's pointer is while the client
+/// moves its own window (`selfdrag`).
 struct DragRel;
 
+/// A frame callback of a held self-drag's window (its user data), committed
+/// after the reply to one of the drag's MoveResize requests: when it fires,
+/// the window has been laid out at that origin (`SelfDrag::laid_out`).
+struct DragMark {
+    drag: u64,
+    origin: usize,
+}
+
+/// A held self-drag of a synced toplevel (`begin_move`): the window, its
+/// number (for its frame callbacks), whether wl_pointer drives it (else a
+/// touch point or a tablet tool does) and where the desktop's pointer is.
+struct Drag {
+    window: Window,
+    id: u64,
+    wl_pointer: bool,
+    pointer: selfdrag::SelfDrag,
+}
+
+impl Drag {
+    /// wl_pointer's events on `on` are this drag's.
+    fn of_pointer(&self, on: Option<Window>) -> bool {
+        self.wl_pointer && on == Some(self.window)
+    }
+}
+
+/// CLOCK_MONOTONIC in milliseconds, wrapping: the clock of the compositor's
+/// event times (libinput's, and mutter's own for virtual devices).
+fn monotonic_ms() -> Option<u32> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the timespec it is given.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return None;
+    }
+    Some((ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000) as u32)
+}
+
+/// Keep the pointer mapping stable while the compositor owns a client drag.
 fn mirror_position(moving: Option<Window>, w: Window, buttons: &[u8]) -> bool {
     moving != Some(w) || buttons.is_empty()
 }
@@ -824,13 +853,22 @@ struct State {
     /// authoritative for its geometry until the last comes up.
     held_on: Option<Window>,
     /// While a button is held on a synced toplevel: a relative pointer, and
-    /// once the client moves the window itself, the drag it drives (the root
-    /// position at the start, the motion since). Surface-local motion is no
-    /// use then: the surface moves under the pointer when the desktop
-    /// carries out the client's move, and its new position reaches us over
-    /// D-Bus, possibly after the Wayland events relative to it.
+    /// once the client moves the window itself, the drag (`selfdrag`): the
+    /// surface moves under the pointer while the desktop carries out the
+    /// client's moves, so which of the window's positions an event is
+    /// relative to has to be worked out. The relative pointer's motion picks
+    /// it for relative devices.
     drag_rel: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
-    drag: Option<((i16, i16), (f64, f64))>,
+    drag: Option<Drag>,
+    /// The current wl_pointer frame's events during a drag.
+    drag_parts: selfdrag::Parts,
+    /// Drags so far (numbers them).
+    drags: u64,
+    /// The reverse pointer's fractional desktop positions, a drag's start.
+    track: selfdrag::Track,
+    /// The last surface-local position wl_pointer gave (mutter sends no
+    /// motion when it is unchanged).
+    pointer_s: Option<(f64, f64)>,
     /// A window handed to the desktop's interactive move: its X position is
     /// not mirrored into the pointer mapping while a button is held.
     moving: Option<Window>,
@@ -978,6 +1016,10 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         held_on: None,
         drag_rel: None,
         drag: None,
+        drag_parts: selfdrag::Parts::default(),
+        drags: 0,
+        track: selfdrag::Track::default(),
+        pointer_s: None,
         moving: None,
         moving_pos: None,
         axis_source: None,
@@ -2188,29 +2230,34 @@ impl State {
             .filter(|&p| p != 0)
     }
 
-    /// Root coordinates of surface-local `(sx, sy)` on `w`'s surface.
-    fn to_root(&self, w: Window, sx: f64, sy: f64) -> Option<(i16, i16)> {
-        let (x, y) = if w == self.root {
+    /// Root coordinates of surface-local `(sx, sy)` on `w`'s surface, before
+    /// they are whole pixels on the X screen.
+    fn to_desk(&self, w: Window, sx: f64, sy: f64) -> Option<selfdrag::Pos> {
+        if w == self.root {
             let scale = self.canvas.as_ref().map_or(1.0, |c| c.scale);
-            ((sx / scale).floor() as i32, (sy / scale).floor() as i32)
-        } else {
-            let s = self.windows.get(&w)?;
-            (
-                s.x as i32 + sx.floor() as i32,
-                s.y as i32 + sy.floor() as i32,
-            )
-        };
-        Some((
-            x.clamp(0, self.screen.0 as i32 - 1) as i16,
-            y.clamp(0, self.screen.1 as i32 - 1) as i16,
-        ))
+            return Some((sx / scale, sy / scale));
+        }
+        let s = self.windows.get(&w)?;
+        Some((f64::from(s.x) + sx, f64::from(s.y) + sy))
     }
 
-    /// Moves the reverse pointer to surface-local `(sx, sy)` of `w`.
-    fn motion(&mut self, w: Window, sx: f64, sy: f64) {
-        let Some((x, y)) = self.to_root(w, sx, sy) else {
+    /// Moves the reverse pointer to surface-local `(sx, sy)` of `w` (an event
+    /// of compositor time `time`, ms).
+    fn motion(&mut self, w: Window, sx: f64, sy: f64, time: Option<u32>) {
+        if self.drag.as_ref().is_some_and(|d| d.window == w) {
+            // the held self-drag's (a tablet tool's or a touch point's:
+            // wl_pointer's frames go through `drag_parts`)
+            self.drag_frame(selfdrag::Frame {
+                surface: Some((sx, sy)),
+                rel: None,
+                time,
+            });
+            return;
+        }
+        let Some(pos) = self.to_desk(w, sx, sy) else {
             return;
         };
+        let (x, y) = selfdrag::root_position(pos, self.screen);
         // mouse-look: a client that hid the cursor and moved the pointer
         // itself (a warp to the centre, typically) wants relative motion
         if self.lock.is_none()
@@ -2243,6 +2290,26 @@ impl State {
                 }
             }
         }
+        self.track.update(pos, time);
+        self.last_pos = Some((x, y));
+        let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
+    }
+
+    /// A pointer frame during a held self-drag: the X pointer goes where the
+    /// desktop's pointer is (`selfdrag::SelfDrag`).
+    fn drag_frame(&mut self, f: selfdrag::Frame) {
+        let now_ms = monotonic_ms();
+        let Some(d) = self.drag.as_mut() else {
+            return;
+        };
+        let Some(pos) = d.pointer.frame(f, Instant::now(), now_ms) else {
+            return;
+        };
+        self.track.update(pos, f.time);
+        let (x, y) = selfdrag::root_position(pos, self.screen);
+        if self.last_pos == Some((x, y)) {
+            return;
+        }
         self.last_pos = Some((x, y));
         let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
     }
@@ -2262,15 +2329,16 @@ impl State {
         }
     }
 
-    /// A tablet tool frame: the motion goes first, then the tip and buttons.
-    fn tool_frame(&mut self) {
+    /// A tablet tool frame (of compositor time `time`, ms): the motion goes
+    /// first, then the tip and buttons.
+    fn tool_frame(&mut self, time: u32) {
         let Some((_, w)) = self.tool_on.clone() else {
             self.tool_motion = None;
             self.tool_presses.clear();
             return;
         };
         if let Some((x, y)) = self.tool_motion.take() {
-            self.motion(w, x, y);
+            self.motion(w, x, y, Some(time));
         }
         let presses = std::mem::take(&mut self.tool_presses);
         for (code, pressed) in tool_frame_presses(&mut self.tool_buttons, &presses) {
@@ -2312,9 +2380,9 @@ impl State {
     ///
     /// With the window sync the desktop window follows the X window (one
     /// MoveResize per frame), still with no grab: the surface moves under the
-    /// pointer, and the mapping stays steady by mapping from where the
-    /// desktop has the window (`winsync::pointer_origin`) rather than from
-    /// the held X position.
+    /// pointer, and the X pointer goes where the desktop's pointer is, worked
+    /// out from the window's positions on the desktop meanwhile
+    /// (`selfdrag::SelfDrag`, `drag_frame`).
     fn begin_move(&mut self, w: Window) {
         if self.moving.is_some() {
             return;
@@ -2322,10 +2390,24 @@ impl State {
         self.moving = Some(w);
         self.moving_pos = None;
         if self.synced_toplevel(w)
-            && self.drag_rel.is_some()
-            && let Some(start) = self.last_pos
+            && self.track.pos().is_some()
+            && let Some(s) = self.windows.get(&w)
         {
-            self.drag = Some((start, (0.0, 0.0)));
+            // so far the pointer mapped from where the desktop has it
+            let origin = (i32::from(s.x), i32::from(s.y));
+            self.drags += 1;
+            // wl_pointer's press, or a touch point's or tablet tool's (they
+            // drive the pointer without it)
+            let wl_pointer =
+                self.pointer_entered && self.touch_emulating.is_none() && self.tool_on.is_none();
+            let surface = self.pointer_s.filter(|_| wl_pointer);
+            self.drag = Some(Drag {
+                window: w,
+                id: self.drags,
+                wl_pointer,
+                pointer: selfdrag::SelfDrag::new(origin, self.track, surface),
+            });
+            self.drag_parts = selfdrag::Parts::default();
         }
         if self.synced_toplevel(w) {
             crate::log!(
@@ -2340,6 +2422,7 @@ impl State {
 
     fn end_move(&mut self) {
         self.drag = None;
+        self.drag_parts = selfdrag::Parts::default();
         if let Some(w) = self.moving.take()
             && let Some((x, y)) = self.moving_pos.take()
             && let Some(s) = self.windows.get_mut(&w)
@@ -2774,24 +2857,10 @@ impl State {
 
     fn drop_drag_pointer(&mut self) {
         self.drag = None;
+        self.drag_parts = selfdrag::Parts::default();
         if let Some(r) = self.drag_rel.take() {
             r.destroy();
         }
-    }
-
-    /// Relative motion during a held self-drag (`drag`): the X pointer goes
-    /// where the desktop's pointer is, whatever the surface did meanwhile.
-    fn drag_motion(&mut self, dx: f64, dy: f64) {
-        let Some((start, acc)) = self.drag.as_mut() else {
-            return;
-        };
-        *acc = (acc.0 + dx, acc.1 + dy);
-        let (x, y) = drag_root(*start, *acc, self.screen);
-        if self.last_pos == Some((x, y)) {
-            return;
-        }
-        self.last_pos = Some((x, y));
-        let _ = xtest::fake_input(&self.x, MOTION_NOTIFY, 0, 0, self.root, x, y, 0);
     }
 
     fn wheel(&mut self, axis: wl_pointer::Axis, steps: i32) {
@@ -3124,6 +3193,29 @@ impl State {
         }
     }
 
+    /// The reply to a MoveResize of a held self-drag's window: the drag
+    /// takes its origin, and a frame callback committed now tells when the
+    /// window has been laid out there (`DragMark`).
+    fn drag_applied(&mut self, w: Window, requested: Rect, applied: Rect) {
+        let Some(d) = self.drag.as_mut().filter(|d| d.window == w) else {
+            return;
+        };
+        let Some(origin) = d.pointer.applied(
+            (requested.x, requested.y),
+            (applied.x, applied.y),
+            Instant::now(),
+        ) else {
+            return;
+        };
+        let mark = DragMark { drag: d.id, origin };
+        if let Some(s) = self.windows.get(&w)
+            && s.configured
+        {
+            s.surface.frame(&self.qh, mark);
+            s.surface.commit();
+        }
+    }
+
     /// A MoveResize of `w` waits: it goes now, with the frame callback of the
     /// commit in flight, or at its pacing time (`winsync::send_due`).
     fn sync_kick(&mut self, w: Window) {
@@ -3171,6 +3263,9 @@ impl State {
                 flags: mr.flags,
             });
             sync.sent_at.insert(w, Instant::now());
+            if let Some(d) = self.drag.as_mut().filter(|d| d.window == w) {
+                d.pointer.sent((mr.rect.x, mr.rect.y), monotonic_ms());
+            }
             crate::vlog!(
                 "-showwindows: {w:#x} moved itself: the desktop follows to {}x{}+{}+{} (flags {:#x})",
                 mr.rect.w,
@@ -3238,6 +3333,9 @@ impl State {
                 {
                     sync.geo.failed(xid, answered);
                     kick = sync.on && sync.geo.pending(xid);
+                    if let Some(d) = self.drag.as_mut().filter(|d| d.window == xid) {
+                        d.pointer.failed(answered);
+                    }
                 }
                 crate::vlog!("-showwindows: window sync: {method} of {xid:#x} failed: {error}");
                 if kick {
@@ -3257,6 +3355,7 @@ impl State {
                 let back = sync.geo.applied(xid, requested, applied, Some(wire));
                 let pending = sync.geo.pending(xid);
                 self.set_origin(xid);
+                self.drag_applied(xid, requested, applied);
                 if let Some(r) = back {
                     crate::vlog!(
                         "-showwindows: the desktop has {xid:#x} at {}x{}+{}+{} (an edge, a size limit, or a later change)",
@@ -4447,6 +4546,23 @@ impl Dispatch<wl_callback::WlCallback, Window> for State {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, DragMark> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        data: &DragMark,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event
+            && let Some(d) = state.drag.as_mut().filter(|d| d.id == data.drag)
+        {
+            d.pointer.laid_out(data.origin);
+        }
+    }
+}
+
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
@@ -4456,6 +4572,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         _: &WlConnection,
         _: &QueueHandle<Self>,
     ) {
+        // during a held self-drag the motion of a frame goes at its end
+        // (with its relative motion), before anything else the frame has
+        if state
+            .drag
+            .as_ref()
+            .is_some_and(|d| d.of_pointer(state.pointer_on))
+            && !matches!(
+                event,
+                wl_pointer::Event::Motion { .. } | wl_pointer::Event::Frame
+            )
+            && let Some(f) = state.drag_parts.other()
+        {
+            state.drag_frame(f);
+        }
         match event {
             wl_pointer::Event::Enter {
                 serial,
@@ -4469,6 +4599,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 if w == 0 {
                     return; // the cursor surface
                 }
+                state.pointer_s = Some((surface_x, surface_y));
                 state.pointer_on = Some(w);
                 state.pointer_entered = true;
                 state.enter_serial = serial;
@@ -4504,7 +4635,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         }
                     }
                 }
-                state.motion(w, surface_x, surface_y);
+                state.motion(w, surface_x, surface_y, None);
                 state.apply_cursor();
             }
             wl_pointer::Event::Leave { .. } => {
@@ -4518,14 +4649,19 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 );
             }
             wl_pointer::Event::Motion {
+                time,
                 surface_x,
                 surface_y,
-                ..
             } => {
-                if let Some(w) = state.pointer_on
-                    && state.drag.is_none()
+                state.pointer_s = Some((surface_x, surface_y));
+                if state
+                    .drag
+                    .as_ref()
+                    .is_some_and(|d| d.of_pointer(state.pointer_on))
                 {
-                    state.motion(w, surface_x, surface_y);
+                    state.drag_parts.motion((surface_x, surface_y), time);
+                } else if let Some(w) = state.pointer_on {
+                    state.motion(w, surface_x, surface_y, Some(time));
                 }
             }
             wl_pointer::Event::Button {
@@ -4570,6 +4706,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             wl_pointer::Event::Frame => {
                 state.axis_source = None;
                 state.axis_discrete_seen = false;
+                if state
+                    .drag
+                    .as_ref()
+                    .is_some_and(|d| d.of_pointer(state.pointer_on))
+                    && let Some(f) = state.drag_parts.end()
+                {
+                    state.drag_frame(f);
+                }
             }
             wl_pointer::Event::AxisDiscrete {
                 axis: WEnum::Value(axis),
@@ -4665,9 +4809,22 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, DragRel> for State 
         _: &WlConnection,
         _: &QueueHandle<Self>,
     ) {
-        // accelerated, as the desktop's pointer moves
-        if let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = event {
-            state.drag_motion(dx, dy);
+        // accelerated, as the desktop's pointer moves; part of the
+        // wl_pointer frame it comes in
+        if let zwp_relative_pointer_v1::Event::RelativeMotion {
+            utime_hi,
+            utime_lo,
+            dx,
+            dy,
+            ..
+        } = event
+            && state
+                .drag
+                .as_ref()
+                .is_some_and(|d| d.of_pointer(state.pointer_on))
+        {
+            let us = (u64::from(utime_hi) << 32) | u64::from(utime_lo);
+            state.drag_parts.relative((dx, dy), (us / 1000) as u32);
         }
     }
 }
@@ -4739,15 +4896,15 @@ impl Dispatch<wl_touch::WlTouch, ()> for State {
                 {
                     state.pointer_on = Some(w);
                     state.input_time = time;
-                    state.motion(w, x, y);
+                    state.motion(w, x, y, Some(time));
                     state.button(0x110, true);
                 }
             }
-            wl_touch::Event::Motion { id, x, y, .. } => {
+            wl_touch::Event::Motion { time, id, x, y } => {
                 if touch_motion_drives(state.touch_emulating, id)
                     && let Some((_, w)) = state.touch_emulating
                 {
-                    state.motion(w, x, y);
+                    state.motion(w, x, y, Some(time));
                 }
             }
             wl_touch::Event::Up { id, .. } => {
@@ -4892,7 +5049,7 @@ impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for State {
                 if state.tool_presses.iter().any(|(_, pressed)| *pressed) {
                     state.input_time = time;
                 }
-                state.tool_frame();
+                state.tool_frame(time);
             }
             zwp_tablet_tool_v2::Event::Removed => {
                 state.tool_gone();
@@ -5184,19 +5341,15 @@ mod tests {
         assert_eq!(popup_anchor(40, 50, 300, 200), ((40, 50), (0, 0)));
     }
 
+    /// A held self-drag compares the compositor's event times with when its
+    /// moves were sent: both on CLOCK_MONOTONIC, in milliseconds.
     #[test]
-    fn a_held_self_drag_follows_the_relative_motion() {
-        let screen = (1280, 720);
-        assert_eq!(drag_root((100, 100), (0.0, 0.0), screen), (100, 100));
-        assert_eq!(drag_root((100, 100), (30.5, -10.25), screen), (130, 89));
-        // sub-pixel motion adds up instead of being lost per event
-        let mut acc = (0.0, 0.0);
-        for _ in 0..10 {
-            acc.0 += 0.4;
-        }
-        assert_eq!(drag_root((100, 100), acc, screen), (104, 100));
-        // on the X screen
-        assert_eq!(drag_root((10, 700), (-50.0, 90.0), screen), (0, 719));
+    fn the_drags_clock_is_the_compositors() {
+        let a = monotonic_ms().expect("CLOCK_MONOTONIC");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = monotonic_ms().unwrap();
+        let d = b.wrapping_sub(a);
+        assert!((5..1000).contains(&d), "{a} -> {b}");
     }
 
     #[test]

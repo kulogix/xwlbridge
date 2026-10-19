@@ -87,6 +87,8 @@ mod cursor;
 mod motion;
 mod record;
 mod reverse;
+// -showwindows' pointer during a held self-drag of a synced window (reverse.rs)
+mod selfdrag;
 mod wlhost;
 // -showwindows' window sync with the desktop (reverse.rs)
 mod winsync;
