@@ -6,7 +6,14 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 
 ### Added
 
-- GNOME Shell extension `xwlbridge-windows@xwlbridge` (GNOME 49 and 50): a D-Bus service through which the bridge can move, resize, place, activate and restack the windows `-showwindows` shows, and learn about desktop-side moves, maximising, stacking and focus (see [docs/extension.md](docs/extension.md)). It serves only windows tagged `xwlbridge:` and only to the process that owns them. `install.sh` installs and enables it (one log-out/log-in on Wayland), `--no-extension` or the setting `extension=off` opt out, `uninstall.sh` removes it and `xwlbridge-ctl doctor` reports it. The bridge does not use it yet.
+- GNOME Shell extension `xwlbridge-windows@xwlbridge` (GNOME 49 and 50): a D-Bus service through which the bridge can move, resize, place, activate and restack the windows `-showwindows` shows, and learn about desktop-side moves, maximising, stacking and focus (see [docs/extension.md](docs/extension.md)). It serves only windows tagged `xwlbridge:` and only to the process that owns them. `install.sh` installs and enables it (one log-out/log-in on Wayland), `--no-extension` or the setting `extension=off` opt out, `uninstall.sh` removes it and `xwlbridge-ctl doctor` reports it.
+- `-showwindows` with the extension running (window sync, see [docs/extension.md](docs/extension.md)): an X window and its desktop window keep one position.
+  - A window that moves or resizes itself (its own drag handle - a Qt dock, a palette -, a slide-in panel, an animation) moves on the desktop too, at most once per frame and kept inside the monitor's work area; at an edge the X window is put back where the desktop keeps it, with the ConfigureNotify an X window manager sends. A held-button self-drag needs no desktop grab: the window moves under the pointer and the drag stays with the app.
+  - The desktop's moves (dragging, tiling, maximising, another monitor) reach the X window, so apps know where they are and popups open in the right place.
+  - A window that asks for a position (USPosition, or a PPosition other than 0,0: session restore, saved layouts) opens there instead of where GNOME would put it.
+  - The X stacking order follows the desktop's. An app's raise or `_NET_ACTIVE_WINDOW` request activates its window only after recent input in that app; otherwise the window demands attention (at most once per 3 s), so no app can steal the focus or start a raise loop.
+  - `_NET_WM_STATE_ABOVE` (and `_NET_WM_STATE_STAYS_ON_TOP`) keeps a window above others, together with its transient dialogs; WM_HINTS urgency and `_NET_WM_STATE_DEMANDS_ATTENTION` raise GNOME's "is ready" notice.
+  - Without the extension (not installed, turned off with `extension=off`, the lock screen, an older version, a build without `gnome`) the bridge behaves as 0.1.2; it picks the extension up again when it comes back.
 
 ### Fixed
 

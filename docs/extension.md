@@ -35,6 +35,43 @@ xwlbridge-windows@xwlbridge` and logs in again.
 If remote unlock or this extension stopped working after a gnome-shell crash, GNOME may have turned off all
 user extensions: `gsettings get org.gnome.shell disable-user-extensions` shows `true`; set it back to `false`.
 
+## What the bridge does with it
+
+With `-showwindows` (per-window mode; not `-showscreen`) the bridge tags each shown toplevel
+`xwlbridge:<display>:<window id>`, finds the extension on the session bus and checks its version and features.
+While the extension is there:
+
+- **The X window moves the desktop window.** When an app moves or resizes its own top-level window (its own
+  drag loop, an animation, a slide-in panel), the bridge sends `MoveResize` with the clamp to the monitor's work
+  area, coalesced to one per frame (the window's frame callback; at most one per 16 ms for a window that does
+  not repaint) and one at a time. If the desktop keeps the window elsewhere (an edge, a size limit, a maximised
+  window), the X window is put back there and gets the synthetic ConfigureNotify an X window manager sends
+  (ICCCM 4.1.5). During a drag with a button held the X app is in charge; the window moves under the pointer and
+  the pointer keeps mapping from where the desktop has the window, so the app's drag loop sees the pointer where
+  it is.
+- **The desktop window moves the X window.** A user's move, tiling, maximising, a monitor change: the X window
+  is configured to the same position (the size follows the desktop's configure, as before), with the synthetic
+  ConfigureNotify.
+- **Placement at map.** A window with USPosition, or PPosition other than 0,0, in WM_NORMAL_HINTS opens at that
+  position (`SetInitialPosition`); other windows are placed by GNOME and the X window follows.
+- **Stacking.** GNOME is the only stacking authority: X's stacking order of the shown windows follows
+  `Restacked`. An app's raise (XRaiseWindow, seen as its window going over windows the desktop has above it) or
+  `_NET_ACTIVE_WINDOW` request activates the window when the app had input (a key or button press on one of its
+  windows) in the last 2 s; otherwise the window demands attention instead, at most once per 3 s per window, and
+  X goes back to the desktop's order. `_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_STAYS_ON_TOP` keep a window above
+  (`SetAbove`), and its transient children with it, so a dialog never opens behind its own above parent.
+- **Attention.** WM_HINTS UrgencyHint or `_NET_WM_STATE_DEMANDS_ATTENTION` -> `SetDemandsAttention`.
+- **Resync.** At start, on `MonitorsChanged` and whenever the extension comes back (the lock screen turns it
+  off and on again, as does a shell restart), the bridge reads `GetState` and puts every X window where the
+  desktop has it.
+
+While it is not there, `-showwindows` behaves exactly as 0.1.2 did (and `_NET_SUPPORTED` announces only what
+0.1.2 carries out). The log says which: `window sync with the desktop: extension version 1, ...` or
+`no window sync with the desktop (...): windows keep the 0.1.2 behaviour`.
+
+Not in this phase: HiDPI scaling (X pixels are logical pixels), workspaces, sticky, minimise through the
+extension, keep-below (mutter has no call for it), and the desktop's own "Always on top" reaching X.
+
 ## Security model
 
 - **Only the bridge's own windows.** A window is reachable only when its Wayland client tagged it with
@@ -107,5 +144,6 @@ runs a release bundle's `install.sh`, then GNOME Shell ("the next login": the ex
 `xwlbridge-ctl doctor` and `uninstall.sh` (the running shell stops the extension; files and settings entries
 are gone). `packaging/tests/test_ctl.sh` covers the installer's choices with fakes (opt-out, upgrades, a user
 who turned the extension off, GNOME older than 49, settings that cannot be written).
-Not covered: a real user drag (the `user` flag), several workspaces, the bridge itself (it does not use the
-extension yet in this version).
+Not covered here: a real user drag (the `user` flag), several workspaces. The bridge's side is unit-tested in
+`src/xvfb/winsync.rs` (the sync's decisions) and was run against this extension in a headless gnome-shell (see
+the release notes).

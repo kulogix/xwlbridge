@@ -88,9 +88,7 @@ mod motion;
 mod record;
 mod reverse;
 mod wlhost;
-// 0.2's window sync with the desktop: building blocks; reverse.rs uses only
-// the tag so far
-#[allow(dead_code)]
+// -showwindows' window sync with the desktop (reverse.rs)
 mod winsync;
 pub mod xrelay;
 mod xserver;

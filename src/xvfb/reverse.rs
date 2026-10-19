@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Instant;
 
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
@@ -72,13 +73,14 @@ use x11rb::protocol::render::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, MapState,
-    PropMode, StackMode, Window, WindowClass,
+    AtomEnum, CONFIGURE_NOTIFY_EVENT, ClientMessageEvent, ConfigureNotifyEvent, ConfigureWindowAux,
+    ConnectionExt as _, EventMask, MapState, PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use super::winsync::{self, Due, Raise, Rect, Request};
 use super::{AnyError, Auth};
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
 
@@ -498,6 +500,10 @@ struct Atoms {
     net_wm_moveresize: u32,
     net_supported: u32,
     net_supporting_wm_check: u32,
+    net_active_window: u32,
+    net_wm_state_above: u32,
+    net_wm_state_stays_on_top: u32,
+    net_wm_state_demands_attention: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -526,11 +532,20 @@ enum Role {
 }
 
 struct Shown {
-    /// Outer position and size (border included), as the X server has it.
+    /// Where pointer positions on the surface map from (root = this +
+    /// surface-local): the outer position as the X server has it, held
+    /// during a held-button self-drag (0.1.2); with the window sync, where
+    /// the desktop has the window (`winsync::pointer_origin`).
     x: i16,
     y: i16,
+    /// Outer size (border included), as the X server has it.
     width: u16,
     height: u16,
+    /// The outer position as the X server has it (always).
+    at: (i16, i16),
+    border: u16,
+    /// The sibling below it in its last ConfigureNotify (None: none seen).
+    above: Option<Window>,
     depth: u8,
     damage: u32,
     pixmap: Option<u32>,
@@ -608,6 +623,101 @@ struct CursorImage {
     hot: (i32, i32),
     serial: u32,
     blank: bool,
+}
+
+/// `-showwindows`' window sync with the desktop, through the bundled GNOME
+/// Shell extension `xwlbridge-windows@xwlbridge` (`winsync`; design:
+/// research/release/design_desktop_integration.md section 2,
+/// design_x_capability_gaps.md sections A and B). Everything it changes
+/// happens only while the extension is `available`; otherwise (no
+/// extension, an old one, the lock screen, a build without `gnome`, or
+/// `XWLBRIDGE_WINDOWS_EXTENSION=off`) the bridge behaves as 0.1.2.
+struct Sync {
+    client: winsync::bus::Client,
+    available: bool,
+    geo: winsync::Geometry,
+    gate: winsync::RaiseGate,
+    layers: winsync::Layers,
+    attention: winsync::Attention,
+    /// The desktop's stacking order of our shown windows, bottom to top.
+    order: Vec<Window>,
+    /// Our restacks of X windows not seen back yet: (window -> the request's
+    /// sequence number). The window's first restack at or after it is ours.
+    stack_echo: HashMap<Window, u64>,
+    /// When each window's last MoveResize went, and the windows whose next
+    /// one waits for its pacing time (`winsync::send_due`).
+    sent_at: HashMap<Window, Instant>,
+    due: HashMap<Window, Instant>,
+}
+
+/// `XWLBRIDGE_WINDOWS_EXTENSION=off` (what `xwlbridge-ctl run` exports for
+/// the setting `extension=off`) turns the window sync off.
+fn sync_turned_off(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
+}
+
+/// Starts the window sync's D-Bus client, unless it is turned off or cannot
+/// work here (each case is logged; the bridge then keeps the 0.1.2
+/// behaviour).
+fn start_sync(display: u32, tags: bool) -> Option<Sync> {
+    let keep = "windows keep the 0.1.2 behaviour";
+    if sync_turned_off(std::env::var("XWLBRIDGE_WINDOWS_EXTENSION").ok().as_deref()) {
+        crate::log!("-showwindows: window sync with the desktop is off (extension=off): {keep}");
+        return None;
+    }
+    if !tags {
+        crate::log!(
+            "-showwindows: no window sync with the desktop (the compositor has no xdg_toplevel_tag_manager_v1): {keep}"
+        );
+        return None;
+    }
+    match winsync::bus::Client::spawn(display) {
+        Ok(client) => Some(Sync {
+            client,
+            available: false,
+            geo: winsync::Geometry::new(),
+            gate: winsync::RaiseGate::new(),
+            layers: winsync::Layers::new(),
+            attention: winsync::Attention::new(),
+            order: Vec::new(),
+            stack_echo: HashMap::new(),
+            sent_at: HashMap::new(),
+            due: HashMap::new(),
+        }),
+        Err(e) => {
+            crate::log!("-showwindows: no window sync with the desktop ({e}): {keep}");
+            None
+        }
+    }
+}
+
+/// The synthetic ConfigureNotify an X window manager sends after moving or
+/// resizing a client's window (ICCCM 4.1.5): `w`'s geometry in root
+/// coordinates (`x`, `y` the outer corner; `width`, `height` inside the
+/// border).
+fn synthetic_configure(
+    w: Window,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    border: u16,
+) -> ConfigureNotifyEvent {
+    let i16_of = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    let u16_of = |v: u32| v.min(u32::from(u16::MAX)) as u16;
+    ConfigureNotifyEvent {
+        response_type: CONFIGURE_NOTIFY_EVENT,
+        sequence: 0,
+        event: w,
+        window: w,
+        above_sibling: x11rb::NONE,
+        x: i16_of(x),
+        y: i16_of(y),
+        width: u16_of(width),
+        height: u16_of(height),
+        border_width: border,
+        override_redirect: false,
+    }
 }
 
 struct State {
@@ -713,6 +823,13 @@ struct State {
     tool_presses: Vec<(u32, bool)>,
     /// Buttons the XTest device has none for, already logged once.
     dropped_button_logged: bool,
+    /// The window sync with the desktop (per-window mode only).
+    sync: Option<Sync>,
+    /// This thread announced itself as the engine's window manager (EWMH).
+    wm_announced: bool,
+    /// The compositor time of the latest key or button press on a shown
+    /// window (an activation's timestamp).
+    input_time: u32,
     qh: QueueHandle<State>,
 }
 
@@ -760,6 +877,10 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_wm_moveresize: atom(b"_NET_WM_MOVERESIZE")?,
         net_supported: atom(b"_NET_SUPPORTED")?,
         net_supporting_wm_check: atom(b"_NET_SUPPORTING_WM_CHECK")?,
+        net_active_window: atom(b"_NET_ACTIVE_WINDOW")?,
+        net_wm_state_above: atom(b"_NET_WM_STATE_ABOVE")?,
+        net_wm_state_stays_on_top: atom(b"_NET_WM_STATE_STAYS_ON_TOP")?,
+        net_wm_state_demands_attention: atom(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -829,6 +950,9 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         tool_motion: None,
         tool_presses: Vec::new(),
         dropped_button_logged: false,
+        sync: None,
+        wm_announced: false,
+        input_time: 0,
         qh: qh.clone(),
     };
     queue.roundtrip(&mut state)?;
@@ -870,10 +994,13 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
 
     if screen_mode {
         state.show_screen(&qh, display)?;
-    } else if let Err(e) = state.announce_wm() {
-        crate::warning!(
-            "-showwindows: can't announce the window-manager requests it carries out: {e}"
-        );
+    } else {
+        if let Err(e) = state.announce_wm() {
+            crate::warning!(
+                "-showwindows: can't announce the window-manager requests it carries out: {e}"
+            );
+        }
+        state.sync = start_sync(display, state.tags.is_some());
     }
     // what is already up
     let tree = state.x.query_tree(root)?.reply()?;
@@ -882,16 +1009,25 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
     }
 
     let xfd = state.x.stream().as_raw_fd();
+    let sync_fd = state.sync.as_ref().map(|s| s.client.fd());
     loop {
-        while let Some(ev) = state.x.poll_for_event()? {
-            state.x_event(ev, &qh);
+        // (with their full sequence numbers: the window sync tells our own
+        // configures' notifications from the clients' by them)
+        while let Some((ev, seq)) = state.x.poll_for_event_with_sequence()? {
+            state.x_event(ev, seq, &qh);
         }
         queue.dispatch_pending(&mut state)?;
         state.after_dispatch(&qh);
         // anything the dispatch did may have queued X events (replies we
         // waited for read them in)
-        while let Some(ev) = state.x.poll_for_event()? {
-            state.x_event(ev, &qh);
+        while let Some((ev, seq)) = state.x.poll_for_event_with_sequence()? {
+            state.x_event(ev, seq, &qh);
+        }
+        if state.sync.is_some() {
+            state.sync_poll();
+            while let Some((ev, seq)) = state.x.poll_for_event_with_sequence()? {
+                state.x_event(ev, seq, &qh);
+            }
         }
         state.x.flush()?;
         match wl.flush() {
@@ -915,8 +1051,15 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: sync_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 1000) };
+        let nfds = if sync_fd.is_some() { 3 } else { 2 };
+        let timeout = state.sync_timeout_ms().unwrap_or(1000);
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout) };
         if n > 0 && pfds[1].revents != 0 {
             if let Err(e) = guard.read()
                 && !matches!(&e, wayland_client::backend::WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
@@ -938,15 +1081,36 @@ impl State {
         w & !self.resource_mask
     }
 
-    /// WM_HINTS: (takes input, starts iconic).
-    fn hints(&self, w: Window) -> (bool, bool) {
-        let v: Vec<u32> = self
-            .x
+    /// WM_HINTS as 32-bit values (empty: none).
+    fn wm_hints(&self, w: Window) -> Vec<u32> {
+        self.x
             .get_property(false, w, AtomEnum::WM_HINTS, AtomEnum::WM_HINTS, 0, 9)
             .ok()
             .and_then(|c| c.reply().ok())
             .and_then(|r| r.value32().map(|v| v.collect()))
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    /// WM_NORMAL_HINTS as 32-bit values (empty: none).
+    fn normal_hints(&self, w: Window) -> Vec<u32> {
+        self.x
+            .get_property(
+                false,
+                w,
+                AtomEnum::WM_NORMAL_HINTS,
+                AtomEnum::WM_SIZE_HINTS,
+                0,
+                18,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default()
+    }
+
+    /// WM_HINTS: (takes input, starts iconic).
+    fn hints(&self, w: Window) -> (bool, bool) {
+        let v = self.wm_hints(w);
         let flags = v.first().copied().unwrap_or(0);
         let input = if flags & 1 != 0 {
             v.get(1).copied().unwrap_or(1) != 0
@@ -1003,8 +1167,9 @@ impl State {
     }
 
     /// The X-side part of showing `w`: its geometry, a DAMAGE object, and
-    /// property changes. `(x, y, width, height, depth, damage)`.
-    fn watch(&mut self, w: Window) -> Result<(i16, i16, u16, u16, u8, u32), AnyError> {
+    /// property changes. `(x, y, width, height, depth, damage, border)`.
+    #[allow(clippy::type_complexity)]
+    fn watch(&mut self, w: Window) -> Result<(i16, i16, u16, u16, u8, u32, u16), AnyError> {
         let g = self.x.get_geometry(w)?.reply()?;
         let (width, height) = (g.width + 2 * g.border_width, g.height + 2 * g.border_width);
         if frame_bytes(width, height).is_none() {
@@ -1017,7 +1182,7 @@ impl State {
             &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
                 .event_mask(EventMask::PROPERTY_CHANGE),
         )?;
-        Ok((g.x, g.y, width, height, g.depth, dmg))
+        Ok((g.x, g.y, width, height, g.depth, dmg, g.border_width))
     }
 
     /// Query rather than use a ConfigureNotify that may still be queued (for
@@ -1061,7 +1226,7 @@ impl State {
     }
 
     fn show(&mut self, w: Window, qh: &QueueHandle<State>) -> Result<(), AnyError> {
-        let (mut x, mut y, width, height, depth, dmg) = self.watch(w)?;
+        let (mut x, mut y, width, height, depth, dmg, border) = self.watch(w)?;
         // Pointer input can only reach the part of the window on the screen:
         // without a window manager its position is the client's guess and
         // nobody sees it, so move it fully on the screen where it fits.
@@ -1110,6 +1275,23 @@ impl State {
             }
             _ => None,
         };
+        // with the window sync, a position the client asked for (USPosition,
+        // PPosition) is where the desktop opens it: asked before the first
+        // commit, applied at the window's first show (no jump)
+        if self.synced()
+            && let Some((ix, iy)) =
+                winsync::initial_position(&self.normal_hints(w), i32::from(x), i32::from(y))
+            && let Some(sync) = self.sync.as_ref()
+        {
+            sync.client.send(Request::SetInitialPosition {
+                xid: w,
+                x: ix,
+                y: iy,
+            });
+            crate::log!(
+                "-showwindows: {w:#x} asks to open at {ix},{iy}: the desktop places it there"
+            );
+        }
         surface.commit();
         crate::log!(
             "-showwindows: showing {w:#x} {:?} (class {:?}) {}x{}+{}+{} depth {}{}{}",
@@ -1135,6 +1317,9 @@ impl State {
                 y,
                 width,
                 height,
+                at: (x, y),
+                border,
+                above: None,
                 depth,
                 damage: dmg,
                 pixmap: None,
@@ -1155,6 +1340,16 @@ impl State {
                 fullscreen: false,
             },
         );
+        if let Some(sync) = self.sync.as_mut() {
+            let r = Rect::new(
+                i32::from(x),
+                i32::from(y),
+                i32::from(width),
+                i32::from(height),
+            );
+            sync.geo.track(w, r);
+        }
+        self.sync_flags(w);
         Ok(())
     }
 
@@ -1216,7 +1411,7 @@ impl State {
             );
             return Ok(());
         };
-        let (x, y, width, height, depth, dmg) = self.watch(w)?;
+        let (x, y, width, height, depth, dmg, border) = self.watch(w)?;
         let origin = self.shown_origin(parent)?;
         let p = self.windows.get(&parent).expect("found above");
         let (dx, dy) = (i32::from(x) - origin.0, i32::from(y) - origin.1);
@@ -1266,6 +1461,9 @@ impl State {
                 y,
                 width,
                 height,
+                at: (x, y),
+                border,
+                above: None,
                 depth,
                 damage: dmg,
                 pixmap: None,
@@ -1341,6 +1539,7 @@ impl State {
             return;
         };
         self.popups.retain(|p| *p != w);
+        self.sync_forget(w);
         crate::log!("-showwindows: {w:#x} went away after {} frame(s)", s.frames);
         // the window may be gone already: errors are expected and harmless
         let _ = damage::destroy(&self.x, s.damage);
@@ -1379,7 +1578,7 @@ impl State {
         }
     }
 
-    fn x_event(&mut self, ev: Event, qh: &QueueHandle<State>) {
+    fn x_event(&mut self, ev: Event, seq: u64, qh: &QueueHandle<State>) {
         match ev {
             // A client's first top-level window: give it the reverse master
             // now, before it is mapped, as some clients pick their XInput
@@ -1454,8 +1653,18 @@ impl State {
                 } else {
                     (e.x, e.y)
                 };
+                let synced = self.synced_toplevel(e.window);
+                let desk = self.sync.as_ref().and_then(|sync| sync.geo.desk(e.window));
+                let mut restacked = false;
                 if let Some(s) = self.windows.get_mut(&e.window) {
-                    if mirror_position(self.moving, e.window, &self.buttons_down) {
+                    s.at = pos;
+                    s.border = e.border_width;
+                    restacked = s.above.is_some_and(|a| a != e.above_sibling);
+                    s.above = Some(e.above_sibling);
+                    if synced {
+                        // the pointer maps from where the desktop has it
+                        (s.x, s.y) = winsync::pointer_origin(desk, pos);
+                    } else if mirror_position(self.moving, e.window, &self.buttons_down) {
                         (s.x, s.y) = pos;
                     } else {
                         self.moving_pos = Some(pos);
@@ -1478,6 +1687,7 @@ impl State {
                         self.paint(e.window);
                     }
                 }
+                self.sync_x_configured(&e, seq, restacked);
             }
             Event::CirculateNotify(_) => {
                 if let Some(c) = self.canvas.as_mut() {
@@ -1527,6 +1737,14 @@ impl State {
                 }
                 self.paint(e.window);
             }
+            // with the window sync: keep-above and attention hints
+            Event::PropertyNotify(e)
+                if (e.atom == self.atoms.net_wm_state
+                    || e.atom == u32::from(AtomEnum::WM_HINTS))
+                    && self.synced_toplevel(e.window) =>
+            {
+                self.sync_flags(e.window)
+            }
             // a client asking the window manager (EWMH / ICCCM requests to the root)
             Event::ClientMessage(e) if e.format == 32 => self.client_message(e),
             Event::XfixesCursorNotify(_) => self.update_cursor(),
@@ -1554,6 +1772,8 @@ impl State {
                 }
             }
             self.paint(w);
+            // the window's frame: its coalesced MoveResize, if one waits
+            self.sync_send(w);
         }
         for (w, i) in std::mem::take(&mut self.released) {
             if let Some(b) = self.windows.get_mut(&w).and_then(|s| s.buffers.as_mut()) {
@@ -1575,12 +1795,29 @@ impl State {
                 && (width as u16, height as u16) != (s.width, s.height)
                 && frame_bytes(width as u16, height as u16).is_some()
             {
-                let _ = self.x.configure_window(
-                    w,
-                    &ConfigureWindowAux::new()
-                        .width(width as u32)
-                        .height(height as u32),
-                );
+                let synced = self.synced_toplevel(w);
+                // with the sync the size is the window geometry's, border
+                // included (0.1.2 sets it as the size inside the border)
+                let (iw, ih) = if synced {
+                    winsync::inner_size(width, height, s.border)
+                } else {
+                    (width as u32, height as u32)
+                };
+                let at = s.at;
+                let cookie = self
+                    .x
+                    .configure_window(w, &ConfigureWindowAux::new().width(iw).height(ih));
+                // the desktop's resize: its notification is not the client's
+                // (unless a move of the client's waits to go out: then the
+                // notification carries that move to the desktop, size and all)
+                if synced
+                    && let Ok(c) = cookie
+                    && let Some(sync) = self.sync.as_mut()
+                    && !sync.geo.pending(w)
+                {
+                    let r = Rect::new(i32::from(at.0), i32::from(at.1), width, height);
+                    sync.geo.x_sent(w, r, c.sequence_number());
+                }
             }
         }
         for (w, maximized, fullscreen) in std::mem::take(&mut self.states) {
@@ -1616,6 +1853,7 @@ impl State {
         // focus) keeps the focus where `focus_x` put or left it.
         if x_focus_clears(std::mem::take(&mut self.keyboard_left), self.keyboard_on) {
             self.unfocus_x();
+            self.set_active(None);
         }
         for locked in std::mem::take(&mut self.lock_events) {
             if let Some(l) = self.lock.as_mut() {
@@ -1998,13 +2236,27 @@ impl State {
     /// the drag's start point — over its own dock area — and re-docks: the
     /// dock's window went away 5 frames into the drag, the rest of the drag
     /// ran on the main window and dragged it off-screen.
+    ///
+    /// With the window sync the desktop window follows the X window (one
+    /// MoveResize per frame), still with no grab: the surface moves under the
+    /// pointer, and the mapping stays steady by mapping from where the
+    /// desktop has the window (`winsync::pointer_origin`) rather than from
+    /// the held X position.
     fn begin_move(&mut self, w: Window) {
         if self.moving.is_some() {
             return;
         }
         self.moving = Some(w);
         self.moving_pos = None;
-        crate::log!("-showwindows: {w:#x} moves itself with the pointer: its own move carries it");
+        if self.synced_toplevel(w) {
+            crate::log!(
+                "-showwindows: {w:#x} moves itself with the pointer: its desktop window follows"
+            );
+        } else {
+            crate::log!(
+                "-showwindows: {w:#x} moves itself with the pointer: its own move carries it"
+            );
+        }
     }
 
     fn end_move(&mut self) {
@@ -2072,17 +2324,7 @@ impl State {
             a.utf8_string,
             b"xwlbridge",
         )?;
-        let supported = [
-            a.net_supported,
-            a.net_supporting_wm_check,
-            a.net_wm_name,
-            a.net_wm_moveresize,
-            a.net_wm_state,
-            a.net_wm_state_max_vert,
-            a.net_wm_state_max_horz,
-            a.net_wm_state_fullscreen,
-            a.net_wm_state_modal,
-        ];
+        let supported = self.supported(false);
         self.x.change_property32(
             PropMode::REPLACE,
             self.root,
@@ -2097,10 +2339,36 @@ impl State {
             AtomEnum::WINDOW,
             &[check],
         )?;
+        self.wm_announced = true;
         crate::log!(
             "-showwindows: announced _NET_WM_MOVERESIZE and _NET_WM_STATE (maximise, fullscreen) to clients"
         );
         Ok(())
+    }
+
+    /// `_NET_SUPPORTED`: what 0.1.2 carries out, plus (`sync`: while the
+    /// window sync is available) activation, keep-above and attention.
+    fn supported(&self, sync: bool) -> Vec<u32> {
+        let a = &self.atoms;
+        let mut v = vec![
+            a.net_supported,
+            a.net_supporting_wm_check,
+            a.net_wm_name,
+            a.net_wm_moveresize,
+            a.net_wm_state,
+            a.net_wm_state_max_vert,
+            a.net_wm_state_max_horz,
+            a.net_wm_state_fullscreen,
+            a.net_wm_state_modal,
+        ];
+        if sync {
+            v.extend([
+                a.net_active_window,
+                a.net_wm_state_above,
+                a.net_wm_state_demands_attention,
+            ]);
+        }
+        v
     }
 
     fn net_wm_state(&self, w: Window) -> Vec<u32> {
@@ -2133,20 +2401,7 @@ impl State {
 
     /// WM_NORMAL_HINTS' minimum and maximum size on the shown toplevel.
     fn apply_size_hints(&self, w: Window, t: &xdg_toplevel::XdgToplevel) {
-        let v: Vec<u32> = self
-            .x
-            .get_property(
-                false,
-                w,
-                AtomEnum::WM_NORMAL_HINTS,
-                AtomEnum::WM_SIZE_HINTS,
-                0,
-                18,
-            )
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .and_then(|r| r.value32().map(|v| v.collect()))
-            .unwrap_or_default();
+        let v = self.normal_hints(w);
         let ((minw, minh), (maxw, maxh)) = size_limits(&v);
         t.set_min_size(minw, minh);
         t.set_max_size(maxw, maxh);
@@ -2183,6 +2438,9 @@ impl State {
     /// fullscreen, hidden) and ICCCM's `WM_CHANGE_STATE` (iconify), for a
     /// shown toplevel.
     fn client_message(&mut self, e: ClientMessageEvent) {
+        if self.synced_toplevel(e.window) && self.sync_client_message(&e) {
+            return;
+        }
         let d = e.data.as_data32();
         let a = &self.atoms;
         let Some(s) = self.windows.get(&e.window) else {
@@ -2393,16 +2651,21 @@ impl State {
         } else {
             BUTTON_RELEASE
         };
+        let was_held = !self.buttons_down.is_empty();
         if pressed {
             self.buttons_down.push(b);
             if self.screen_mode() {
                 self.click_to_focus();
             }
+            self.input_on(self.pointer_on);
         } else {
             self.buttons_down.retain(|&x| x != b);
             if self.buttons_down.is_empty() {
                 self.end_move();
             }
+        }
+        if was_held == self.buttons_down.is_empty() {
+            self.sync_held(self.pointer_on, !was_held);
         }
         crate::vlog!(
             "-showwindows: button {b} {} on {:?}",
@@ -2473,10 +2736,14 @@ impl State {
     }
 
     fn release_buttons(&mut self) {
+        let was_held = !self.buttons_down.is_empty();
         for b in std::mem::take(&mut self.buttons_down) {
             let _ = xtest::fake_input(&self.x, BUTTON_RELEASE, b, 0, self.root, 0, 0, 0);
         }
         self.end_move();
+        if was_held {
+            self.sync_held(self.pointer_on, false);
+        }
     }
 
     /// Gives `w` the reverse keyboard the way an ICCCM window manager gives
@@ -2604,6 +2871,622 @@ impl State {
         }
     }
 
+    // ---- the window sync with the desktop (winsync) ----
+
+    /// The window sync is on: the extension is there and compatible.
+    fn synced(&self) -> bool {
+        self.sync.as_ref().is_some_and(|s| s.available)
+    }
+
+    /// The window sync is on and `w` is a shown toplevel.
+    fn synced_toplevel(&self, w: Window) -> bool {
+        self.synced()
+            && self
+                .windows
+                .get(&w)
+                .is_some_and(|s| matches!(s.role, Role::Toplevel(_)))
+    }
+
+    /// The user pressed a key or button on shown window `w`: its client's
+    /// raise requests are honoured for a while (`winsync::RaiseGate`).
+    fn input_on(&mut self, w: Option<Window>) {
+        let client = w.and_then(|w| self.windows.get(&w)).map(|s| s.client);
+        if let (Some(sync), Some(c)) = (self.sync.as_mut(), client) {
+            sync.gate.input(c, Instant::now());
+        }
+    }
+
+    /// The first button went down on, or the last came up from, shown
+    /// window `w`: X is authoritative for its geometry while one is held.
+    fn sync_held(&mut self, w: Option<Window>, held: bool) {
+        let (Some(w), Some(sync)) = (w, self.sync.as_mut()) else {
+            return;
+        };
+        if let Some(r) = sync.geo.button(w, held) {
+            self.apply_x(w, r);
+        }
+    }
+
+    /// A ConfigureNotify (of sequence number `seq`) of shown window `e.window`
+    /// was handled: with the sync, a toplevel the client moved or resized
+    /// itself goes to the desktop (coalesced, at most one MoveResize per
+    /// frame), and a restack of its own goes through the raise gating.
+    fn sync_x_configured(&mut self, e: &ConfigureNotifyEvent, seq: u64, restacked: bool) {
+        let toplevel = self
+            .windows
+            .get(&e.window)
+            .is_some_and(|s| matches!(s.role, Role::Toplevel(_)));
+        let synced = self.synced();
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        if !toplevel {
+            return;
+        }
+        let rect = winsync::outer_rect(e.x, e.y, e.width, e.height, e.border_width);
+        if !synced {
+            // kept current for the next resync; nothing else changes
+            sync.geo.track(e.window, rect);
+            return;
+        }
+        // our own restack (or one from before it, which it overrides)
+        let ours = restacked
+            && match sync.stack_echo.get(&e.window) {
+                Some(&sent) => {
+                    if seq >= sent {
+                        sync.stack_echo.remove(&e.window);
+                    }
+                    true
+                }
+                None => false,
+            };
+        let back = sync.geo.x_configured(e.window, rect, seq, Instant::now());
+        let pending = sync.geo.pending(e.window);
+        if let Some(r) = back {
+            self.apply_x(e.window, r);
+        } else if pending {
+            self.sync_kick(e.window);
+        }
+        if restacked && !ours {
+            self.x_restacked(e.window);
+        }
+    }
+
+    /// Configures X window `w` to `r` for the desktop (its move, a clamp, a
+    /// resync), sends the synthetic ConfigureNotify an X window manager
+    /// sends (ICCCM 4.1.5), and tells the sync it was ours.
+    fn apply_x(&mut self, w: Window, r: Rect) {
+        if !self.synced_toplevel(w) {
+            return;
+        }
+        let Some(s) = self.windows.get(&w) else {
+            return;
+        };
+        let border = s.border;
+        let size = (i32::from(s.width), i32::from(s.height));
+        let (iw, ih) = winsync::inner_size(r.w, r.h, border);
+        let (iw, ih) = (iw.min(u32::from(MAX_SIDE)), ih.min(u32::from(MAX_SIDE)));
+        let mut aux = ConfigureWindowAux::new().x(r.x).y(r.y);
+        if (r.w, r.h) != size {
+            aux = aux.width(iw).height(ih);
+        }
+        let seq = match self.x.configure_window(w, &aux) {
+            Ok(c) => c.sequence_number(),
+            Err(e) => {
+                crate::vlog!("-showwindows: can't configure {w:#x}: {e}");
+                return;
+            }
+        };
+        let ev = synthetic_configure(w, r.x, r.y, iw, ih, border);
+        let _ = self.x.send_event(false, w, EventMask::STRUCTURE_NOTIFY, ev);
+        if let Some(sync) = self.sync.as_mut() {
+            sync.geo.x_sent(w, r, seq);
+        }
+        crate::vlog!(
+            "-showwindows: {w:#x} follows the desktop: {}x{}+{}+{}",
+            r.w,
+            r.h,
+            r.x,
+            r.y
+        );
+    }
+
+    /// The pointer on `w` maps from where the desktop has it
+    /// (`winsync::pointer_origin`).
+    fn set_origin(&mut self, w: Window) {
+        let desk = self.sync.as_ref().and_then(|s| s.geo.desk(w));
+        if let Some(s) = self.windows.get_mut(&w)
+            && matches!(s.role, Role::Toplevel(_))
+        {
+            (s.x, s.y) = winsync::pointer_origin(desk, s.at);
+        }
+    }
+
+    /// A MoveResize of `w` waits: it goes now, with the frame callback of the
+    /// commit in flight, or at its pacing time (`winsync::send_due`).
+    fn sync_kick(&mut self, w: Window) {
+        let frame_wait = self
+            .windows
+            .get(&w)
+            .filter(|s| self.throttle && s.frame_pending)
+            .and_then(|s| s.committed_at);
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        match winsync::send_due(frame_wait, sync.sent_at.get(&w).copied(), Instant::now()) {
+            Due::Now => self.sync_send(w),
+            Due::Frame => {}
+            Due::At(t) => {
+                sync.due.entry(w).or_insert(t);
+            }
+        }
+    }
+
+    /// `w`'s frame callback (or pacing time) came: its coalesced
+    /// MoveResize, if one waits.
+    fn sync_send(&mut self, w: Window) {
+        let synced = self.synced();
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        sync.due.remove(&w);
+        // nothing goes before the desktop has shown the window: its first
+        // report places it (where it was asked to open, or where GNOME puts
+        // it) and X follows that
+        if !synced || sync.geo.desk(w).is_none() {
+            return;
+        }
+        if let Some(mr) = sync.geo.frame(w) {
+            sync.client.send(Request::MoveResize {
+                xid: w,
+                rect: mr.rect,
+                flags: mr.flags,
+            });
+            sync.sent_at.insert(w, Instant::now());
+            crate::vlog!(
+                "-showwindows: {w:#x} moved itself: the desktop follows to {}x{}+{}+{} (flags {:#x})",
+                mr.rect.w,
+                mr.rect.h,
+                mr.rect.x,
+                mr.rect.y,
+                mr.flags
+            );
+        }
+    }
+
+    /// How long the main loop may sleep before a paced MoveResize is due.
+    fn sync_timeout_ms(&self) -> Option<i32> {
+        let now = Instant::now();
+        let next = self.sync.as_ref()?.due.values().min()?;
+        let us = next.saturating_duration_since(now).as_micros();
+        Some(us.div_ceil(1000).min(1000) as i32)
+    }
+
+    /// What the extension sent, and the paced MoveResize requests now due.
+    fn sync_poll(&mut self) {
+        let Some(sync) = self.sync.as_ref() else {
+            return;
+        };
+        let events: Vec<winsync::Event> = sync.client.events().collect();
+        for e in events {
+            self.sync_event(e);
+        }
+        let now = Instant::now();
+        let due: Vec<Window> = self.sync.as_ref().map_or_else(Vec::new, |s| {
+            s.due
+                .iter()
+                .filter(|(_, t)| **t <= now)
+                .map(|(w, _)| *w)
+                .collect()
+        });
+        for w in due {
+            self.sync_send(w);
+        }
+    }
+
+    fn sync_event(&mut self, e: winsync::Event) {
+        use winsync::Event as E;
+        match e {
+            E::Available { .. } => self.sync_available(true),
+            E::Unavailable => self.sync_available(false),
+            E::Failed { xid, method, error } => {
+                if method == "MoveResize"
+                    && let Some(sync) = self.sync.as_mut()
+                {
+                    sync.geo.failed(xid);
+                }
+                crate::vlog!("-showwindows: window sync: {method} of {xid:#x} failed: {error}");
+            }
+            _ if !self.synced() => {}
+            E::Applied { xid, applied, .. } => {
+                let Some(sync) = self.sync.as_mut() else {
+                    return;
+                };
+                let back = sync.geo.applied(xid, applied);
+                let pending = sync.geo.pending(xid);
+                self.set_origin(xid);
+                if let Some(r) = back {
+                    crate::vlog!(
+                        "-showwindows: the desktop kept {xid:#x} at {}x{}+{}+{} (an edge or a size limit)",
+                        r.w,
+                        r.h,
+                        r.x,
+                        r.y
+                    );
+                    self.apply_x(xid, r);
+                }
+                if pending {
+                    self.sync_kick(xid);
+                }
+            }
+            E::Changed {
+                xid,
+                rect,
+                flags,
+                serial,
+                ..
+            } => {
+                let Some(sync) = self.sync.as_mut() else {
+                    return;
+                };
+                let Some(x) = sync.geo.x_rect(xid) else {
+                    return;
+                };
+                let rect = winsync::desktop_position(rect, x);
+                let back = sync.geo.changed(xid, rect, flags, serial, Instant::now());
+                self.set_origin(xid);
+                if let Some(r) = back {
+                    self.apply_x(xid, r);
+                }
+            }
+            E::State(list) => {
+                for ws in list.iter().filter(|w| w.shown) {
+                    let Some(sync) = self.sync.as_mut() else {
+                        return;
+                    };
+                    let Some(x) = sync.geo.x_rect(ws.xid) else {
+                        continue;
+                    };
+                    let rect = winsync::desktop_position(ws.rect, x);
+                    let back = sync.geo.resync(ws.xid, rect, ws.flags, ws.serial);
+                    self.set_origin(ws.xid);
+                    if let Some(r) = back {
+                        self.apply_x(ws.xid, r);
+                    }
+                }
+                if let Some(sync) = self.sync.as_mut() {
+                    sync.order = list.iter().filter(|w| w.shown).map(|w| w.xid).collect();
+                }
+                self.restack_x();
+            }
+            E::Restacked(order) => {
+                if let Some(sync) = self.sync.as_mut() {
+                    sync.order = order;
+                }
+                self.restack_x();
+            }
+            E::MonitorsChanged => {
+                if let Some(sync) = self.sync.as_ref() {
+                    sync.client.send(Request::GetState);
+                }
+            }
+            E::WindowGone(xid) => {
+                crate::vlog!("-showwindows: the desktop's window of {xid:#x} is gone")
+            }
+            E::Monitors(_) => {}
+        }
+    }
+
+    /// The extension came (`on`; at start, or back after the lock screen or
+    /// a shell restart) or went: a full resync, or back to 0.1.2.
+    fn sync_available(&mut self, on: bool) {
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        sync.available = on;
+        if on {
+            sync.layers.retell();
+            for w in sync.attention.retell() {
+                sync.client
+                    .send(Request::SetDemandsAttention { xid: w, on: true });
+            }
+            sync.client.send(Request::GetState);
+            self.announce_sync(true);
+            let tops: Vec<Window> = self
+                .windows
+                .iter()
+                .filter(|(_, s)| matches!(s.role, Role::Toplevel(_)))
+                .map(|(w, _)| *w)
+                .collect();
+            for w in tops {
+                self.sync_flags(w);
+            }
+            crate::vlog!("-showwindows: window sync on: windows and the desktop follow each other");
+        } else {
+            sync.geo.reset();
+            sync.due.clear();
+            sync.sent_at.clear();
+            sync.stack_echo.clear();
+            sync.order.clear();
+            self.announce_sync(false);
+            // back to 0.1.2: the pointer maps from X's positions
+            for s in self.windows.values_mut() {
+                if matches!(s.role, Role::Toplevel(_)) {
+                    (s.x, s.y) = s.at;
+                }
+            }
+            crate::vlog!("-showwindows: window sync off: the 0.1.2 behaviour until it is back");
+        }
+    }
+
+    /// `_NET_SUPPORTED` with or without what the sync carries out, and
+    /// `_NET_ACTIVE_WINDOW` (kept while it is announced).
+    fn announce_sync(&self, on: bool) {
+        if !self.wm_announced {
+            return;
+        }
+        let v = self.supported(on);
+        let _ = self.x.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_supported,
+            AtomEnum::ATOM,
+            &v,
+        );
+        if on {
+            self.set_active(self.keyboard_on);
+        } else {
+            let _ = self
+                .x
+                .delete_property(self.root, self.atoms.net_active_window);
+        }
+    }
+
+    /// With the sync, the root's `_NET_ACTIVE_WINDOW` is the shown toplevel
+    /// with the desktop's keyboard (None while it is elsewhere), as EWMH asks
+    /// of a window manager that announces it.
+    fn set_active(&self, w: Option<Window>) {
+        if !self.wm_announced || !self.synced() {
+            return;
+        }
+        let w = w
+            .filter(|w| self.synced_toplevel(*w))
+            .unwrap_or(x11rb::NONE);
+        let _ = self.x.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_active_window,
+            AtomEnum::WINDOW,
+            &[w],
+        );
+    }
+
+    /// Restacks the shown toplevels in X to the desktop's order (the desktop
+    /// is the only stacking authority), the popups staying on top.
+    fn restack_x(&mut self) {
+        if !self.synced() {
+            return;
+        }
+        let Some(sync) = self.sync.as_ref() else {
+            return;
+        };
+        let desk: Vec<Window> = sync
+            .order
+            .iter()
+            .copied()
+            .filter(|w| {
+                self.windows
+                    .get(w)
+                    .is_some_and(|s| matches!(s.role, Role::Toplevel(_)))
+            })
+            .collect();
+        if desk.len() < 2 {
+            return;
+        }
+        let Ok(Ok(tree)) = self.x.query_tree(self.root).map(|c| c.reply()) else {
+            return;
+        };
+        let ops = winsync::restack_plan(&desk, &tree.children);
+        if ops.is_empty() {
+            return;
+        }
+        for (w, to) in &ops {
+            let aux = match *to {
+                winsync::Stack::Above(s) => ConfigureWindowAux::new()
+                    .sibling(s)
+                    .stack_mode(StackMode::ABOVE),
+                winsync::Stack::Below(s) => ConfigureWindowAux::new()
+                    .sibling(s)
+                    .stack_mode(StackMode::BELOW),
+            };
+            if let Ok(c) = self.x.configure_window(*w, &aux) {
+                let seq = c.sequence_number();
+                if let Some(sync) = self.sync.as_mut() {
+                    sync.stack_echo.insert(*w, seq);
+                }
+            }
+        }
+        for p in self.popups.clone() {
+            let _ = self
+                .x
+                .configure_window(p, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        }
+        crate::vlog!(
+            "-showwindows: X's stacking follows the desktop's ({} restack(s))",
+            ops.len()
+        );
+    }
+
+    /// The client restacked its own toplevel `w`. A raise over what the
+    /// desktop has above it is a request for the raise gating; unless it
+    /// activates the window (the desktop's Restacked then brings X along), X
+    /// goes back to the desktop's order.
+    fn x_restacked(&mut self, w: Window) {
+        let Some(sync) = self.sync.as_ref() else {
+            return;
+        };
+        let Ok(Ok(tree)) = self.x.query_tree(self.root).map(|c| c.reply()) else {
+            return;
+        };
+        if winsync::raised_over_desktop(w, &sync.order, &tree.children)
+            && self.raise_request(w, "raises itself") == Raise::Activate
+        {
+            return;
+        }
+        self.restack_x();
+    }
+
+    /// An X client asks to raise or activate `w` (design_x_capability_gaps.md
+    /// A2): honoured after recent input in that client, else the window
+    /// demands attention (at most once per interval).
+    fn raise_request(&mut self, w: Window, why: &str) -> Raise {
+        let Some(client) = self.windows.get(&w).map(|s| s.client) else {
+            return Raise::Ignore;
+        };
+        let timestamp = self.input_time;
+        let Some(sync) = self.sync.as_mut() else {
+            return Raise::Ignore;
+        };
+        let r = sync.gate.request(w, client, Instant::now());
+        match r {
+            Raise::Activate => {
+                sync.client.send(Request::Activate { xid: w, timestamp });
+                crate::vlog!("-showwindows: {w:#x} {why} after input in its app: activated");
+            }
+            Raise::DemandAttention => {
+                sync.client
+                    .send(Request::SetDemandsAttention { xid: w, on: true });
+                crate::vlog!(
+                    "-showwindows: {w:#x} {why} with no recent input in its app: it demands attention instead"
+                );
+            }
+            Raise::Ignore => crate::vlog!("-showwindows: {w:#x} {why} again: ignored"),
+        }
+        r
+    }
+
+    /// Keep-above and attention of shown toplevel `w` from its hints, told
+    /// to the desktop on change (a transient child of an above window is
+    /// above too: `winsync::Layers`).
+    fn sync_flags(&mut self, w: Window) {
+        if !self.synced_toplevel(w) {
+            return;
+        }
+        let parent = self.windows.get(&w).and_then(|s| s.parent);
+        let state = self.net_wm_state(w);
+        let a = &self.atoms;
+        let above =
+            state.contains(&a.net_wm_state_above) || state.contains(&a.net_wm_state_stays_on_top);
+        let attention =
+            state.contains(&a.net_wm_state_demands_attention) || winsync::urgent(&self.wm_hints(w));
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        sync.layers.set(w, above, parent);
+        for (x, on) in sync.layers.changes() {
+            sync.client.send(Request::SetAbove { xid: x, on });
+            crate::log!(
+                "-showwindows: {x:#x} {}",
+                if on {
+                    "stays above other windows"
+                } else {
+                    "no longer stays above other windows"
+                }
+            );
+        }
+        if let Some(on) = sync.attention.hint(w, attention) {
+            sync.client
+                .send(Request::SetDemandsAttention { xid: w, on });
+            crate::log!(
+                "-showwindows: {w:#x} {}",
+                if on {
+                    "demands attention"
+                } else {
+                    "no longer demands attention"
+                }
+            );
+        }
+    }
+
+    /// With the sync: `_NET_ACTIVE_WINDOW` (through the raise gating), and
+    /// `_NET_WM_STATE`'s keep-above and attention (the bridge, as the window
+    /// manager, keeps the property). True: nothing more to do with it.
+    fn sync_client_message(&mut self, e: &ClientMessageEvent) -> bool {
+        let a = &self.atoms;
+        let (active, state_atom) = (a.net_active_window, a.net_wm_state);
+        let ours = [
+            a.net_wm_state_above,
+            a.net_wm_state_stays_on_top,
+            a.net_wm_state_demands_attention,
+        ];
+        if e.type_ == active {
+            self.raise_request(e.window, "asks to be activated");
+            return true;
+        }
+        if e.type_ != state_atom {
+            return false;
+        }
+        let d = e.data.as_data32();
+        let props = [d[1], d[2]];
+        if !props.iter().any(|p| ours.contains(p)) {
+            return false;
+        }
+        let mut v = self.net_wm_state(e.window);
+        let mut changed = false;
+        for atom in ours {
+            if !props.contains(&atom) {
+                continue;
+            }
+            let cur = v.contains(&atom);
+            let want = match d[0] {
+                0 => false,
+                1 => true,
+                _ => !cur,
+            };
+            if want != cur {
+                if want {
+                    v.push(atom);
+                } else {
+                    v.retain(|x| *x != atom);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.x.change_property32(
+                PropMode::REPLACE,
+                e.window,
+                state_atom,
+                AtomEnum::ATOM,
+                &v,
+            );
+        }
+        self.sync_flags(e.window);
+        false // its maximise and fullscreen parts, if any, as before
+    }
+
+    /// Shown window `w` went away.
+    fn sync_forget(&mut self, w: Window) {
+        let synced = self.synced();
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        sync.geo.forget(w);
+        sync.gate.forget_window(w);
+        sync.attention.forget(w);
+        sync.layers.forget(w);
+        sync.stack_echo.remove(&w);
+        sync.sent_at.remove(&w);
+        sync.due.remove(&w);
+        sync.order.retain(|x| *x != w);
+        if synced {
+            // its transient children no longer inherit its keep-above
+            for (x, on) in sync.layers.changes() {
+                sync.client.send(Request::SetAbove { xid: x, on });
+            }
+        }
+    }
+
     // ---- -showscreen ----
 
     fn show_screen(&mut self, qh: &QueueHandle<State>, display: u32) -> Result<(), AnyError> {
@@ -2682,6 +3565,9 @@ impl State {
                 y: 0,
                 width: sw,
                 height: sh,
+                at: (0, 0),
+                border: 0,
+                above: None,
                 depth: 24,
                 damage: 0,
                 pixmap: None,
@@ -2759,7 +3645,7 @@ impl State {
             .as_ref()
             .and_then(|c| c.formats.get(&visual).copied())
             .ok_or("no picture format")?;
-        let (mut x, mut y, mut width, mut height, depth, damage) = self.watch(w)?;
+        let (mut x, mut y, mut width, mut height, depth, damage, _) = self.watch(w)?;
         if !override_redirect {
             // no window manager keeps a managed window on the screen: one
             // bigger than the screen (OBS asks for 1280x960 on 1280x720) or
@@ -3326,11 +4212,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 if w != state.root {
                     // the reverse pointer must hit this window, not one
                     // stacked above it on the X screen; the popups shown stay
-                    // above it
-                    let _ = state.x.configure_window(
-                        w,
-                        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-                    );
+                    // above it. With the window sync X's geometry and stacking
+                    // are the desktop's, so the window under the desktop's
+                    // pointer is the one on top there too: no raise (the
+                    // desktop alone orders the stack)
+                    if !state.synced_toplevel(w) {
+                        let _ = state.x.configure_window(
+                            w,
+                            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                        );
+                    }
                     for p in state.popups.clone() {
                         if p != w {
                             let _ = state.x.configure_window(
@@ -3364,13 +4255,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             }
             wl_pointer::Event::Button {
                 serial,
+                time,
                 button,
                 state: WEnum::Value(bs),
-                ..
             } if state.pointer_on.is_some() => {
                 let pressed = bs == wl_pointer::ButtonState::Pressed;
                 if pressed {
                     state.press_serial = serial;
+                    state.input_time = time;
                 }
                 state.button(button, pressed);
             }
@@ -3431,6 +4323,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     return;
                 };
                 on_keyboard_enter(&mut state.keyboard_left, &mut state.keyboard_on, w);
+                state.set_active(Some(w));
                 if w == state.root {
                     if let Some(f) = state.canvas.as_ref().and_then(|c| c.focus) {
                         state.focus_x(f);
@@ -3441,15 +4334,29 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.release_keys();
+                let had = state.keyboard_on;
                 on_keyboard_leave(&mut state.keyboard_left, &mut state.keyboard_on);
+                // its client's earlier input no longer vouches for a raise
+                if let Some(w) = had {
+                    let client = state.windows.get(&w).map(|s| s.client);
+                    if let (Some(sync), Some(c)) = (state.sync.as_mut(), client) {
+                        sync.gate.left(c);
+                    }
+                }
                 state.dismiss_menus();
             }
             wl_keyboard::Event::Key {
                 key,
+                time,
                 state: WEnum::Value(ks),
                 ..
             } if state.keyboard_on.is_some() => {
-                state.key(key, ks == wl_keyboard::KeyState::Pressed);
+                let pressed = ks == wl_keyboard::KeyState::Pressed;
+                if pressed {
+                    state.input_time = time;
+                    state.input_on(state.keyboard_on);
+                }
+                state.key(key, pressed);
             }
             _ => {}
         }
@@ -3708,6 +4615,37 @@ impl Dispatch<wl_surface::WlSurface, Window> for State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_window_sync_is_turned_off_by_extension_off_only() {
+        assert!(super::sync_turned_off(Some("off")));
+        assert!(super::sync_turned_off(Some(" OFF\n")));
+        assert!(!super::sync_turned_off(Some("auto")));
+        assert!(!super::sync_turned_off(Some("")));
+        assert!(!super::sync_turned_off(None));
+    }
+
+    #[test]
+    fn the_synthetic_configure_notify_is_icccm_4_1_5s() {
+        let e = super::synthetic_configure(0x400001, -20, 30, 640, 480, 1);
+        assert_eq!(
+            e.response_type,
+            x11rb::protocol::xproto::CONFIGURE_NOTIFY_EVENT
+        );
+        assert_eq!((e.event, e.window), (0x400001, 0x400001));
+        assert_eq!(e.above_sibling, x11rb::NONE);
+        assert_eq!(
+            (e.x, e.y, e.width, e.height, e.border_width),
+            (-20, 30, 640, 480, 1)
+        );
+        assert!(!e.override_redirect);
+        // root coordinates beyond X's 16 bits are clamped, not wrapped
+        let e = super::synthetic_configure(1, 70000, -70000, 1 << 20, 5, 0);
+        assert_eq!((e.x, e.y, e.width), (i16::MAX, i16::MIN, u16::MAX));
+        // the wire form: a ConfigureNotify (22) the server forwards as is
+        let bytes: [u8; 32] = e.into();
+        assert_eq!(bytes[0], 22);
+    }
+
     #[test]
     fn size_hints_become_limits() {
         use super::size_limits;

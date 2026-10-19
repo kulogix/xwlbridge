@@ -37,6 +37,7 @@ pub fn tag(display: u32, xid: Xid) -> String {
 /// A tag's display and window, for tags exactly as `tag` writes them (no
 /// leading zeros, lowercase, a non-zero window), so a tag has one spelling
 /// and nothing else parses.
+#[cfg_attr(not(feature = "gnome"), allow(dead_code))] // the D-Bus client's
 pub fn parse_tag(s: &str) -> Option<(u32, Xid)> {
     let (display, xid) = s.strip_prefix(TAG_PREFIX)?.split_once(':')?;
     let canonical_decimal = !display.is_empty()
@@ -54,6 +55,7 @@ pub fn parse_tag(s: &str) -> Option<(u32, Xid)> {
 }
 
 /// The window of `s` if it is a tag of display `display`.
+#[cfg_attr(not(feature = "gnome"), allow(dead_code))] // the D-Bus client's
 pub fn tag_window(s: &str, display: u32) -> Option<Xid> {
     parse_tag(s).filter(|t| t.0 == display).map(|t| t.1)
 }
@@ -86,6 +88,7 @@ pub mod mr {
 }
 
 /// Window state bits (`Changed`'s flags, `GetState`'s `flags`).
+#[allow(dead_code)] // the extension's full set; the sync reads USER
 pub mod st {
     /// The user is moving or resizing the window on the desktop (a mutter
     /// grab op is active on it).
@@ -98,6 +101,7 @@ pub mod st {
 }
 
 /// `Changed`'s and `GetState`'s workspace of a window on every workspace.
+#[allow(dead_code)] // the extension's API (workspaces are a later phase)
 pub const ALL_WORKSPACES: i32 = -1;
 
 /// Whether desktop serial `a` is later than `b` (the extension's counter is
@@ -192,13 +196,30 @@ impl Geometry {
         self.wins.remove(&xid);
     }
 
+    #[allow(dead_code)] // tests
     pub fn is_tracked(&self, xid: Xid) -> bool {
         self.wins.contains_key(&xid)
     }
 
     /// Whether a MoveResize for `xid` is waiting for its reply.
+    #[allow(dead_code)] // tests
     pub fn in_flight(&self, xid: Xid) -> bool {
         self.wins.get(&xid).is_some_and(|w| w.in_flight.is_some())
+    }
+
+    /// Whether an X move of `xid` waits to be sent (by `frame`).
+    pub fn pending(&self, xid: Xid) -> bool {
+        self.wins.get(&xid).is_some_and(|w| w.pending.is_some())
+    }
+
+    /// The desktop's rectangle of `xid` as last reported (None: not yet).
+    pub fn desk(&self, xid: Xid) -> Option<Rect> {
+        self.wins.get(&xid)?.desk
+    }
+
+    /// The X window's rectangle as last known.
+    pub fn x_rect(&self, xid: Xid) -> Option<Rect> {
+        self.wins.get(&xid).map(|w| w.x)
     }
 
     /// The bridge configured the X window to `rect` with the request of
@@ -473,8 +494,451 @@ impl RaiseGate {
         self.ungated.remove(&xid);
     }
 
+    #[allow(dead_code)] // no client-gone signal reaches the reverse thread yet
     pub fn forget_client(&mut self, client: u32) {
         self.input.remove(&client);
+    }
+}
+
+// ---- the integration's decisions (src/xvfb/reverse.rs carries them out) ----
+
+/// A shown window's rectangle in the shared space from X's geometry: the
+/// outer corner and the size including the border (the shown surface is the
+/// named pixmap, border included, and has no other window geometry).
+pub fn outer_rect(x: i16, y: i16, width: u16, height: u16, border: u16) -> Rect {
+    Rect::new(
+        i32::from(x),
+        i32::from(y),
+        i32::from(width) + 2 * i32::from(border),
+        i32::from(height) + 2 * i32::from(border),
+    )
+}
+
+/// The X window size (inside the border) of shared-space size `w`x`h`; at
+/// least 1x1.
+pub fn inner_size(w: i32, h: i32, border: u16) -> (u32, u32) {
+    let b = 2 * i32::from(border);
+    ((w - b).max(1) as u32, (h - b).max(1) as u32)
+}
+
+/// What the X window should be told of the desktop's rectangle `desk`: its
+/// position, with X's own size `x`. A shown window's size on the desktop is
+/// the size of the buffer the bridge committed last, so a desktop report can
+/// only lag X's size, never lead it: the desktop's own resizes (the user's,
+/// tiling, maximise) come as the toplevel's configure, which resizes the X
+/// window, and a clamped size comes back in the MoveResize reply. Taking the
+/// reported size would shrink a window that just grew itself back to the
+/// size of its last frame.
+pub fn desktop_position(desk: Rect, x: Rect) -> Rect {
+    Rect {
+        w: x.w,
+        h: x.h,
+        ..desk
+    }
+}
+
+/// WM_NORMAL_HINTS flags.
+const US_POSITION: u32 = 1 << 0;
+const P_POSITION: u32 = 1 << 2;
+
+/// Where a new toplevel at X position `(x, y)` asks to open on the desktop,
+/// from its WM_NORMAL_HINTS (32-bit values): the user's position
+/// (USPosition: -geometry, session restore) always; the program's
+/// (PPosition: a saved layout) unless it is 0,0, which toolkits report for a
+/// window nobody placed. None: the desktop places it (and X follows).
+pub fn initial_position(normal_hints: &[u32], x: i32, y: i32) -> Option<(i32, i32)> {
+    let flags = normal_hints.first().copied().unwrap_or(0);
+    let user = flags & US_POSITION != 0;
+    let program = flags & P_POSITION != 0 && (x, y) != (0, 0);
+    (user || program).then_some((x, y))
+}
+
+/// WM_HINTS (32-bit values) has UrgencyHint set.
+pub fn urgent(wm_hints: &[u32]) -> bool {
+    wm_hints.first().is_some_and(|f| f & (1 << 8) != 0)
+}
+
+/// Where pointer positions on a shown toplevel's surface map from (root =
+/// origin + surface-local): with the sync, where the desktop has the window
+/// (`desk`, as last reported) - the surface's true position, also while the
+/// X client's own drag loop moves the X window ahead of it, so the X pointer
+/// stays where the desktop's is and the drag neither doubles nor stalls;
+/// before the desktop has reported, and without the sync, X's position
+/// (`x`; 0.1.2 holds it during a held-button self-drag).
+pub fn pointer_origin(desk: Option<Rect>, x: (i16, i16)) -> (i16, i16) {
+    match desk {
+        Some(d) => (
+            d.x.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            d.y.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        ),
+        None => x,
+    }
+}
+
+/// The least time between two MoveResize requests of a window that is not
+/// painting (no frame callback to pace them): one per 60 Hz frame.
+pub const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// A frame callback later than this (a hidden or minimised window's) does
+/// not hold a MoveResize back.
+pub const STALE_FRAME: Duration = Duration::from_millis(100);
+
+/// When a window's coalesced MoveResize may go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Due {
+    /// Now.
+    Now,
+    /// At the frame callback of the commit in flight.
+    Frame,
+    /// At this time (the window does not paint: paced by `FRAME_INTERVAL`).
+    At(Instant),
+}
+
+/// One MoveResize per frame callback at most: while a commit (made at
+/// `frame_wait`) waits for its frame callback the request goes with it;
+/// otherwise at once, unless the last one went less than `FRAME_INTERVAL`
+/// ago (a window moving itself without repainting has no frame callbacks).
+pub fn send_due(frame_wait: Option<Instant>, last: Option<Instant>, now: Instant) -> Due {
+    if frame_wait.is_some_and(|t| now.saturating_duration_since(t) < STALE_FRAME) {
+        return Due::Frame;
+    }
+    match last {
+        Some(t) if now.saturating_duration_since(t) < FRAME_INTERVAL => Due::At(t + FRAME_INTERVAL),
+        _ => Due::Now,
+    }
+}
+
+/// A restack: put a window directly above or below another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stack {
+    Above(Xid),
+    Below(Xid),
+}
+
+/// How to restack X so the shown toplevels are in the desktop's order (the
+/// desktop is the only stacking authority: design_x_capability_gaps.md A1).
+/// `desktop` and `x` are bottom to top; windows in only one of them are
+/// left out. The longest run of windows already in the desktop's order stays
+/// put and each other window is restacked once, in order (`(w, Stack)`: put
+/// `w` there); empty when X agrees.
+pub fn restack_plan(desktop: &[Xid], x: &[Xid]) -> Vec<(Xid, Stack)> {
+    let mut desk: Vec<Xid> = Vec::new();
+    for w in desktop {
+        if x.contains(w) && !desk.contains(w) {
+            desk.push(*w);
+        }
+    }
+    let n = desk.len();
+    // X's positions of the desktop's windows; the longest increasing run of
+    // them is what is in the desktop's order already
+    let at: Vec<usize> = desk
+        .iter()
+        .map(|w| x.iter().position(|u| u == w).expect("in both"))
+        .collect();
+    let (mut len, mut prev) = (vec![1usize; n], vec![usize::MAX; n]);
+    for i in 0..n {
+        for j in 0..i {
+            if at[j] < at[i] && len[j] + 1 > len[i] {
+                len[i] = len[j] + 1;
+                prev[i] = j;
+            }
+        }
+    }
+    let mut keep = vec![false; n];
+    let mut i = (0..n).max_by_key(|&i| (len[i], std::cmp::Reverse(i)));
+    while let Some(k) = i {
+        keep[k] = true;
+        i = (prev[k] != usize::MAX).then_some(prev[k]);
+    }
+    let mut ops = Vec::new();
+    for i in 0..n {
+        if keep[i] {
+            continue;
+        }
+        if i > 0 {
+            // its desktop neighbour below is in place (kept, or put there)
+            ops.push((desk[i], Stack::Above(desk[i - 1])));
+        } else if let Some(k) = (0..n).find(|&k| keep[k]) {
+            // the desktop's bottom one goes below the lowest kept window
+            ops.push((desk[i], Stack::Below(desk[k])));
+        }
+    }
+    ops
+}
+
+/// Whether X's order `x` (after a client restacked `xid`) has `xid` above a
+/// window the desktop has above it (`desktop`, bottom to top): the client
+/// raised it (XRaiseWindow, a restack to Above or TopIf), which is a request
+/// for the raise gating, not a fact. A lower is never a request: X just goes
+/// back to the desktop's order.
+pub fn raised_over_desktop(xid: Xid, desktop: &[Xid], x: &[Xid]) -> bool {
+    let (Some(d), Some(xi)) = (
+        desktop.iter().position(|&w| w == xid),
+        x.iter().position(|&w| w == xid),
+    ) else {
+        return false;
+    };
+    desktop[d + 1..]
+        .iter()
+        .any(|v| x.iter().position(|u| u == v).is_some_and(|p| p < xi))
+}
+
+/// Keep-above of the shown toplevels (design_x_capability_gaps.md A3, A4):
+/// a window is above when it asks (_NET_WM_STATE_ABOVE, or KDE's
+/// _NET_WM_STATE_STAYS_ON_TOP), or when its transient parent is (a dialog of
+/// an above window must not open behind it: no invisible modal); and what
+/// the desktop was last told.
+#[derive(Debug, Default)]
+pub struct Layers {
+    own: HashMap<Xid, bool>,
+    parent: HashMap<Xid, Xid>,
+    told: HashMap<Xid, bool>,
+}
+
+impl Layers {
+    pub fn new() -> Layers {
+        Layers::default()
+    }
+
+    /// Window `xid` asks to be above (`own`); `parent`: its shown transient
+    /// parent.
+    pub fn set(&mut self, xid: Xid, own: bool, parent: Option<Xid>) {
+        self.own.insert(xid, own);
+        match parent {
+            Some(p) if p != xid => self.parent.insert(xid, p),
+            _ => self.parent.remove(&xid),
+        };
+    }
+
+    pub fn forget(&mut self, xid: Xid) {
+        self.own.remove(&xid);
+        self.parent.remove(&xid);
+        self.told.remove(&xid);
+    }
+
+    /// Whether `xid` is above: its own wish or its parent chain's (a cycle
+    /// of transients ends the walk).
+    pub fn above(&self, xid: Xid) -> bool {
+        let mut w = xid;
+        for _ in 0..32 {
+            if self.own.get(&w).copied().unwrap_or(false) {
+                return true;
+            }
+            match self.parent.get(&w) {
+                Some(&p) if p != xid => w = p,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// What to tell the desktop (SetAbove), by window: every known window
+    /// whose state differs from what it was told (untold = not above).
+    pub fn changes(&mut self) -> Vec<(Xid, bool)> {
+        let mut xids: Vec<Xid> = self.own.keys().copied().collect();
+        xids.sort_unstable();
+        let mut out = Vec::new();
+        for w in xids {
+            let on = self.above(w);
+            if self.told.get(&w).copied().unwrap_or(false) != on {
+                self.told.insert(w, on);
+                out.push((w, on));
+            }
+        }
+        out
+    }
+
+    /// The desktop side came back: tell it again (the next `changes`).
+    pub fn retell(&mut self) {
+        self.told.clear();
+    }
+}
+
+/// Demands-attention of the shown toplevels from their hints (WM_HINTS
+/// UrgencyHint, _NET_WM_STATE_DEMANDS_ATTENTION: design_x_capability_gaps.md
+/// B), and what the desktop was told.
+#[derive(Debug, Default)]
+pub struct Attention {
+    told: HashMap<Xid, bool>,
+}
+
+impl Attention {
+    pub fn new() -> Attention {
+        Attention::default()
+    }
+
+    /// The window's hints ask for attention or not: what to tell the
+    /// desktop (SetDemandsAttention), if anything (untold = no attention).
+    pub fn hint(&mut self, xid: Xid, on: bool) -> Option<bool> {
+        let was = self.told.insert(xid, on).unwrap_or(false);
+        (was != on).then_some(on)
+    }
+
+    pub fn forget(&mut self, xid: Xid) {
+        self.told.remove(&xid);
+    }
+
+    /// The desktop side came back: the windows to tell again.
+    pub fn retell(&self) -> Vec<Xid> {
+        let mut v: Vec<Xid> = self
+            .told
+            .iter()
+            .filter(|(_, on)| **on)
+            .map(|(w, _)| *w)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+/// The extension's requests and events (pure data; the client is `bus`).
+/// A request to the extension, about window `xid` of our display.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // the extension's full API; this phase uses part of it
+pub enum Request {
+    MoveResize { xid: Xid, rect: Rect, flags: u32 },
+    SetInitialPosition { xid: Xid, x: i32, y: i32 },
+    Activate { xid: Xid, timestamp: u32 },
+    Raise { xid: Xid },
+    SetAbove { xid: Xid, on: bool },
+    SetDemandsAttention { xid: Xid, on: bool },
+    Stick { xid: Xid, on: bool },
+    SetWorkspace { xid: Xid, index: i32 },
+    Minimize { xid: Xid, on: bool },
+    GetState,
+    GetMonitors,
+}
+
+#[cfg_attr(not(feature = "gnome"), allow(dead_code))] // the D-Bus client's
+impl Request {
+    pub fn method(&self) -> &'static str {
+        match self {
+            Request::MoveResize { .. } => "MoveResize",
+            Request::SetInitialPosition { .. } => "SetInitialPosition",
+            Request::Activate { .. } => "Activate",
+            Request::Raise { .. } => "Raise",
+            Request::SetAbove { .. } => "SetAbove",
+            Request::SetDemandsAttention { .. } => "SetDemandsAttention",
+            Request::Stick { .. } => "Stick",
+            Request::SetWorkspace { .. } => "SetWorkspace",
+            Request::Minimize { .. } => "Minimize",
+            Request::GetState => "GetState",
+            Request::GetMonitors => "GetMonitors",
+        }
+    }
+
+    pub fn xid(&self) -> Option<Xid> {
+        match *self {
+            Request::MoveResize { xid, .. }
+            | Request::SetInitialPosition { xid, .. }
+            | Request::Activate { xid, .. }
+            | Request::Raise { xid }
+            | Request::SetAbove { xid, .. }
+            | Request::SetDemandsAttention { xid, .. }
+            | Request::Stick { xid, .. }
+            | Request::SetWorkspace { xid, .. }
+            | Request::Minimize { xid, .. } => Some(xid),
+            Request::GetState | Request::GetMonitors => None,
+        }
+    }
+}
+
+/// A window as `GetState` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowState {
+    pub xid: Xid,
+    pub rect: Rect,
+    pub monitor: i32,
+    /// `ALL_WORKSPACES` when on all.
+    pub workspace: i32,
+    /// `st` bits.
+    pub flags: u32,
+    /// The serial of its last `Changed` (0: none yet).
+    pub serial: u32,
+    /// Mapped on the desktop yet.
+    pub shown: bool,
+}
+
+/// A monitor as `GetMonitors` reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorInfo {
+    pub index: i32,
+    pub rect: Rect,
+    pub work_area: Rect,
+    pub scale: f64,
+    pub primary: bool,
+}
+
+/// What comes back from the extension.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(feature = "gnome"), allow(dead_code))] // the D-Bus client's
+pub enum Event {
+    /// The extension is there and compatible (at start, or it came
+    /// back): resync with `GetState`.
+    Available {
+        version: u32,
+        features: Vec<String>,
+    },
+    /// It went away (or the session bus did): fall back.
+    Unavailable,
+    /// The reply to a MoveResize.
+    Applied {
+        xid: Xid,
+        requested: Rect,
+        applied: Rect,
+    },
+    /// A request about `xid` failed. Every MoveResize ends in exactly
+    /// one `Applied` or `Failed`.
+    Failed {
+        xid: Xid,
+        method: &'static str,
+        error: String,
+    },
+    Changed {
+        xid: Xid,
+        rect: Rect,
+        monitor: i32,
+        workspace: i32,
+        flags: u32,
+        serial: u32,
+    },
+    /// Our display's windows, bottom to top.
+    Restacked(Vec<Xid>),
+    MonitorsChanged,
+    WindowGone(Xid),
+    /// Our display's windows, bottom to top.
+    State(Vec<WindowState>),
+    Monitors(Vec<MonitorInfo>),
+}
+
+/// Without `--features gnome` there is no D-Bus client: no window sync, the
+/// 0.1.2 behaviour (`Client::spawn` says so).
+#[cfg(not(feature = "gnome"))]
+pub mod bus {
+    pub use super::{Event, Request};
+
+    /// Never made: `spawn` fails.
+    pub enum Client {}
+
+    impl Client {
+        pub fn spawn(_display: u32) -> std::io::Result<Client> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this bridge was built without D-Bus (--features gnome)",
+            ))
+        }
+
+        pub fn send(&self, _: Request) {
+            match *self {}
+        }
+
+        pub fn fd(&self) -> std::os::fd::RawFd {
+            match *self {}
+        }
+
+        pub fn events(&self) -> std::iter::Empty<Event> {
+            match *self {}
+        }
     }
 }
 
@@ -533,121 +997,7 @@ pub mod bus {
     /// MoveResize stuck longer must not keep its window from syncing.
     const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-    /// A request to the extension, about window `xid` of our display.
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum Request {
-        MoveResize { xid: Xid, rect: Rect, flags: u32 },
-        SetInitialPosition { xid: Xid, x: i32, y: i32 },
-        Activate { xid: Xid, timestamp: u32 },
-        Raise { xid: Xid },
-        SetAbove { xid: Xid, on: bool },
-        SetDemandsAttention { xid: Xid, on: bool },
-        Stick { xid: Xid, on: bool },
-        SetWorkspace { xid: Xid, index: i32 },
-        Minimize { xid: Xid, on: bool },
-        GetState,
-        GetMonitors,
-    }
-
-    impl Request {
-        fn method(&self) -> &'static str {
-            match self {
-                Request::MoveResize { .. } => "MoveResize",
-                Request::SetInitialPosition { .. } => "SetInitialPosition",
-                Request::Activate { .. } => "Activate",
-                Request::Raise { .. } => "Raise",
-                Request::SetAbove { .. } => "SetAbove",
-                Request::SetDemandsAttention { .. } => "SetDemandsAttention",
-                Request::Stick { .. } => "Stick",
-                Request::SetWorkspace { .. } => "SetWorkspace",
-                Request::Minimize { .. } => "Minimize",
-                Request::GetState => "GetState",
-                Request::GetMonitors => "GetMonitors",
-            }
-        }
-
-        fn xid(&self) -> Option<Xid> {
-            match *self {
-                Request::MoveResize { xid, .. }
-                | Request::SetInitialPosition { xid, .. }
-                | Request::Activate { xid, .. }
-                | Request::Raise { xid }
-                | Request::SetAbove { xid, .. }
-                | Request::SetDemandsAttention { xid, .. }
-                | Request::Stick { xid, .. }
-                | Request::SetWorkspace { xid, .. }
-                | Request::Minimize { xid, .. } => Some(xid),
-                Request::GetState | Request::GetMonitors => None,
-            }
-        }
-    }
-
-    /// A window as `GetState` reports it.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct WindowState {
-        pub xid: Xid,
-        pub rect: Rect,
-        pub monitor: i32,
-        /// `super::ALL_WORKSPACES` when on all.
-        pub workspace: i32,
-        /// `st` bits.
-        pub flags: u32,
-        /// The serial of its last `Changed` (0: none yet).
-        pub serial: u32,
-        /// Mapped on the desktop yet.
-        pub shown: bool,
-    }
-
-    /// A monitor as `GetMonitors` reports it.
-    #[derive(Clone, Debug, PartialEq)]
-    pub struct MonitorInfo {
-        pub index: i32,
-        pub rect: Rect,
-        pub work_area: Rect,
-        pub scale: f64,
-        pub primary: bool,
-    }
-
-    /// What comes back from the extension.
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum Event {
-        /// The extension is there and compatible (at start, or it came
-        /// back): resync with `GetState`.
-        Available {
-            version: u32,
-            features: Vec<String>,
-        },
-        /// It went away (or the session bus did): fall back.
-        Unavailable,
-        /// The reply to a MoveResize.
-        Applied {
-            xid: Xid,
-            requested: Rect,
-            applied: Rect,
-        },
-        /// A request about `xid` failed. Every MoveResize ends in exactly
-        /// one `Applied` or `Failed`.
-        Failed {
-            xid: Xid,
-            method: &'static str,
-            error: String,
-        },
-        Changed {
-            xid: Xid,
-            rect: Rect,
-            monitor: i32,
-            workspace: i32,
-            flags: u32,
-            serial: u32,
-        },
-        /// Our display's windows, bottom to top.
-        Restacked(Vec<Xid>),
-        MonitorsChanged,
-        WindowGone(Xid),
-        /// Our display's windows, bottom to top.
-        State(Vec<WindowState>),
-        Monitors(Vec<MonitorInfo>),
-    }
+    pub use super::{Event, MonitorInfo, Request, WindowState};
 
     pub(super) type Quad = (i32, i32, i32, i32);
     pub(super) type ChangedBody = (String, Quad, i32, i32, u32, u32);
@@ -818,6 +1168,7 @@ pub mod bus {
         }
 
         /// Whether the extension is there and compatible right now.
+        #[allow(dead_code)] // the reverse thread follows Available/Unavailable
         pub fn available(&self) -> bool {
             self.shared.available.load(Ordering::Relaxed)
         }
@@ -1804,6 +2155,371 @@ mod tests {
             .filter(|i| g.request(XID, 1, ms(t, i * 50)) != Raise::Ignore)
             .count();
         assert_eq!(forwarded, 20, "one per 3 s");
+    }
+
+    // ---- the integration's decisions ----
+
+    #[test]
+    fn the_shared_rectangle_includes_the_border() {
+        assert_eq!(outer_rect(10, 20, 100, 50, 0), Rect::new(10, 20, 100, 50));
+        assert_eq!(outer_rect(10, 20, 100, 50, 2), Rect::new(10, 20, 104, 54));
+        assert_eq!(outer_rect(-5, -7, 1, 1, 0), Rect::new(-5, -7, 1, 1));
+        assert_eq!(inner_size(104, 54, 2), (100, 50));
+        assert_eq!(inner_size(100, 50, 0), (100, 50));
+        assert_eq!(inner_size(3, 3, 2), (1, 1), "never below 1x1");
+        // round trip
+        let r = outer_rect(1, 2, 640, 480, 1);
+        assert_eq!(inner_size(r.w, r.h, 1), (640, 480));
+    }
+
+    #[test]
+    fn desktop_reports_carry_the_position_not_the_size() {
+        // the client grew to 500x400; the desktop still reports its last
+        // frame (400x300) at a new position: X keeps its size
+        let x = Rect::new(100, 100, 500, 400);
+        let desk = Rect::new(150, 120, 400, 300);
+        assert_eq!(desktop_position(desk, x), Rect::new(150, 120, 500, 400));
+        // fed to Geometry, the stale size does not shrink X back
+        let mut g = synced(Rect::new(100, 100, 400, 300));
+        let t = t0();
+        assert_eq!(g.x_configured(XID, x, 1, t), None);
+        let m = g.frame(XID).expect("the client's resize goes out");
+        assert_eq!(m.rect, x);
+        assert_eq!(g.applied(XID, x), None);
+        let stale = Rect::new(100, 100, 400, 300);
+        assert_eq!(
+            g.changed(
+                XID,
+                desktop_position(stale, g.x_rect(XID).unwrap()),
+                0,
+                11,
+                t
+            ),
+            None,
+            "the frame before the new buffer is no desktop resize"
+        );
+        assert_eq!(g.x_rect(XID), Some(x));
+    }
+
+    #[test]
+    fn a_user_or_meaningful_program_position_opens_there() {
+        let flags = |f: u32| vec![f, 0, 0, 0, 0];
+        assert_eq!(
+            initial_position(&flags(1), 300, 200),
+            Some((300, 200)),
+            "USPosition"
+        );
+        assert_eq!(
+            initial_position(&flags(1), 0, 0),
+            Some((0, 0)),
+            "the user's 0,0 too"
+        );
+        assert_eq!(
+            initial_position(&flags(4), 300, 200),
+            Some((300, 200)),
+            "PPosition"
+        );
+        assert_eq!(
+            initial_position(&flags(4), 0, 0),
+            None,
+            "a program's 0,0 is no position"
+        );
+        assert_eq!(initial_position(&flags(5), 0, 0), Some((0, 0)));
+        assert_eq!(
+            initial_position(&flags(2 | 8), 300, 200),
+            None,
+            "sizes only"
+        );
+        assert_eq!(initial_position(&flags(0), 300, 200), None);
+        assert_eq!(initial_position(&[], 300, 200), None, "no WM_NORMAL_HINTS");
+    }
+
+    #[test]
+    fn urgency_is_wm_hints_bit_8() {
+        assert!(urgent(&[1 << 8, 1, 0]));
+        assert!(urgent(&[(1 << 8) | 3, 1, 1]));
+        assert!(!urgent(&[3, 1, 1]));
+        assert!(!urgent(&[]));
+    }
+
+    #[test]
+    fn the_pointer_maps_from_the_desktops_position_once_known() {
+        assert_eq!(
+            pointer_origin(None, (5, 6)),
+            (5, 6),
+            "not reported yet: X's"
+        );
+        assert_eq!(
+            pointer_origin(Some(Rect::new(70, 80, 1, 1)), (5, 6)),
+            (70, 80)
+        );
+        assert_eq!(
+            pointer_origin(Some(Rect::new(1 << 20, -(1 << 20), 1, 1)), (0, 0)),
+            (i16::MAX, i16::MIN)
+        );
+    }
+
+    /// The X client's own drag loop (window = pointer - grab offset) with
+    /// the pointer mapped from the desktop's position: the desktop window
+    /// stays under the pointer step for step.
+    #[test]
+    fn a_self_drag_follows_the_pointer_with_the_desktops_origin() {
+        let start = Rect::new(100, 100, 200, 150);
+        let mut g = synced(start);
+        let t = t0();
+        let grab = 10; // the pointer is 10 px into the window
+        let (mut p, mut desk_actual, mut seq) = (110, 100, 1u64);
+        assert!(g.button(XID, true).is_none());
+        for _ in 0..40 {
+            p += 7; // the desktop's pointer
+            let sx = p - desk_actual; // wl_pointer.motion, surface-local
+            let origin = i32::from(pointer_origin(g.desk(XID), (0, 0)).0);
+            let root = origin + sx;
+            let x = Rect::new(root - grab, 100, 200, 150);
+            seq += 1;
+            assert_eq!(g.x_configured(XID, x, seq, t), None);
+            if let Some(m) = g.frame(XID) {
+                assert_ne!(m.flags & mr::USER, 0, "a held drag is the user's");
+                desk_actual = m.rect.x; // mutter moves it in the call
+                assert_eq!(g.applied(XID, m.rect), None);
+            }
+            assert_eq!(root, p, "the X pointer is where the desktop's is");
+        }
+        assert_eq!(desk_actual, p - grab, "the desktop window followed");
+        assert_eq!(g.x_rect(XID).unwrap().x, p - grab);
+        assert!(g.button(XID, false).is_none(), "nothing to put back");
+    }
+
+    /// Why 0.1.2's held mapping is not kept with the sync: once the surface
+    /// moves under the pointer, a fixed origin reads only part of the
+    /// pointer's motion and the window falls behind it.
+    #[test]
+    fn a_held_origin_would_stall_a_drag_the_desktop_follows() {
+        let (fixed_origin, grab) = (100, 10);
+        let (mut p, mut desk_actual) = (110, 100);
+        let mut window = 100;
+        for _ in 0..20 {
+            p += 7;
+            let root = fixed_origin + (p - desk_actual);
+            window = root - grab;
+            desk_actual = window; // the desktop follows X
+        }
+        // half the pointer's speed: 70 px behind after 20 steps of 7
+        assert_eq!(p - grab - window, 70, "window {window}, pointer {p}");
+    }
+
+    #[test]
+    fn move_resizes_go_with_frames_or_every_16_ms() {
+        let t = t0();
+        assert_eq!(send_due(None, None, t), Due::Now);
+        assert_eq!(
+            send_due(Some(t), None, ms(t, 5)),
+            Due::Frame,
+            "a commit waits"
+        );
+        assert_eq!(
+            send_due(Some(t), Some(t), ms(t, 150)),
+            Due::Now,
+            "a frame callback this late does not hold it"
+        );
+        assert_eq!(send_due(None, Some(t), ms(t, 5)), Due::At(ms(t, 16)));
+        assert_eq!(send_due(None, Some(t), ms(t, 16)), Due::Now);
+        assert_eq!(send_due(None, Some(t), ms(t, 40)), Due::Now);
+    }
+
+    /// Applies `restack_plan`'s operations to a whole X stack.
+    fn restacked(stack: &[Xid], ops: &[(Xid, Stack)]) -> Vec<Xid> {
+        let mut s = stack.to_vec();
+        for &(w, to) in ops {
+            s.retain(|&v| v != w);
+            match to {
+                Stack::Above(below) => {
+                    let i = s.iter().position(|&v| v == below).unwrap();
+                    s.insert(i + 1, w);
+                }
+                Stack::Below(above) => {
+                    let i = s.iter().position(|&v| v == above).unwrap();
+                    s.insert(i, w);
+                }
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn x_restacks_to_the_desktops_order() {
+        let (a, b, c, d) = (1, 2, 3, 4);
+        assert!(restack_plan(&[a, b, c], &[a, b, c]).is_empty(), "agrees");
+        assert!(
+            restack_plan(&[a, b, c], &[90, a, 91, b, c, 92]).is_empty(),
+            "other windows in between don't matter"
+        );
+        // the client raised a: one restack puts it back
+        let ops = restack_plan(&[a, b, c], &[b, c, a]);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(restacked(&[b, c, a], &ops), vec![a, b, c]);
+        // reversed: n-1 restacks
+        let ops = restack_plan(&[a, b, c, d], &[d, c, b, a]);
+        assert_eq!(ops.len(), 3);
+        assert_eq!(restacked(&[d, c, b, a], &ops), vec![a, b, c, d]);
+        // windows in only one list are left out; duplicates count once
+        let ops = restack_plan(&[a, 77, b, b, c], &[c, 88, b, a]);
+        let x = restacked(&[c, 88, b, a], &ops);
+        let ours: Vec<Xid> = x.into_iter().filter(|v| [a, b, c].contains(v)).collect();
+        assert_eq!(ours, vec![a, b, c]);
+        assert!(restack_plan(&[a], &[a]).is_empty());
+        assert!(restack_plan(&[], &[a, b]).is_empty());
+    }
+
+    #[test]
+    fn every_order_restacks_to_the_desktops() {
+        // all permutations of 4 windows, with others interleaved
+        let ws = [1, 2, 3, 4];
+        let mut perms = vec![vec![]];
+        for _ in 0..ws.len() {
+            perms = perms
+                .into_iter()
+                .flat_map(|p: Vec<Xid>| {
+                    ws.iter()
+                        .filter(|w| !p.contains(w))
+                        .map(|w| {
+                            let mut q = p.clone();
+                            q.push(*w);
+                            q
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        }
+        for desk in &perms {
+            for x in &perms {
+                let stack: Vec<Xid> = x.iter().flat_map(|w| [100 + w, *w]).collect();
+                let ops = restack_plan(desk, &stack);
+                let got: Vec<Xid> = restacked(&stack, &ops)
+                    .into_iter()
+                    .filter(|v| ws.contains(v))
+                    .collect();
+                assert_eq!(&got, desk, "x {x:?}");
+                assert!(ops.len() < ws.len());
+                // one restack per window out of the longest run in order
+                let pos: Vec<usize> = desk
+                    .iter()
+                    .map(|w| x.iter().position(|u| u == w).unwrap())
+                    .collect();
+                let longest = (0..1u32 << ws.len())
+                    .filter(|m| {
+                        let p: Vec<usize> = (0..ws.len())
+                            .filter(|i| m & (1 << i) != 0)
+                            .map(|i| pos[i])
+                            .collect();
+                        p.windows(2).all(|q| q[0] < q[1])
+                    })
+                    .map(|m| m.count_ones() as usize)
+                    .max()
+                    .unwrap();
+                assert_eq!(ops.len(), ws.len() - longest, "x {x:?} desk {desk:?}");
+                if desk == x {
+                    assert!(ops.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_raise_over_the_desktops_order_is_a_request() {
+        let (a, b, c) = (1, 2, 3);
+        let desk = [a, b, c];
+        assert!(raised_over_desktop(a, &desk, &[b, c, a]), "XRaiseWindow");
+        assert!(raised_over_desktop(a, &desk, &[b, 9, a, c]), "over b");
+        assert!(!raised_over_desktop(c, &desk, &[a, b, c]), "on top already");
+        assert!(
+            !raised_over_desktop(c, &desk, &[c, a, b]),
+            "a lower is no request"
+        );
+        assert!(!raised_over_desktop(b, &desk, &[a, b, c]), "unchanged");
+        assert!(
+            !raised_over_desktop(7, &desk, &[a, b, c, 7]),
+            "not on the desktop yet"
+        );
+        assert!(!raised_over_desktop(a, &desk, &[b, c]), "not in X");
+    }
+
+    #[test]
+    fn keep_above_is_told_on_change_only() {
+        let mut l = Layers::new();
+        l.set(1, false, None);
+        assert!(l.changes().is_empty(), "untold means not above");
+        l.set(1, true, None);
+        assert_eq!(l.changes(), vec![(1, true)]);
+        assert!(l.changes().is_empty());
+        l.set(1, true, None);
+        assert!(l.changes().is_empty(), "the same again");
+        l.set(1, false, None);
+        assert_eq!(l.changes(), vec![(1, false)]);
+    }
+
+    #[test]
+    fn a_child_of_an_above_window_is_above_too() {
+        let (top, dialog, sub) = (1, 2, 3);
+        let mut l = Layers::new();
+        l.set(top, true, None);
+        l.set(dialog, false, Some(top));
+        l.set(sub, false, Some(dialog));
+        assert_eq!(l.changes(), vec![(top, true), (dialog, true), (sub, true)]);
+        assert!(l.above(sub), "through the chain");
+        l.set(top, false, None);
+        assert_eq!(
+            l.changes(),
+            vec![(top, false), (dialog, false), (sub, false)]
+        );
+        // a child above of its own stays so
+        l.set(top, true, None);
+        l.set(dialog, true, Some(top));
+        let _ = l.changes();
+        l.set(top, false, None);
+        assert_eq!(l.changes(), vec![(top, false)]);
+        assert!(l.above(sub), "its own parent still is");
+        // the parent goes: the inheritance with it
+        l.set(dialog, false, Some(top));
+        l.set(top, true, None);
+        let _ = l.changes();
+        l.forget(top);
+        assert_eq!(l.changes(), vec![(dialog, false), (sub, false)]);
+    }
+
+    #[test]
+    fn transient_cycles_end() {
+        let mut l = Layers::new();
+        l.set(1, false, Some(2));
+        l.set(2, false, Some(1));
+        l.set(3, false, Some(3));
+        assert!(!l.above(1) && !l.above(2) && !l.above(3));
+        assert!(l.changes().is_empty());
+    }
+
+    #[test]
+    fn keep_above_is_told_again_when_the_extension_comes_back() {
+        let mut l = Layers::new();
+        l.set(1, true, None);
+        l.set(2, false, None);
+        let _ = l.changes();
+        l.retell();
+        assert_eq!(l.changes(), vec![(1, true)], "not-above needs no telling");
+    }
+
+    #[test]
+    fn attention_is_told_on_change_and_again_after_a_comeback() {
+        let mut a = Attention::new();
+        assert_eq!(a.hint(1, false), None, "untold means none");
+        assert_eq!(a.hint(1, true), Some(true));
+        assert_eq!(a.hint(1, true), None);
+        assert_eq!(a.hint(2, true), Some(true));
+        assert_eq!(a.retell(), vec![1, 2]);
+        assert_eq!(a.hint(1, false), Some(false));
+        assert_eq!(a.retell(), vec![2]);
+        a.forget(2);
+        assert!(a.retell().is_empty());
+        assert_eq!(a.hint(2, true), Some(true), "forgotten: told afresh");
     }
 }
 
