@@ -411,11 +411,12 @@ impl SelfDrag {
         if !answered {
             return;
         }
-        let first = usize::from(self.base == 0);
+        // not the oldest: the drag's start, or where the window has been
+        // laid out
         if let Some(o) = self
             .origins
             .iter_mut()
-            .skip(first)
+            .skip(1)
             .rev()
             .find(|o| o.reply.is_none() && !o.refused)
         {
@@ -824,6 +825,16 @@ mod tests {
         d.laid_out(1);
         assert_eq!(d.laid_out_at(), 0, "never laid out there");
         assert_eq!(d.applied((6, 0), (6, 0), t), None);
+        // where the window has been laid out is never refused
+        let mut d = SelfDrag::new((0, 0), Track::default(), Some((5.0, 5.0)));
+        d.sent((6, 0), None);
+        d.laid_out(1);
+        d.failed(true);
+        assert_eq!(
+            d.frame(Frame::default(), t, None),
+            Some((11.0, 5.0)),
+            "still a candidate"
+        );
     }
 
     #[test]
