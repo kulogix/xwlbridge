@@ -66,6 +66,7 @@ use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
+use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_manager_v1;
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
@@ -628,6 +629,12 @@ struct State {
     relative_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
     dialogs: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
+    /// xdg_toplevel_tag_v1: every shown toplevel is tagged
+    /// `xwlbridge:<display>:<xid>` (`winsync::tag`), the name the desktop
+    /// side of the window sync finds it by.
+    tags: Option<xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1>,
+    /// The engine display's number (for the tags).
+    display: u32,
     windows: HashMap<Window, Shown>,
     /// Shown popups, oldest first (the last is the topmost).
     popups: Vec<Window>,
@@ -779,6 +786,8 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         relative_manager: None,
         viewporter: None,
         dialogs: None,
+        tags: None,
+        display,
         windows: HashMap::new(),
         popups: Vec::new(),
         adopted: Vec::new(),
@@ -828,7 +837,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         return Err("the compositor lacks wl_compositor, wl_shm or xdg_wm_base".into());
     }
     crate::log!(
-        "-showwindows: showing the engine display's {} on the desktop (reverse master {:?}; pointer lock {}, viewporter {})",
+        "-showwindows: showing the engine display's {} on the desktop (reverse master {:?}; pointer lock {}, viewporter {}, toplevel tags {})",
         if screen_mode {
             "screen as one window"
         } else {
@@ -845,6 +854,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         } else {
             "no"
         },
+        if state.tags.is_some() { "yes" } else { "no" },
     );
     if let Some(c) = state.compositor.as_ref() {
         let surface = c.create_surface(&qh, 0);
@@ -1042,6 +1052,14 @@ impl State {
         }
     }
 
+    /// Tags a new toplevel for the desktop's window sync (before its first
+    /// commit, as the protocol asks), if the compositor offers tags.
+    fn tag(&self, toplevel: &xdg_toplevel::XdgToplevel, w: Window) {
+        if let Some(tags) = &self.tags {
+            tags.set_toplevel_tag(toplevel, super::winsync::tag(self.display, w));
+        }
+    }
+
     fn show(&mut self, w: Window, qh: &QueueHandle<State>) -> Result<(), AnyError> {
         let (mut x, mut y, width, height, depth, dmg) = self.watch(w)?;
         // Pointer input can only reach the part of the window on the screen:
@@ -1064,6 +1082,7 @@ impl State {
         let surface = compositor.create_surface(qh, w);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, w);
         let toplevel = xdg_surface.get_toplevel(qh, w);
+        self.tag(&toplevel, w);
         let title = self.title(w);
         toplevel.set_title(title.clone());
         let class = self.class(w);
@@ -2642,6 +2661,7 @@ impl State {
         let surface = compositor.create_surface(qh, self.root);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, self.root);
         let toplevel = xdg_surface.get_toplevel(qh, self.root);
+        self.tag(&toplevel, self.root);
         toplevel.set_title(format!("X display :{display} (xwlbridge)"));
         toplevel.set_app_id("xwlbridge-screen".into());
         let viewport = self
@@ -2998,6 +3018,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
+                "xdg_toplevel_tag_manager_v1" => state.tags = Some(registry.bind(name, 1, qh, ())),
                 "zwp_tablet_manager_v2" => {
                     state.tablet_manager = Some(registry.bind(name, 1, qh, ()))
                 }
@@ -3180,6 +3201,18 @@ impl Dispatch<wl_region::WlRegion, ()> for State {
         _: &mut Self,
         _: &wl_region::WlRegion,
         _: wl_region::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1,
+        _: xdg_toplevel_tag_manager_v1::Event,
         _: &(),
         _: &WlConnection,
         _: &QueueHandle<Self>,
