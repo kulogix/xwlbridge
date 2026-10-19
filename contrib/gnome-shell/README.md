@@ -90,3 +90,10 @@ the viewer; connecting to an already locked screen; unlocking with the password 
 lock and display blanking (a VM test of the session lifecycle). GNOME Shell 46 and 48
 use the same remote-access code (`js/ui/main.js` `_sessionUpdated`, checked in 46.0 and 48.7) but the
 extension was not run there.
+
+## The other extension here: xwlbridge-windows@xwlbridge
+
+`xwlbridge-windows@xwlbridge` is the window integration for `-showwindows` (geometry, placement, stacking and
+state of the X windows shown on the desktop). Unlike this one, `install.sh` installs and enables it; see
+[docs/extension.md](../../docs/extension.md). Its end-to-end test, `tests/run_windows_ext.sh`, runs it in a
+headless gnome-shell in a scratch session (a container or VM, never your own session).

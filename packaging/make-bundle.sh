@@ -1,7 +1,7 @@
 #!/bin/bash
 # Makes the release bundle users install from: xwlbridge-<version>-<arch>.tar.gz
-# holding the binary, xwlbridge-ctl, the services, the default settings and
-# install.sh/uninstall.sh.
+# holding the binary, xwlbridge-ctl, the services, the default settings, the GNOME
+# Shell extension xwlbridge-windows@xwlbridge and install.sh/uninstall.sh.
 #
 #   packaging/make-bundle.sh [--bin PATH] [--out DIR] [--suffix TEXT]
 #
@@ -38,8 +38,13 @@ install -m 0755 "$HERE/install.sh" "$HERE/uninstall.sh" "$D/"
 # the bundle's own xwlbridge-ctl knows its version too (its doctor runs before installing)
 sed "s|@VERSION@|$VERSION|g" "$HERE/xwlbridge-ctl" >"$D/xwlbridge-ctl"; chmod 0755 "$D/xwlbridge-ctl"
 install -m 0644 "$HERE/xwlbridge-realvnc.service.in" "$HERE/xwlbridge.service.in" "$HERE/xwlbridge-status.desktop.in" "$HERE/xwlbridge.conf" "$HERE/README.md" "$ROOT/LICENSE" "$D/"
+# the GNOME Shell extension install.sh installs (window integration for -showwindows)
+EXT=xwlbridge-windows@xwlbridge
+install -d -m 0755 "$D/gnome-shell/$EXT"
+install -m 0644 "$ROOT/contrib/gnome-shell/$EXT/metadata.json" "$ROOT/contrib/gnome-shell/$EXT/extension.js" "$D/gnome-shell/$EXT/"
 printf '%s\n' "$VERSION" >"$D/VERSION"
-( cd "$D" && sha256sum xwlbridge xwlbridge-ctl install.sh uninstall.sh xwlbridge-realvnc.service.in xwlbridge.service.in xwlbridge-status.desktop.in xwlbridge.conf README.md LICENSE VERSION >SHA256SUMS )
+( cd "$D" && sha256sum xwlbridge xwlbridge-ctl install.sh uninstall.sh xwlbridge-realvnc.service.in xwlbridge.service.in xwlbridge-status.desktop.in xwlbridge.conf README.md LICENSE VERSION \
+    "gnome-shell/$EXT/metadata.json" "gnome-shell/$EXT/extension.js" >SHA256SUMS )
 mkdir -p "$OUT"
 tar -C "$STAGE" --owner=0 --group=0 --numeric-owner --sort=name -czf "$OUT/$NAME.tar.gz" "$NAME"
 ( cd "$OUT" && sha256sum "$NAME.tar.gz" >"$NAME.tar.gz.sha256" )

@@ -41,7 +41,14 @@ after your next login). It also takes over an xwlrvnc install, once
 
 Other options: `--bin PATH`, `--prefix DIR`, `--port N|realvnc`, `--engine
 auto|builtin|xvnc|xvfb|xwayland` (for a new settings file), `--no-enable`,
-`--no-start`. Running a newer `install.sh` upgrades
+`--no-start`, `--no-extension`.
+
+`install.sh` also installs and enables the GNOME Shell extension
+`xwlbridge-windows@xwlbridge`, the window integration for `-showwindows`
+([docs/extension.md](../docs/extension.md)). GNOME on Wayland loads a newly
+installed extension at login: log out and in once. To go without it:
+`--no-extension` (or `xwlbridge-ctl config set extension off` and `install.sh`
+again). Running a newer `install.sh` upgrades
 in place (settings are kept; the service restarts, so connected viewers
 reconnect).
 
@@ -57,7 +64,8 @@ It reports, without printing any key or password: the GNOME/mutter version and
 its remote-desktop APIs, PipeWire, Xwayland, the bridge binary and settings, the
 X server engines available (and refuses RealVNC's own `Xvnc`), RealVNC Server's
 version, licence, authentication and encryption, RealVNC's system service and
-the port, the AppIndicator extension (tray icon), GNOME's own Remote Desktop
+the port, the AppIndicator extension (tray icon), the window extension
+(installed, enabled, running, version), GNOME's own Remote Desktop
 settings, automatic login, the screen lock, and the service's state.
 
 ## RealVNC's system service and port 5900
@@ -142,6 +150,7 @@ the effective values). Change with `xwlbridge-ctl config set KEY VALUE`, then
 | `backend` | `gnome` | `gnome`, `wlr` or `auto` |
 | `bridge` | `auto` | the `xwlbridge` binary; auto = next to `xwlbridge-ctl`, else on PATH |
 | `display` | `auto` | `xwlbridge.service` only: the display number (e.g. `20`); auto = the bridge picks one |
+| `extension` | `auto` | the window extension `xwlbridge-windows@xwlbridge`: `auto` = `install.sh` installs and enables it and the bridge uses it while GNOME runs it; `off` = `install.sh` leaves it out (removing its own copy) and the bridge does not use it ([docs/extension.md](../docs/extension.md)) |
 
 RealVNC's own settings (authentication, encryption, permissions, ...) stay in
 RealVNC's files and its Options dialog (status window > menu > Options), e.g. a
@@ -323,7 +332,7 @@ go for the set-uid launcher to work.)
 
 ## Uninstall
 
-    ~/.local/share/xwlbridge/uninstall.sh            # everything it installed, settings included
+    ~/.local/share/xwlbridge/uninstall.sh            # everything it installed (the extension too), settings included
     ~/.local/share/xwlbridge/uninstall.sh --keep-config
     ~/.local/share/xwlbridge/uninstall.sh --purge    # also RealVNC's per-user files created since the install
 

@@ -4,6 +4,10 @@ All notable changes to xwlbridge are listed here. The format follows Keep a Chan
 
 ## Unreleased
 
+### Added
+
+- GNOME Shell extension `xwlbridge-windows@xwlbridge` (GNOME 49 and 50): a D-Bus service through which the bridge can move, resize, place, activate and restack the windows `-showwindows` shows, and learn about desktop-side moves, maximising, stacking and focus (see [docs/extension.md](docs/extension.md)). It serves only windows tagged `xwlbridge:` and only to the process that owns them. `install.sh` installs and enables it (one log-out/log-in on Wayland), `--no-extension` or the setting `extension=off` opt out, `uninstall.sh` removes it and `xwlbridge-ctl doctor` reports it. The bridge does not use it yet.
+
 ### Fixed
 
 - `-showwindows`: the compositor's liveness pings are answered on a thread of their own, so an X client holding a server grab (a screenshot tool selecting a region) can no longer make GNOME offer to force-quit the bridge - which would have closed every X app on the display at once.

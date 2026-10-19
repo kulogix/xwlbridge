@@ -90,4 +90,7 @@ assets = [
     ["packaging/xwlbridge.conf", "usr/share/xwlbridge/", "644"],
     ["packaging/README.md", "usr/share/doc/xwlbridge/README.packaging.md", "644"],
     ["README.md", "usr/share/doc/xwlbridge/", "644"],
+    # system-wide: each user enables it (gnome-extensions enable xwlbridge-windows@xwlbridge, then a new login)
+    ["contrib/gnome-shell/xwlbridge-windows@xwlbridge/metadata.json", "usr/share/gnome-shell/extensions/xwlbridge-windows@xwlbridge/", "644"],
+    ["contrib/gnome-shell/xwlbridge-windows@xwlbridge/extension.js", "usr/share/gnome-shell/extensions/xwlbridge-windows@xwlbridge/", "644"],
 ]

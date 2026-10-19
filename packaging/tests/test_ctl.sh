@@ -26,6 +26,7 @@ cat >"$T/pkg/bin/xwlbridge" <<'EOF'
 printf 'ARG=%s\n' "$@"
 printf 'XVNC=%s\n' "$(readlink -f "$(command -v Xvnc)" 2>/dev/null)"
 printf 'XVFB=%s\n' "$(readlink -f "$(command -v Xvfb)" 2>/dev/null)"
+printf 'ENV_WINDOWS_EXTENSION=%s\n' "${XWLBRIDGE_WINDOWS_EXTENSION-unset}"
 EOF
 chmod 755 "$T/pkg/bin/xwlbridge"
 cp "$CTL" "$T/pkg/bin/xwlbridge-ctl"; chmod 755 "$T/pkg/bin/xwlbridge-ctl"
@@ -43,13 +44,55 @@ printf '#!/bin/sh\n# TigerVNC\ntouch %s\n' "$MARK" >"$T/tiger/Xtigervnc"; chmod 
 ln -s Xtigervnc "$T/tiger/Xvnc"
 printf '#!/bin/sh\n# Xvnc TigerVNC 1.15 https://www.tigervnc.org\ntouch %s\n' "$MARK" >"$T/tiger2/Xvnc"; chmod 755 "$T/tiger2/Xvnc"
 printf '#!/bin/sh\ntouch %s\n' "$MARK" >"$T/xvfb/Xvfb"; chmod 755 "$T/xvfb/Xvfb"
-# the system's tools without any X server (the test machine may have TigerVNC/Xvfb installed)
+# the system's tools without any X server (the test machine may have TigerVNC/Xvfb installed), and without
+# GNOME's own tools: install.sh writes GNOME settings (the extension), so only the fakes below may answer
+# (the tests must never change the desktop session of the user running them)
 mkdir -p "$T/sys"
 for f in /usr/bin/* /bin/*; do
-  case ${f##*/} in X|Xorg|Xvnc|Xtigervnc|Xvfb|Xwayland|Xnest|Xephyr|xwlbridge|xwlbridge-ctl|vncserver-x11*) continue;; esac
+  case ${f##*/} in X|Xorg|Xvnc|Xtigervnc|Xvfb|Xwayland|Xnest|Xephyr|xwlbridge|xwlbridge-ctl|vncserver-x11*) continue;;
+    gsettings|dconf|gnome-extensions|gnome-shell|busctl|gdbus|dbus-send) continue;; esac
   [ -e "$T/sys/${f##*/}" ] || ln -s "$f" "$T/sys/${f##*/}"
 done
 SYS=$T/sys
+
+# fake GNOME tools with state in $FAKE_DIR: gsettings (org.gnome.shell's extension keys), gnome-extensions,
+# gnome-shell --version, busctl (ShellVersion while $FAKE_DIR/shell_running exists; the window extension's
+# Version() while $FAKE_DIR/ext_active exists)
+mkdir -p "$T/fakegnome"
+cat >"$T/fakegnome/gsettings" <<'EOS'
+#!/bin/bash
+d=$FAKE_DIR/gsettings.d; mkdir -p "$d"; echo "gsettings $*" >>"$FAKE_DIR/gnome.log"
+case "$1 ${2:-}" in
+  "get org.gnome.shell")
+    case ${3:-} in
+      enabled-extensions|disabled-extensions) cat "$d/$3" 2>/dev/null || echo "@as []";;
+      disable-user-extensions) cat "$d/$3" 2>/dev/null || echo false;;
+      *) exit 1;;
+    esac;;
+  "set org.gnome.shell") [ -e "$FAKE_DIR/gs_memory_backend" ] && exit 0   # accepted, never stored
+    printf '%s\n' "$4" >"$d/$3";;
+  *) exit 1;;
+esac
+EOS
+cat >"$T/fakegnome/gnome-extensions" <<'EOS'
+#!/bin/bash
+echo "gnome-extensions $*" >>"$FAKE_DIR/gnome.log"
+[ -e "$FAKE_DIR/shell_knows_ext" ] || { echo "Extension “${2:-}” does not exist" >&2; exit 2; }
+case $1 in info) printf '%s\n  State: %s\n' "$2" "$(cat "$FAKE_DIR/ext_state" 2>/dev/null || echo ACTIVE)";; esac
+EOS
+cat >"$T/fakegnome/gnome-shell" <<'EOS'
+#!/bin/sh
+echo "GNOME Shell ${FAKE_SHELL_VERSION:-50.1}"
+EOS
+cat >"$T/fakegnome/busctl" <<'EOS'
+#!/bin/bash
+case "$*" in
+  *"get-property org.gnome.Shell /org/gnome/Shell org.gnome.Shell ShellVersion") [ -e "$FAKE_DIR/shell_running" ] && echo 's "50.1"';;
+  *"org.xwlbridge.Windows1 Version") [ -e "$FAKE_DIR/ext_active" ] && echo "u 1";;
+  *) false;;
+esac
+EOS
+chmod 755 "$T/fakegnome"/*
 
 conf() { mkdir -p "$XDG_CONFIG_HOME/xwlbridge"; printf '%s\n' "$@" >"$XDG_CONFIG_HOME/xwlbridge/xwlbridge.conf"; }
 
@@ -317,6 +360,7 @@ esac
 exit 0
 EOS
 chmod 755 "$T/fakebin/systemctl"
+cp "$T/fakegnome"/* "$T/fakebin/"
 # rpm as Debian/Ubuntu's rpm package behaves without a system database: it creates ~/.rpmdb. The HOME-as-before checks
 # below fail if any script calls rpm on such a system (CI runners have rpm installed).
 cat >"$T/fakebin/rpm" <<'EOS'
@@ -330,6 +374,8 @@ chmod 755 "$T/fakebin/rpm"
 # RealVNC Server "installed" for install.sh's service choice (realvnc when vncserver-x11 is on PATH)
 printf '#!/bin/sh\nexit 0\n' >"$T/fakebin/vncserver-x11"; chmod 755 "$T/fakebin/vncserver-x11"
 cp "$HERE/../install.sh" "$HERE/../uninstall.sh" "$HERE/../xwlbridge-realvnc.service.in" "$HERE/../xwlbridge.service.in" "$HERE/../xwlbridge-status.desktop.in" "$HERE/../xwlbridge.conf" "$T/pkg/bin/"
+EXT_UUID=xwlbridge-windows@xwlbridge
+mkdir -p "$T/pkg/bin/gnome-shell"; cp -r "$HERE/../../contrib/gnome-shell/$EXT_UUID" "$T/pkg/bin/gnome-shell/"   # the bundle's layout
 before=$(cd "$H2" && find . | sort)
 out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" 2>&1); rc=$?
 check "install.sh (no root, fake user manager) rc 0" test $rc -eq 0
@@ -342,11 +388,17 @@ check "  ...unit: a crash restarts, a stop is a success by its status 0 alone" b
   ! grep -qE "^[[:space:]]*RestartPreventExitStatus[[:space:]]*=.*\<(143|69|70|137|139)\>" "$1"' _ "$H2/.config/systemd/user/xwlbridge-realvnc.service"
 check "  ...settings 0600" test "$(stat -c %a "$H2/.config/xwlbridge/xwlbridge.conf")" = 600
 check "  ...app-grid entry" grep -qx "Exec=$H2/.local/bin/xwlbridge-ctl --realvnc show" "$H2/.local/share/applications/xwlbridge-status.desktop"
+E2=$H2/.local/share/gnome-shell/extensions/$EXT_UUID
+check "  ...window extension installed (metadata.json, extension.js)" bash -c 'cmp -s "$1/metadata.json" "$2/metadata.json" && cmp -s "$1/extension.js" "$2/extension.js"' _ "$E2" "$HERE/../../contrib/gnome-shell/$EXT_UUID"
+check "  ...and enabled for the next login (enabled-extensions)" grep -qF "'$EXT_UUID'" "$T/gsettings.d/enabled-extensions"
+check "  ...says a new extension needs one log-out/log-in" grep -q "installed and enabled. It starts after you log out and in once" <<<"$out"
+check "  ...manifest records that install.sh enabled it" grep -qx "extension-enabled $EXT_UUID" "$H2/.local/share/xwlbridge/manifest"
 out=$(HOME=$H2 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin:$T/empty:$SYS" bash "$H2/.local/share/xwlbridge/uninstall.sh" --purge 2>&1); rc=$?
 check "uninstall.sh --purge rc 0" test $rc -eq 0
 after=$(cd "$H2" && find . | sort)
 [ "$before" = "$after" ] || { echo "--- HOME difference (before vs after) for: ...HOME exactly as before the install"; diff <(echo "$before") <(echo "$after"); env | grep -E "^XDG_|^TMPDIR=|^HOME=" | sed "s/^/env: /"; }
 check "  ...HOME exactly as before the install" test "$before" = "$after"
+check "  ...uninstall disabled the window extension again" bash -c '! grep -qF "$1" "$2/gsettings.d/enabled-extensions"' _ "$EXT_UUID" "$T"
 
 # a user whose RealVNC settings already choose the port: left to RealVNC
 H3=$T/home3; mkdir -p "$H3/.vnc/config.d" "$H3/.cache"
@@ -401,13 +453,99 @@ out=$(HOME=$T/home5 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin
 check "install --port bogus -> refused" test $rc -ne 0
 
 # ---- install without RealVNC Server: the display service
-mkdir -p "$T/fakebin_norvnc"; cp "$T/fakebin/systemctl" "$T/fakebin_norvnc/"
+mkdir -p "$T/fakebin_norvnc"; cp "$T/fakebin/systemctl" "$T/fakegnome"/* "$T/fakebin_norvnc/"
 H10=$T/home10; mkdir -p "$H10"; : >"$T/systemctl.log"
 out=$(HOME=$H10 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin_norvnc:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start 2>&1); rc=$?
 check "install without RealVNC -> xwlbridge.service enabled" bash -c '[ $1 -eq 0 ] && grep -qx -- "--user enable xwlbridge.service" "$2" && ! grep -q -- "enable xwlbridge-realvnc.service" "$2"' _ $rc "$T/systemctl.log"
 check "  ...both units installed; the display unit runs --display run" bash -c 'grep -qx "ExecStart=$1/.local/bin/xwlbridge-ctl --display run" "$1/.config/systemd/user/xwlbridge.service" && [ -f "$1/.config/systemd/user/xwlbridge-realvnc.service" ]' _ "$H10"
 HOME=$H10 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$T PATH="$T/fakebin_norvnc:$T/empty:$SYS" bash "$H10/.local/share/xwlbridge/uninstall.sh" >/dev/null 2>&1
 check "  ...uninstall removes both units" bash -c '[ ! -e "$1/.config/systemd/user/xwlbridge.service" ] && [ ! -e "$1/.config/systemd/user/xwlbridge-realvnc.service" ]' _ "$H10"
+
+# ---- the window extension: opt-out, upgrades, a user's own choice, unsupported GNOME, no dconf
+FX=$T/fx; mkdir -p "$FX"
+xinst() { HOME=$1 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$FX PATH="$T/fakebin:$T/empty:$SYS" bash "$T/pkg/bin/install.sh" --bin "$T/pkg/bin/xwlbridge" --no-start "${@:2}" 2>&1; }
+xuninst() { HOME=$1 XDG_CONFIG_HOME= XDG_DATA_HOME= FAKE_DIR=$FX PATH="$T/fakebin:$T/empty:$SYS" bash "$1/.local/share/xwlbridge/uninstall.sh" "${@:2}" 2>&1; }
+enabled_list() { cat "$FX/gsettings.d/enabled-extensions" 2>/dev/null; }
+H20=$T/home20; mkdir -p "$H20/.local/share/gnome-shell/extensions/someone@else"   # the user's own extensions dir
+printf '%s\n' "['someone@else']" >"$FX/gsettings.d/enabled-extensions" 2>/dev/null || { mkdir -p "$FX/gsettings.d"; printf '%s\n' "['someone@else']" >"$FX/gsettings.d/enabled-extensions"; }
+E20=$H20/.local/share/gnome-shell/extensions/$EXT_UUID
+out=$(xinst "$H20"); rc=$?
+check "extension: install keeps the user's other extensions enabled" bash -c '[ $1 -eq 0 ] && [ "$(cat "$2/gsettings.d/enabled-extensions")" = "['"'"'someone@else'"'"', '"'"'$3'"'"']" ]' _ $rc "$FX" "$EXT_UUID"
+out=$(xinst "$H20"); rc=$?
+check "  ...an upgrade with nothing new: listed once, no log-out note" bash -c '[ $1 -eq 0 ] && [ "$(grep -o "$3" "$2/gsettings.d/enabled-extensions" | wc -l)" = 1 ] && ! grep -q "^==> GNOME Shell extension.*log out" <<<"$4" && grep -q "^==> GNOME Shell extension $3: installed and enabled\$" <<<"$4"' _ $rc "$FX" "$EXT_UUID" "$out"
+printf '// a newer version\n' >>"$E20/extension.js"
+out=$(xinst "$H20")
+check "  ...an upgrade that changes it: runs after the next login" grep -q "updated; GNOME runs the new version after you log out and in once" <<<"$out"
+# the user turned it off in the Extensions app: an upgrade respects that
+printf '%s\n' "['someone@else']" >"$FX/gsettings.d/enabled-extensions"; printf '%s\n' "['$EXT_UUID']" >"$FX/gsettings.d/disabled-extensions"
+out=$(xinst "$H20")
+check "  ...turned off by the user: an upgrade keeps it off" bash -c 'grep -q "kept disabled" <<<"$1" && [ "$(cat "$2/gsettings.d/enabled-extensions")" = "['"'"'someone@else'"'"']" ]' _ "$out" "$FX"
+# ...also when it was only taken off enabled-extensions
+rm -f "$FX/gsettings.d/disabled-extensions"
+out=$(xinst "$H20")
+check "  ...taken off enabled-extensions only: still kept off" bash -c 'grep -q "kept disabled" <<<"$1" && [ "$(cat "$2/gsettings.d/enabled-extensions")" = "['"'"'someone@else'"'"']" ]' _ "$out" "$FX"
+printf '%s\n' "['someone@else', '$EXT_UUID']" >"$FX/gsettings.d/enabled-extensions"
+# --no-extension on an install that has it: removed, disabled, extension=off kept for later upgrades
+out=$(xinst "$H20" --no-extension); rc=$?
+check "--no-extension: removes the extension it installed and disables it" bash -c '[ $1 -eq 0 ] && [ ! -e "$2" ] && [ "$(cat "$3/gsettings.d/enabled-extensions")" = "['"'"'someone@else'"'"']" ]' _ $rc "$E20" "$FX"
+check "  ...the user's own extensions dir is kept" test -d "$H20/.local/share/gnome-shell/extensions/someone@else"
+check "  ...settings: extension=off" grep -qx "extension=off" "$H20/.config/xwlbridge/xwlbridge.conf"
+check "  ...manifest no longer lists its files or that it was enabled" bash -c '! grep -qE "^(file .*$1/|extension-enabled )" "$2"' _ "$EXT_UUID" "$H20/.local/share/xwlbridge/manifest"
+out=$(xinst "$H20")
+check "  ...a later upgrade leaves it out (extension=off)" bash -c '[ ! -e "$1" ] && grep -q "not installed (extension=off" <<<"$2"' _ "$E20" "$out"
+xuninst "$H20" >/dev/null
+check "  ...uninstall keeps the user's other extensions" bash -c '[ -d "$1/.local/share/gnome-shell/extensions/someone@else" ] && [ "$(cat "$2/gsettings.d/enabled-extensions")" = "['"'"'someone@else'"'"']" ]' _ "$H20" "$FX"
+# a fresh install with --no-extension
+H21=$T/home21; mkdir -p "$H21"; before=$(cd "$H21" && find . | sort); : >"$FX/gnome.log"
+out=$(xinst "$H21" --no-extension); rc=$?
+check "fresh install --no-extension: no extension, no GNOME setting written" bash -c '[ $1 -eq 0 ] && [ ! -e "$2/.local/share/gnome-shell" ] && ! grep -q "^gsettings set" "$3/gnome.log" && grep -qx "extension=off" "$2/.config/xwlbridge/xwlbridge.conf"' _ $rc "$H21" "$FX"
+xuninst "$H21" --purge >/dev/null; after=$(cd "$H21" && find . | sort)
+check "  ...uninstall --purge: HOME as before" test "$before" = "$after"
+# GNOME Shell 46: the extension is for 49 and 50
+H22=$T/home22; mkdir -p "$H22"
+out=$(FAKE_SHELL_VERSION=46.0 xinst "$H22")
+check "GNOME Shell 46: extension not installed, said why" bash -c '[ ! -e "$1/.local/share/gnome-shell" ] && grep -q "it is for GNOME Shell 49 and 50; this is 46" <<<"$2"' _ "$H22" "$out"
+xuninst "$H22" >/dev/null
+# GNOME settings not writable here (gsettings' memory backend: no session bus / dconf)
+H23=$T/home23; mkdir -p "$H23"; : >"$FX/gs_memory_backend"
+out=$(xinst "$H23"); rc=$?
+rm -f "$FX/gs_memory_backend"
+check "settings not writable: files installed, the user is told how to enable it" bash -c '[ $1 -eq 0 ] && [ -f "$2/.local/share/gnome-shell/extensions/$4/extension.js" ] && grep -q "could not enable it" <<<"$3" && grep -q "gnome-extensions enable $4" <<<"$3"' _ $rc "$H23" "$out" "$EXT_UUID"
+check "  ...manifest: not recorded as enabled" bash -c '! grep -q "^extension-enabled" "$1"' _ "$H23/.local/share/xwlbridge/manifest"
+xuninst "$H23" >/dev/null
+check "  ...uninstall removes the files" test ! -e "$H23/.local/share/gnome-shell"
+
+# ---- the extension setting: validation, the bridge's environment, doctor
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "extension=maybe"
+PATH="$T/empty:$SYS" "$C" command >/dev/null 2>"$T/err"; rc=$?
+check "extension=maybe -> exit 78, named" bash -c '[ $1 -eq 78 ] && grep -qF "extension: '"'"'maybe'"'"' is not auto or off" "$2"' _ $rc "$T/err"
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "extension=off"
+PATH="$T/empty:$SYS" "$C" command >/dev/null 2>"$T/err"
+check "extension=off: command names the bridge's environment" grep -q "environment: XWLBRIDGE_WINDOWS_EXTENSION=off" "$T/err"
+out=$(PATH="$T/empty:$SYS" "$C" run 2>/dev/null)
+check "  ...run gives it to the bridge" grep -qx "ENV_WINDOWS_EXTENSION=off" <<<"$out"
+out=$(PATH="$T/empty:$SYS" "$C" --display run 2>/dev/null)
+check "  ...--display run too" grep -qx "ENV_WINDOWS_EXTENSION=off" <<<"$out"
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5"
+out=$(env -u XWLBRIDGE_WINDOWS_EXTENSION PATH="$T/empty:$SYS" "$C" run 2>/dev/null)
+check "extension=auto (default): nothing set for the bridge" grep -qx "ENV_WINDOWS_EXTENSION=unset" <<<"$out"
+if command -v python3 >/dev/null; then
+  FD=$T/fd; mkdir -p "$FD/gsettings.d"
+  wdoc() { FAKE_DIR=$FD PATH="$T/fakegnome:$T/empty:$SYS" "$C" "$@" doctor --json 2>/dev/null | python3 -c 'import json,sys; c=[c for c in json.load(sys.stdin)["checks"] if c["id"]=="gnome.windows_extension"]; print(c[0]["status"] + " " + c[0]["summary"] if c else "missing")'; }
+  out=$(wdoc); check "doctor: window extension not installed -> info" grep -q "^info .*is not installed" <<<"$out"
+  out=$(wdoc --display); check "  ...the display service's doctor checks it too" grep -q "^info .*is not installed" <<<"$out"
+  WE=$HOME/.local/share/gnome-shell/extensions/$EXT_UUID; mkdir -p "$WE"; cp "$HERE/../../contrib/gnome-shell/$EXT_UUID/metadata.json" "$WE/"
+  out=$(wdoc); check "doctor: installed, not enabled -> warn" grep -q "^warn .*installed (.*) but not enabled" <<<"$out"
+  printf '%s\n' "['$EXT_UUID']" >"$FD/gsettings.d/enabled-extensions"; : >"$FD/shell_running"
+  out=$(wdoc); check "doctor: enabled but not loaded by this session -> warn: log out and in" grep -q "^warn .*has not loaded it: log out and in once" <<<"$out"
+  : >"$FD/ext_active"
+  out=$(wdoc); check "doctor: active -> ok with version and API" grep -q "^ok window extension $EXT_UUID 1.0 is active (API v1)" <<<"$out"
+  rm -f "$FD/ext_active"; printf 'true\n' >"$FD/gsettings.d/disable-user-extensions"
+  out=$(wdoc); check "doctor: user extensions turned off by GNOME -> warn" grep -q "^warn .*GNOME has turned off all user extensions" <<<"$out"
+  conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "extension=off"
+  out=$(wdoc); check "doctor: extension=off -> info" grep -q "^info .*turned off (extension=off)" <<<"$out"
+  rm -rf "$HOME/.local/share/gnome-shell"
+fi
 
 # ---- migrate: an xwlrvnc install (unit enabled and running, settings) is taken over
 mkdir -p "$T/fakemig"
@@ -431,6 +569,7 @@ esac
 exit 0
 EOS
 chmod 755 "$T/fakemig/systemctl"
+cp "$T/fakegnome"/* "$T/fakemig/"
 H11=$T/home11; mkdir -p "$H11/.config/xwlrvnc" "$H11/.config/systemd/user"
 printf '%s\n' '# xwlrvnc settings' 'engine=xvnc' 'rfb_port=5910' 'bridge=/opt/old/bin/xwlrvnc' 'bridge_args=-fps 30' >"$H11/.config/xwlrvnc/xwlrvnc.conf"
 : >"$H11/.config/systemd/user/xwlrvnc.service"

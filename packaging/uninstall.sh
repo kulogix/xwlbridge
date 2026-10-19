@@ -1,6 +1,7 @@
 #!/bin/bash
 # Removes what install.sh installed for the current user: stops and disables the
-# services, deletes the programs, the unit, the settings and runtime files.
+# services and the GNOME Shell extension, deletes the programs, the units, the
+# extension, the settings and runtime files.
 #
 #   ~/.local/share/xwlbridge/uninstall.sh [--keep-config] [--purge] [--prefix DIR]
 #
@@ -42,6 +43,37 @@ for UNIT in $UNITS; do
   rm -f -- "$CONF_HOME/systemd/user/graphical-session.target.wants/$UNIT" "$CONF_HOME/systemd/user/default.target.wants/$UNIT"
   rm -rf -- "$CONF_HOME/systemd/user/$UNIT.d"
 done
+
+# 1b. the GNOME Shell extension xwlbridge-windows@xwlbridge: disabled again if install.sh enabled it (its files
+# go with the manifest below). A running GNOME stops it now; its entries leave enabled/disabled-extensions.
+EXT_UUID=xwlbridge-windows@xwlbridge
+gs_list() {  # gs_list KEY: org.gnome.shell's string list KEY, one item per line
+  local v it
+  v=$(timeout 5 gsettings get org.gnome.shell "$1" 2>/dev/null) || return 1
+  case $v in *'"'*|*'\'*) return 1;; esac
+  v=${v#@as }; v=${v#[}; v=${v%]}
+  local IFS=,
+  for it in $v; do
+    it=${it#"${it%%[![:space:]]*}"}; it=${it%"${it##*[![:space:]]}"}; it=${it#\'}; it=${it%\'}
+    [ -n "$it" ] && printf '%s\n' "$it"
+  done
+  return 0
+}
+gs_drop() {  # gs_drop KEY ITEM: removes ITEM from the list KEY
+  local items out="" it
+  items=$(gs_list "$1") || return 1
+  grep -qxF -- "$2" <<<"$items" || return 0
+  while IFS= read -r it; do [ -n "$it" ] && [ "$it" != "$2" ] && out+="${out:+, }'$it'"; done <<<"$items"
+  timeout 5 gsettings set org.gnome.shell "$1" "[$out]" 2>/dev/null
+}
+if grep -qxF "extension-enabled $EXT_UUID" "$MANIFEST"; then
+  timeout 5 gnome-extensions disable "$EXT_UUID" >/dev/null 2>&1
+  if gs_drop enabled-extensions "$EXT_UUID" && gs_drop disabled-extensions "$EXT_UUID"; then
+    say "disabled the GNOME Shell extension $EXT_UUID"
+  else
+    say "could not change GNOME's extension settings here; after this, run in your session: gnome-extensions disable $EXT_UUID"
+  fi
+fi
 
 # 2. RealVNC's per-user files that appeared since the first install (--purge)
 if [ $PURGE = 1 ] && [ -d "$HOME/.vnc" ] && [ ! -L "$HOME/.vnc" ] && [ ! -f "$SHARE/vnc-before.list" ]; then
