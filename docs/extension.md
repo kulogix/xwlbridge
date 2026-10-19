@@ -144,6 +144,13 @@ runs a release bundle's `install.sh`, then GNOME Shell ("the next login": the ex
 `xwlbridge-ctl doctor` and `uninstall.sh` (the running shell stops the extension; files and settings entries
 are gone). `packaging/tests/test_ctl.sh` covers the installer's choices with fakes (opt-out, upgrades, a user
 who turned the extension off, GNOME older than 49, settings that cannot be written).
-Not covered here: a real user drag (the `user` flag), several workspaces. The bridge's side is unit-tested in
-`src/xvfb/winsync.rs` (the sync's decisions) and was run against this extension in a headless gnome-shell (see
-the release notes).
+Not covered here: a real user drag (the `user` flag), several workspaces.
+
+The bridge's side: `src/xvfb/winsync.rs` unit-tests the sync's decisions, and
+`contrib/gnome-shell/tests/run_bridge_sync.sh BRIDGE [sync|off]` runs a bridge binary with `-showwindows` against
+this extension in a scratch headless gnome-shell (xlogo and xeyes moved, resized, raised and flagged from the X
+side, and from the desktop by a probe extension): placement at map, self-moves and the clamp, desktop moves,
+an animation's coalescing, a self-resize, stacking both ways, raise gating, keep-above, the extension going and
+coming back (as at the lock screen) and maximise (22 checks); `off` checks the 0.1.2 behaviour with
+`XWLBRIDGE_WINDOWS_EXTENSION=off` (5 checks). A held-button drag is not covered: the headless shell has no
+pointer.
