@@ -42,7 +42,24 @@
 //!   (`Track::expectations`: on at its velocity, slowing down to a stop if it
 //!   slows, and its last step again; either may be right, as event times can
 //!   be jittered and steps irregular, so a candidate is scored against both,
-//!   each as good as it has been lately).
+//!   each as good as it has been lately);
+//! - an origin whose MoveResize is unanswered is where the desktop will put
+//!   the window, which is not always where it was asked to: mutter keeps part
+//!   of a window on the monitors' work areas, user moves included, so a drag
+//!   past an edge is held there on every request. The bounds the replies
+//!   showed are learned (`Bounds`) and an unanswered origin is placed inside
+//!   them; a reply that went past a bound as asked drops it (another monitor);
+//! - the X pointer follows one account of the drag (the main `Path`), which
+//!   never goes back to an origin older than its own last one: events are
+//!   made in order and the window goes through the origins in order. Its
+//!   predictions come from its own picks, and the X client's moves, which
+//!   become the next origins, follow those picks too: a wrong pick followed
+//!   by one wrong the other way grew without bound (an absolute pointer that
+//!   repeats positions or steps unevenly: 6232 px), and the order rules that
+//!   out. Beside it, the most likely account of the drag up to each origin is
+//!   kept, each judged by its own predictions, with room for a sudden turn;
+//!   the X pointer moves over to one only when it explains the frames clearly
+//!   better than the main one (`SWITCH_MARGIN`).
 //!
 //! Model-checked against a simulation (tests below): the compositor (moves
 //! taking effect once applied or once laid out at the next frame, events made
@@ -50,8 +67,10 @@
 //! busy), random latencies on both connections, the X client moving its
 //! window with the pointer, the bridge pacing its MoveResize requests. The
 //! simulation reproduces what was measured with both earlier rules
-//! (research/release/p1/p1-validate.md); `sweep` compares the rules over event
-//! rates, slowing drags and irregular event times.
+//! (research/release/p1/p1-validate.md) and the review of the first version
+//! of this one (p1-absdrag-review.md: a drag the desktop holds at an edge,
+//! repeated and uneven absolute positions); `sweep` compares the rules over
+//! event rates, slowing drags and irregular event times.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -104,6 +123,26 @@ const CLOCK_SLACK_MS: u32 = 1000;
 /// no frame callback said so (a hidden window gets none).
 pub const SETTLE: Duration = Duration::from_millis(250);
 
+/// How much more likely another account of the drag must be than the main
+/// one before the X pointer follows it instead (a negative log-likelihood
+/// difference): enough that a coincidence does not move it, little enough
+/// that a run of wrong picks does (each costs several).
+const SWITCH_MARGIN: f64 = 10.0;
+
+/// How an account of the drag weighs a frame that none of its predictions
+/// expected (a sudden turn, an uneven step): per axis, a broad component of
+/// this weight and spread (px) beside each prediction's own, so that one
+/// such frame costs it a few units, not hundreds.
+const TURN_WEIGHT: f64 = 0.05;
+const TURN_SPREAD: f64 = 16.0;
+
+/// The accounts of the drag kept beside the main one (one per origin, the
+/// most likely first).
+const MAX_PATHS: usize = 8;
+
+/// ln(sqrt(2 pi)): the normal density's constant, per axis.
+const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_8;
+
 /// The pointer's last positions, for predicting the next one.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Track {
@@ -126,9 +165,14 @@ pub struct Track {
     /// decaying): by velocity and time, and by the last step. Times can be
     /// jittered (a pointer over a network: the compositor stamps arrival),
     /// and steps can be irregular (a device whose events the compositor
-    /// merges per frame); whichever has been right lately is used.
+    /// merges per frame); whichever has been right lately is used. Scored
+    /// only where the position is certain (`score`).
     err_time: f64,
     err_step: f64,
+    /// The same over every position of one account of the drag
+    /// (`score_path`): how well that account explains its own frames.
+    path_time: f64,
+    path_step: f64,
 }
 
 /// The weight of the newest error in `Track`'s decaying means.
@@ -189,21 +233,45 @@ impl Track {
     /// The pointer was in fact at `pos` at `time` (a frame with one possible
     /// origin): how far off each prediction was. Before `update`.
     pub fn score(&mut self, pos: Pos, time: Option<u32>) {
-        if self.paused(time) {
-            return;
-        }
-        let off = |p: Option<Pos>| p.map(|p| (p.0 - pos.0).powi(2) + (p.1 - pos.1).powi(2));
-        let (t, s) = (off(self.by_time(time)), off(self.by_step()));
-        if let (Some(t), Some(s)) = (t, s) {
+        if let Some((t, s)) = self.misses(pos, time) {
             self.err_time += ERR_WEIGHT * (t - self.err_time);
             self.err_step += ERR_WEIGHT * (s - self.err_step);
         }
+    }
+
+    /// The pointer was at `pos` at `time` on the account of the drag this
+    /// track is (`SelfDrag`'s paths): how far off each prediction was along
+    /// it. Before `update`.
+    fn score_path(&mut self, pos: Pos, time: Option<u32>) {
+        if let Some((t, s)) = self.misses(pos, time) {
+            self.path_time += ERR_WEIGHT * (t - self.path_time);
+            self.path_step += ERR_WEIGHT * (s - self.path_step);
+        }
+    }
+
+    /// How far (squared px) each prediction is from `pos` at `time`, unless
+    /// after a pause.
+    fn misses(&self, pos: Pos, time: Option<u32>) -> Option<(f64, f64)> {
+        if self.paused(time) {
+            return None;
+        }
+        let off = |p: Option<Pos>| p.map(|p| (p.0 - pos.0).powi(2) + (p.1 - pos.1).powi(2));
+        off(self.by_time(time)).zip(off(self.by_step()))
     }
 
     /// Where the pointer may be at `time`, each with how far off that
     /// prediction has been lately (px): by velocity and time, and by the last
     /// step; where it is after a pause.
     pub fn expectations(&self, time: Option<u32>) -> Vec<(Pos, f64)> {
+        self.expect(time, (self.err_time, self.err_step))
+    }
+
+    /// The same, each as good as it has been along this account of the drag.
+    fn path_expectations(&self, time: Option<u32>) -> Vec<(Pos, f64)> {
+        self.expect(time, (self.path_time, self.path_step))
+    }
+
+    fn expect(&self, time: Option<u32>, (err_time, err_step): (f64, f64)) -> Vec<(Pos, f64)> {
         let Some(pos) = self.pos else {
             return Vec::new();
         };
@@ -213,10 +281,10 @@ impl Track {
         let spread = |err: f64| err.sqrt().max(MIN_SPREAD);
         let mut v = Vec::with_capacity(2);
         if let Some(p) = self.by_time(time) {
-            v.push((p, spread(self.err_time)));
+            v.push((p, spread(err_time)));
         }
         if let Some(p) = self.by_step() {
-            v.push((p, spread(self.err_step)));
+            v.push((p, spread(err_step)));
         }
         v
     }
@@ -347,12 +415,81 @@ impl Parts {
 #[derive(Clone, Copy, Debug)]
 struct Origin {
     at: (i32, i32),
+    /// `at` is the position asked for, not one the desktop told (the drag's
+    /// start and an answered MoveResize are those).
+    asked: bool,
     /// When its MoveResize was sent, on CLOCK_MONOTONIC (ms), if known.
     sent: Option<u32>,
     /// Its MoveResize was answered (when): `at` is what the desktop applied.
     reply: Option<Instant>,
     /// Its MoveResize was refused: the window never went there.
     refused: bool,
+}
+
+/// Where the desktop has held the window during the drag, per axis (x, y):
+/// the least and the most position a reply put it at in place of one beyond
+/// (mutter's constrain_partially_onscreen keeps part of a window on the
+/// monitors' work areas, user moves included). A drag past an edge is held
+/// there on every request, so a request not yet answered is placed inside
+/// what the replies showed; a reply that went past a bound as asked drops it
+/// (the window has gone where another monitor lets it).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Bounds {
+    least: [Option<i32>; 2],
+    most: [Option<i32>; 2],
+}
+
+impl Bounds {
+    /// The desktop put the window at `applied` for a request to `requested`.
+    fn learn(&mut self, requested: (i32, i32), applied: (i32, i32)) {
+        for (axis, (r, a)) in [(requested.0, applied.0), (requested.1, applied.1)]
+            .into_iter()
+            .enumerate()
+        {
+            if a > r {
+                self.least[axis] = Some(a);
+            } else if a < r {
+                self.most[axis] = Some(a);
+            } else {
+                if self.least[axis].is_some_and(|b| r < b) {
+                    self.least[axis] = None;
+                }
+                if self.most[axis].is_some_and(|b| r > b) {
+                    self.most[axis] = None;
+                }
+            }
+        }
+    }
+
+    /// Where a request to `at` will put the window, as far as the replies
+    /// so far tell.
+    fn place(&self, at: (i32, i32)) -> (i32, i32) {
+        let one = |v: i32, axis: usize| {
+            let v = self.least[axis].map_or(v, |b| v.max(b));
+            self.most[axis].map_or(v, |b| v.min(b))
+        };
+        (one(at.0, 0), one(at.1, 1))
+    }
+}
+
+/// One account of the drag so far: the pointer's track through one sequence
+/// of the window's origins, the newest of them (its number `at`), and how
+/// unlikely the account is (`cost`, a negative log-likelihood of its frames,
+/// less that of the most likely account).
+#[derive(Clone, Copy, Debug)]
+struct Path {
+    track: Track,
+    at: usize,
+    cost: f64,
+}
+
+/// Where the pointer is if a frame was made with origin number `n`.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    n: usize,
+    pos: Pos,
+    /// The origin's MoveResize was sent after the frame's event was made.
+    late: bool,
 }
 
 /// The pointer of one held-button self-drag of a synced toplevel.
@@ -362,7 +499,11 @@ pub struct SelfDrag {
     /// each MoveResize sent, in order; `origins[0]` is number `base`.
     origins: VecDeque<Origin>,
     base: usize,
-    track: Track,
+    bounds: Bounds,
+    /// The account of the drag the X pointer follows.
+    main: Path,
+    /// The most likely account up to each origin, the most likely first.
+    paths: Vec<Path>,
     /// The last surface-local position a frame had.
     surface: Option<Pos>,
 }
@@ -372,15 +513,23 @@ impl SelfDrag {
     /// it under way), with the pointer's track so far and its last
     /// surface-local position on the window.
     pub fn new(origin: (i32, i32), track: Track, surface: Option<Pos>) -> SelfDrag {
+        let main = Path {
+            track,
+            at: 0,
+            cost: 0.0,
+        };
         SelfDrag {
             origins: VecDeque::from([Origin {
                 at: origin,
+                asked: false,
                 sent: None,
                 reply: None,
                 refused: false,
             }]),
             base: 0,
-            track,
+            bounds: Bounds::default(),
+            main,
+            paths: vec![main],
             surface,
         }
     }
@@ -391,6 +540,7 @@ impl SelfDrag {
     pub fn sent(&mut self, at: (i32, i32), ms: Option<u32>) -> usize {
         self.origins.push_back(Origin {
             at,
+            asked: true,
             sent: ms,
             reply: None,
             refused: false,
@@ -416,7 +566,9 @@ impl SelfDrag {
         }
         let o = &mut self.origins[i];
         o.at = applied;
+        o.asked = false;
         o.reply = Some(now);
+        self.bounds.learn(requested, applied);
         Some(self.base + i)
     }
 
@@ -478,56 +630,115 @@ impl SelfDrag {
                 elapsed(Some(t), Some(sent)).is_some_and(|d| d > SENT_AFTER_MS)
             })
         };
-        let expects: Vec<(Pos, f64)> = match (f.rel, self.track.pos()) {
-            (Some(d), Some(p)) => vec![((p.0 + d.0, p.1 + d.1), REL_SPREAD)],
-            _ => self.track.expectations(f.time),
-        };
-        // the most likely origin: its candidate near where the pointer is
-        // expected (a mixture of the expectations, each as good as it has
-        // been lately), and not sent after the event was made
-        let cost = |c: Pos, o: &Origin| {
-            let terms: Vec<f64> = expects
-                .iter()
-                .map(|&(e, s)| {
-                    let d = (c.0 - e.0).powi(2) + (c.1 - e.1).powi(2);
-                    -d / (2.0 * s * s) - 2.0 * s.ln()
-                })
-                .collect();
-            let top = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let near = if terms.is_empty() {
-                0.0
-            } else {
-                -(top + terms.iter().map(|t| (t - top).exp()).sum::<f64>().ln())
-            };
-            near + if late(o) { SENT_AFTER_COST } else { 0.0 }
-        };
+        let candidates: Vec<Candidate> = self
+            .origins
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| !o.refused)
+            .map(|(i, o)| {
+                let at = if o.asked {
+                    self.bounds.place(o.at)
+                } else {
+                    o.at
+                };
+                Candidate {
+                    n: self.base + i,
+                    pos: (f64::from(at.0) + s.0, f64::from(at.1) + s.1),
+                    late: late(o),
+                }
+            })
+            .collect();
+        let late_cost = |c: &Candidate| if c.late { SENT_AFTER_COST } else { 0.0 };
+        // the main account goes on to the most likely origin, not older than
+        // its own last: its candidate near where the pointer is expected (a
+        // mixture of the expectations, each as good as it has been lately),
+        // and not sent after the event was made
+        let main = self.main;
+        let expects = expectations(&main.track, &f, false);
+        let mut pick: Option<(&Candidate, f64)> = None;
+        for any in [false, true] {
+            for c in candidates.iter().filter(|c| any || c.n >= main.at) {
+                let k = near(&expects, c.pos) + late_cost(c);
+                // the oldest of equals; without an expectation, the newest
+                if pick.is_none_or(|b| k < b.1 || (expects.is_empty() && k <= b.1)) {
+                    pick = Some((c, k));
+                }
+            }
+            if pick.is_some() {
+                break;
+            }
+        }
+        let (c, _) = pick?;
+        let mut chosen = (
+            Path {
+                at: c.n,
+                cost: main.cost
+                    + unlikely(&expectations(&main.track, &f, true), c.pos)
+                    + late_cost(c),
+                ..main
+            },
+            c.pos,
+        );
+        // the most likely account up to each origin, the main one's included
+        let mut next: Vec<(Path, Pos)> = Vec::new();
+        for any in [false, true] {
+            for p in self.paths.iter().chain(std::iter::once(&main)) {
+                let e = expectations(&p.track, &f, true);
+                for c in candidates.iter().filter(|c| any || c.n >= p.at) {
+                    let cost = p.cost + unlikely(&e, c.pos) + late_cost(c);
+                    let path = Path {
+                        at: c.n,
+                        cost,
+                        ..*p
+                    };
+                    match next.iter_mut().find(|(q, _)| q.at == c.n) {
+                        Some(q) if cost < q.0.cost => *q = (path, c.pos),
+                        Some(_) => {}
+                        None => next.push((path, c.pos)),
+                    }
+                }
+            }
+            if !next.is_empty() {
+                break;
+            }
+        }
+        // the X pointer moves over to another account only when it explains
+        // the frames clearly better
+        if let Some(best) = next
+            .iter()
+            .min_by(|a, b| a.0.cost.total_cmp(&b.0.cost).then(a.0.at.cmp(&b.0.at)))
+            && best.0.cost + SWITCH_MARGIN < chosen.0.cost
+        {
+            chosen = *best;
+        }
+        let pos = chosen.1;
         // what a frame's relative motion says, which proves an origin
-        let rel_expect = expects.first().map(|e| e.0).filter(|_| f.rel.is_some());
-        let mut best: Option<(usize, f64, Pos)> = None;
-        let mut candidates = 0;
-        for (i, o) in self.origins.iter().enumerate() {
-            if o.refused {
-                continue;
-            }
-            candidates += 1;
-            let c = (f64::from(o.at.0) + s.0, f64::from(o.at.1) + s.1);
-            let k = cost(c, o);
-            // the oldest of equals; without an expectation, the newest
-            if best.is_none_or(|b| k < b.1 || (expects.is_empty() && k <= b.1)) {
-                best = Some((i, k, c));
-            }
-        }
-        let (i, _, pos) = best?;
-        let proved = rel_expect
-            .is_some_and(|e| (pos.0 - e.0).abs() < REL_MATCH && (pos.1 - e.1).abs() < REL_MATCH);
-        if proved {
+        let rel_match = |p: &Path, at: Pos| {
+            f.rel.zip(p.track.pos()).is_some_and(|(d, q)| {
+                (at.0 - (q.0 + d.0)).abs() < REL_MATCH && (at.1 - (q.1 + d.1)).abs() < REL_MATCH
+            })
+        };
+        if rel_match(&chosen.0, pos) {
             // the relative motion proves the origin the compositor used
-            self.laid_out(self.base + i);
+            self.laid_out(chosen.0.at);
         }
-        if proved || candidates == 1 {
-            self.track.score(pos, f.time);
+        let one = candidates.len() == 1;
+        let least = next
+            .iter()
+            .map(|(p, _)| p.cost)
+            .fold(chosen.0.cost, f64::min);
+        for (p, at) in next.iter_mut().chain(std::iter::once(&mut chosen)) {
+            if one || rel_match(p, *at) {
+                p.track.score(*at, f.time);
+            }
+            p.track.score_path(*at, f.time);
+            p.track.update(*at, f.time);
+            p.cost -= least;
         }
-        self.track.update(pos, f.time);
+        next.sort_by(|a, b| a.0.cost.total_cmp(&b.0.cost));
+        next.truncate(MAX_PATHS);
+        self.paths = next.into_iter().map(|(p, _)| p).collect();
+        self.main = chosen.0;
         Some(pos)
     }
 
@@ -543,6 +754,58 @@ impl SelfDrag {
             self.laid_out(self.base + i);
         }
     }
+}
+
+/// A frame's expectations on track `t`: where its relative motion leads, or
+/// where the track's predictions do, each as good as it has been where the
+/// position was certain, or (`path`) along the track's own account.
+fn expectations(t: &Track, f: &Frame, path: bool) -> Vec<(Pos, f64)> {
+    match (f.rel, t.pos()) {
+        (Some(d), Some(p)) => vec![((p.0 + d.0, p.1 + d.1), REL_SPREAD)],
+        _ if path => t.path_expectations(f.time),
+        _ => t.expectations(f.time),
+    }
+}
+
+/// How unlikely position `c` is under `expects` (a negative log-likelihood
+/// of a mixture of normal distributions): the pick of one frame's origin.
+fn near(expects: &[(Pos, f64)], c: Pos) -> f64 {
+    let terms: Vec<f64> = expects
+        .iter()
+        .map(|&(e, s)| {
+            let d = (c.0 - e.0).powi(2) + (c.1 - e.1).powi(2);
+            -d / (2.0 * s * s) - 2.0 * s.ln()
+        })
+        .collect();
+    -log_sum(&terms)
+}
+
+/// The same for an account of the drag, which must survive a frame none of
+/// its predictions expected (a sudden turn, an uneven step): per axis, each
+/// prediction's normal distribution with a broad one beside it
+/// (`TURN_WEIGHT`, `TURN_SPREAD`), the predictions weighed alike.
+fn unlikely(expects: &[(Pos, f64)], c: Pos) -> f64 {
+    let normal = |d: f64, s: f64| -d * d / (2.0 * s * s) - s.ln() - LN_SQRT_2PI;
+    let axis = |d: f64, s: f64| {
+        log_sum(&[
+            (1.0 - TURN_WEIGHT).ln() + normal(d, s),
+            TURN_WEIGHT.ln() + normal(d, TURN_SPREAD.max(s)),
+        ])
+    };
+    let terms: Vec<f64> = expects
+        .iter()
+        .map(|&(e, s)| axis(c.0 - e.0, s) + axis(c.1 - e.1, s) - (expects.len() as f64).ln())
+        .collect();
+    -log_sum(&terms)
+}
+
+/// ln(sum(exp(terms))), 0 for none.
+fn log_sum(terms: &[f64]) -> f64 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let top = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    top + terms.iter().map(|t| (t - top).exp()).sum::<f64>().ln()
 }
 
 /// The X root position of desktop position `pos`, on the X screen.
@@ -735,6 +998,8 @@ mod tests {
             untimed: 0,
             err_time: err,
             err_step: err + 5.0,
+            path_time: err,
+            path_step: err + 5.0,
         };
         // both predictions say 419.8: the newer origin's candidate (420)
         let drag = |err: f64, sent: u32| {
@@ -905,6 +1170,84 @@ mod tests {
         assert_eq!(p, Some((5.0, 5.0)));
     }
 
+    /// What the replies showed of the desktop's constraints (p1-absdrag-
+    /// review F1), and a bound another monitor lifts.
+    #[test]
+    fn the_desktop_holds_a_window_where_its_replies_showed() {
+        let mut b = Bounds::default();
+        assert_eq!(b.place((10, -30)), (10, -30));
+        // the top edge held the window at y 32 (asked -30)
+        b.learn((10, -30), (10, 32));
+        assert_eq!(b.place((14, -40)), (14, 32));
+        assert_eq!(b.place((14, 50)), (14, 50), "below the edge: as asked");
+        // the right edge, as far as one monitor goes
+        b.learn((900, 40), (780, 40));
+        assert_eq!(b.place((950, 0)), (780, 32));
+        // another monitor lets it further right, as asked: that bound is gone
+        b.learn((820, 40), (820, 40));
+        assert_eq!(b.place((950, 0)), (950, 32));
+        // a move inside the bound left keeps it
+        b.learn((100, 100), (100, 100));
+        assert_eq!(b.place((14, -40)), (14, 32));
+    }
+
+    /// A move not yet answered is where the desktop will hold the window,
+    /// not where it was asked to go.
+    #[test]
+    fn an_unanswered_move_past_an_edge_is_where_the_desktop_holds_it() {
+        let t = t0();
+        let mut d = SelfDrag::new((300, 130), Track::default(), Some((110.0, 80.0)));
+        d.sent((310, 110), None);
+        assert_eq!(d.applied((310, 110), (310, 120), t), Some(1), "held at 120");
+        d.sent((315, 100), None);
+        d.laid_out(2); // the only origin left
+        let f = Frame {
+            surface: Some((110.0, 70.0)),
+            rel: None,
+            time: None,
+        };
+        assert_eq!(d.frame(f, t, None), Some((425.0, 190.0)), "not 425,170");
+        assert_eq!(d.applied((315, 100), (315, 120), t), Some(2));
+        // the drag's start is where the desktop had the window, bounds or not
+        let mut still = Track::default();
+        still.update((410.0, 180.0), Some(1000));
+        let mut d = SelfDrag::new((300, 100), still, Some((110.0, 80.0)));
+        d.sent((300, 90), None);
+        d.applied((300, 90), (300, 120), t);
+        let f = Frame {
+            surface: None,
+            rel: None,
+            time: Some(2000),
+        };
+        assert_eq!(d.frame(f, t, None), Some((410.0, 180.0)), "not 410,200");
+    }
+
+    /// The window goes through its origins in order and events are made in
+    /// order: once the main account has a frame at origin 2, a later frame
+    /// is not taken to be made with origin 1, however near its candidate
+    /// lies (an account that went back and forth could follow its own
+    /// errors without bound: p1-absdrag-review F2).
+    #[test]
+    fn the_main_account_does_not_go_back_to_an_older_origin() {
+        let t = t0();
+        let mut d = SelfDrag::new(
+            (0, 0),
+            moving((40.0, 50.0), (10.0, 0.0), 10),
+            Some((40.0, 50.0)),
+        );
+        d.sent((10, 0), None);
+        d.sent((20, 0), None);
+        let f = |x: f64, ms| Frame {
+            surface: Some((x, 50.0)),
+            rel: None,
+            time: Some(ms),
+        };
+        // 30, 40 or 50: on at 10 px per frame, origin 2
+        assert_eq!(d.frame(f(30.0, 1020), t, None), Some((50.0, 50.0)));
+        // 48, 58 or 68 for an expected 60: 58 would be origin 1
+        assert_eq!(d.frame(f(48.0, 1030), t, None), Some((68.0, 50.0)));
+    }
+
     #[test]
     fn root_positions_are_on_the_x_screen() {
         let s = (1280, 720);
@@ -951,7 +1294,16 @@ mod sim {
         /// From `from` to `to`, slowing down to a stop (ease-out), as a
         /// person's drag ends; relative motion or absolute positions.
         Easing { from: Pos, to: Pos, relative: bool },
+        /// Event i of n at `f(i, n)` (i = 0: the start), in wl_fixed;
+        /// relative motion or absolute positions.
+        Path {
+            f: fn(usize, usize) -> Pos,
+            relative: bool,
+        },
     }
+
+    /// Where the desktop puts a window asked to go to a position.
+    pub type Constraint = fn((i32, i32)) -> (i32, i32);
 
     /// The bridge's rule for the X pointer during the drag.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -978,6 +1330,9 @@ mod sim {
         /// each up to half a period early or late, some in bursts of the
         /// same millisecond.
         pub jitter: bool,
+        /// Where the desktop puts the window asked to go somewhere (mutter's
+        /// constraints: an edge it holds the window at).
+        pub constrain: Option<Constraint>,
     }
 
     #[derive(Debug)]
@@ -1008,6 +1363,24 @@ mod sim {
                 prev = p;
             }
             n
+        }
+
+        /// The farthest any X motion was from where the desktop's pointer was
+        /// (px, either axis).
+        pub fn worst_off(&self) -> i32 {
+            self.path
+                .iter()
+                .zip(&self.truth)
+                .map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs()))
+                .max()
+                .unwrap_or(0)
+        }
+
+        /// How far the X pointer ended from the desktop's (px, either axis).
+        pub fn end_off(&self) -> i32 {
+            (self.x_pointer_moved.0 - self.pointer_moved.0)
+                .abs()
+                .max((self.x_pointer_moved.1 - self.pointer_moved.1).abs())
         }
 
         /// The farthest the X pointer went past the desktop pointer's end.
@@ -1132,6 +1505,13 @@ mod sim {
 
         // the drag: the window at 300,200, the pointer 110,80 into it
         let w0 = (300, 200);
+        let relative = matches!(
+            r.device,
+            Device::Relative { .. }
+                | Device::Easing { relative: true, .. }
+                | Device::Path { relative: true, .. }
+        );
+        let constrain = |w: (i32, i32)| r.constrain.map_or(w, |c| c(w));
         let (p0, inputs): (Pos, Vec<Pos>) = match r.device {
             Device::Absolute { from, to } => (
                 from,
@@ -1161,11 +1541,22 @@ mod sim {
                 });
                 (from, points.collect())
             }
+            Device::Path { f, .. } => {
+                let at = |i: usize| {
+                    let p = f(i, r.steps);
+                    (fixed(p.0), fixed(p.1))
+                };
+                let points = (1..=r.steps).map(|i| {
+                    if relative {
+                        let (a, b) = (at(i - 1), at(i));
+                        (b.0 - a.0, b.1 - a.1)
+                    } else {
+                        at(i)
+                    }
+                });
+                (at(0), points.collect())
+            }
         };
-        let relative = matches!(
-            r.device,
-            Device::Relative { .. } | Device::Easing { relative: true, .. }
-        );
         let start_ms = 1000.0;
         let mut times: Vec<f64> = (0..inputs.len())
             .map(|i| start_ms + r.period * (i + 1) as f64)
@@ -1306,7 +1697,7 @@ mod sim {
                             process(&[i], window, &mut pointer, &mut last_s, &mut out);
                         } else {
                             let k = stalled.1.pop_front().unwrap();
-                            window = requests[k];
+                            window = constrain(requests[k]);
                             let lat = rng.range(0.2, 8.0);
                             at!(t + lat, Ev::Reply(k));
                         }
@@ -1339,7 +1730,7 @@ mod sim {
                     }
                 }
                 Ev::Request(k) => {
-                    window = requests[k];
+                    window = constrain(requests[k]);
                     if trace {
                         eprintln!("{t:9.3} applied {k} {:?}", window);
                     }
@@ -1349,9 +1740,9 @@ mod sim {
                 Ev::Commit(n) => commits.push(n),
                 Ev::Reply(k) => {
                     in_flight = false;
-                    reported = requests[k];
+                    reported = constrain(requests[k]);
                     if r.rule == Rule::Origins
-                        && let Some(n) = drag.applied(requests[k], requests[k], instant(t))
+                        && let Some(n) = drag.applied(requests[k], reported, instant(t))
                     {
                         up_last = (t + rng.range(0.05, 1.0)).max(up_last);
                         at!(up_last, Ev::Commit(n));
@@ -1517,6 +1908,7 @@ mod sim {
                     rule: Rule::Origins,
                     seed,
                     jitter: false,
+                    constrain: None,
                 };
                 check_exact(r, (120, 70));
                 assert_eq!(run(r).path.len(), 24, "every event moves the X pointer");
@@ -1537,6 +1929,7 @@ mod sim {
                         rule: Rule::Origins,
                         seed,
                         jitter: false,
+                        constrain: None,
                     };
                     check_exact(r, want);
                 }
@@ -1561,10 +1954,248 @@ mod sim {
                         rule: Rule::Origins,
                         seed,
                         jitter: false,
+                        constrain: None,
                     };
                     check_exact(r, want);
                 }
             }
+        }
+    }
+
+    /// Runs of `device` at 33, 125 and 250 Hz (or the given rates) in every
+    /// model over `seeds`: the worst X motion and the worst end (px).
+    fn worst(
+        device: Device,
+        rates: &[(usize, f64)],
+        constrain: Option<Constraint>,
+        seeds: u64,
+        models: &[Model],
+    ) -> (i32, i32) {
+        let mut w = (0, 0);
+        for &model in models {
+            for &(steps, period) in rates {
+                for seed in 0..seeds {
+                    let o = run(Run {
+                        model,
+                        device,
+                        steps,
+                        period,
+                        rule: Rule::Origins,
+                        seed,
+                        jitter: false,
+                        constrain,
+                    });
+                    w = (w.0.max(o.worst_off()), w.1.max(o.end_off()));
+                }
+            }
+        }
+        w
+    }
+
+    const RATES: [(usize, f64); 3] = [(24, 30.0), (90, 8.0), (120, 4.0)];
+
+    /// mutter keeps part of a window on the work areas, user moves included
+    /// (constraints.c, constrain_partially_onscreen): here the window's top
+    /// at y 120, its right side at x 500.
+    fn top_edge(w: (i32, i32)) -> (i32, i32) {
+        (w.0, w.1.max(120))
+    }
+
+    fn right_edge(w: (i32, i32)) -> (i32, i32) {
+        (w.0.min(500), w.1)
+    }
+
+    /// Up and right, on past the top edge (the window would go to y 0).
+    fn up_right(i: usize, n: usize) -> Pos {
+        let k = i as f64 / n as f64;
+        (410.0 + 120.0 * k, 280.0 - 200.0 * k)
+    }
+
+    /// Right and down, on past the right edge (the window would go to x 700).
+    fn right_down(i: usize, n: usize) -> Pos {
+        let k = i as f64 / n as f64;
+        (410.0 + 400.0 * k, 280.0 + 150.0 * k)
+    }
+
+    /// A palette dragged past an edge the desktop holds it at (p1-absdrag-
+    /// review F1): until its reply, a move counted as where it was asked to
+    /// go, so on the held axis every candidate but the oldest was wrong, the
+    /// X pointer swung ever wider (1814 px) and the drag ended up to 478 px
+    /// off. The bounds the replies show place it: the drag ends where the
+    /// pointer does, every motion close to it.
+    #[test]
+    fn a_drag_the_desktop_holds_at_an_edge_ends_where_the_pointer_does() {
+        for (f, edge) in [
+            (up_right as fn(usize, usize) -> Pos, top_edge as Constraint),
+            (right_down, right_edge),
+        ] {
+            for relative in [false, true] {
+                let (motion, end) = worst(
+                    Device::Path { f, relative },
+                    &RATES,
+                    Some(edge),
+                    20,
+                    &MODELS,
+                );
+                println!(
+                    "held at an edge, relative {relative}: worst motion {motion} px, end {end} px"
+                );
+                assert_eq!(end, 0, "relative {relative}");
+                assert!(motion <= 12, "relative {relative}: {motion} px");
+            }
+        }
+    }
+
+    /// Two monitors side by side, the left one taller: the window's bottom
+    /// is held at y 500 on the left and at 300 on the right. Dragged right
+    /// onto the short one, down past its bottom (held at 300), then left onto
+    /// the tall one, where it may go lower: the bound learned on the right
+    /// no longer holds, and the first reply that shows it drops it.
+    fn monitors(w: (i32, i32)) -> (i32, i32) {
+        (w.0, w.1.min(if w.0 < 450 { 500 } else { 300 }))
+    }
+
+    fn right_down_left(i: usize, n: usize) -> Pos {
+        let k = i as f64 / n as f64 * 3.0;
+        if k < 1.0 {
+            (410.0 + 200.0 * k, 280.0)
+        } else if k < 2.0 {
+            (610.0, 280.0 + 200.0 * (k - 1.0))
+        } else {
+            (610.0 - 300.0 * (k - 2.0), 480.0)
+        }
+    }
+
+    #[test]
+    fn a_bound_another_monitor_lifts_is_dropped() {
+        for relative in [false, true] {
+            let device = Device::Path {
+                f: right_down_left,
+                relative,
+            };
+            let (motion, end) = worst(device, &RATES, Some(monitors), 20, &MODELS);
+            println!("two monitors, relative {relative}: worst motion {motion} px, end {end} px");
+            assert_eq!(end, 0, "relative {relative}");
+            // one frame may be off by the 100 px the window drops by when the
+            // tall monitor takes it, until the reply that shows it
+            assert!(motion <= 100, "relative {relative}: {motion} px");
+        }
+    }
+
+    /// Deterministic noise in [0, 1).
+    fn noise(i: usize) -> f64 {
+        let mut z = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x1234_5678;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn along(k: f64) -> Pos {
+        (410.0 + 240.0 * k, 280.0 + 120.0 * k)
+    }
+
+    /// Every position twice (a remote pointer whose viewer events map to one
+    /// remote pixel; the bridge's own XTest -> EIS path forwards every
+    /// motion).
+    fn pairs(i: usize, n: usize) -> Pos {
+        along((i / 2 * 2) as f64 / n as f64)
+    }
+
+    /// A quarter of the events repeat the position before.
+    fn repeats(i: usize, n: usize) -> Pos {
+        let moves = |upto: usize| (1..=upto).filter(|&j| noise(j) >= 0.25).count() as f64;
+        along(moves(i) / moves(n))
+    }
+
+    /// Steps of 0.2 to 1.8 times the mean.
+    fn uneven(i: usize, n: usize) -> Pos {
+        let sum = |upto: usize| (1..=upto).map(|j| 0.2 + 1.6 * noise(j)).sum::<f64>();
+        along(sum(i) / sum(n))
+    }
+
+    /// Absolute positions that repeat or step unevenly (p1-absdrag-review
+    /// F2): the predictions come from the rule's own picks and the X
+    /// client's moves follow them, so a wrong pick followed by one wrong the
+    /// other way grew without bound (each position twice at 125 Hz: 6232 px,
+    /// the drag ending 138 px off). The main account never goes back to an
+    /// older origin and gives way to a clearly better one: the error stays
+    /// within a few steps.
+    #[test]
+    fn repeated_and_uneven_positions_stay_close() {
+        let rates = [(37, 16.0), (75, 8.0), (150, 4.0)];
+        for (name, f) in [
+            ("pairs", pairs as fn(usize, usize) -> Pos),
+            ("repeats", repeats),
+            ("uneven", uneven),
+        ] {
+            let device = Device::Path { f, relative: false };
+            let (motion, end) = worst(device, &rates, None, 20, &MODELS);
+            println!("{name}: worst motion {motion} px, end {end} px");
+            assert!(motion <= 40, "{name}: {motion} px");
+            assert!(end <= 30, "{name}: end {end} px");
+        }
+    }
+
+    /// Right 120 px, back, and right again, drifting down: a drag that turns
+    /// back. At the turn the main account may take a newer origin than the
+    /// frame was made with, and its order then keeps it there; an account
+    /// that took the older one explains the frames after the turn better,
+    /// and the X pointer moves over to it (without: drags ending 42 px off
+    /// with the frame clock).
+    fn back_and_forth(i: usize, n: usize) -> Pos {
+        let k = i as f64 / n as f64 * 3.0;
+        let x = if k <= 1.0 {
+            k
+        } else if k <= 2.0 {
+            2.0 - k
+        } else {
+            k - 2.0
+        };
+        (410.0 + 120.0 * x, 280.0 + 40.0 * i as f64 / n as f64)
+    }
+
+    #[test]
+    fn a_drag_that_turns_back_ends_where_the_pointer_does() {
+        let rates = [(37, 16.0), (75, 8.0), (150, 4.0)];
+        for relative in [false, true] {
+            let device = Device::Path {
+                f: back_and_forth,
+                relative,
+            };
+            let (motion, end) = worst(device, &rates, None, 20, &MODELS);
+            println!("turning back, relative {relative}: worst motion {motion} px, end {end} px");
+            assert_eq!(end, 0, "relative {relative}");
+            assert!(motion <= 45, "relative {relative}: {motion} px");
+        }
+    }
+
+    /// A person's drag: slow to start, fastest midway, slowing to a stop
+    /// (minimum jerk). A guard that bounds each step by the steps seen at
+    /// the start (where only one origin is possible) trips on it later.
+    fn person(i: usize, n: usize) -> Pos {
+        let t = i as f64 / n as f64;
+        along(10.0 * t.powi(3) - 15.0 * t.powi(4) + 6.0 * t.powi(5))
+    }
+
+    #[test]
+    fn a_person_like_drag_ends_where_the_pointer_does() {
+        let rates = [(20, 30.0), (75, 8.0), (150, 4.0)];
+        let models = [
+            Model::Immediate,
+            Model::Frames { compress: false },
+            Model::Stalling,
+        ];
+        for relative in [false, true] {
+            let device = Device::Path {
+                f: person,
+                relative,
+            };
+            let (motion, end) = worst(device, &rates, None, 20, &models);
+            println!(
+                "a person's drag, relative {relative}: worst motion {motion} px, end {end} px"
+            );
+            assert_eq!(end, 0, "relative {relative}");
+            assert!(motion <= 10, "relative {relative}: {motion} px");
         }
     }
 
@@ -1576,7 +2207,7 @@ mod sim {
     fn sweep() {
         let rules = [Rule::Origins, Rule::Newest, Rule::RelativeOnly];
         println!(
-            "model | device | Hz | rule | drags with back-steps | back-steps | motions off | end off (drags, max px)"
+            "model | device | Hz | rule | drags with back-steps | back-steps | motions off | end off (drags, max px) | worst motion off (px)"
         );
         for model in MODELS {
             for (name, relative) in [("absolute", false), ("relative", true)] {
@@ -1590,6 +2221,7 @@ mod sim {
                         for rule in rules {
                             let (mut drags_back, mut back, mut off, mut ends, mut worst) =
                                 (0, 0, 0, 0, 0);
+                            let mut worst_motion = 0;
                             let steps = (480.0 / period) as usize;
                             for seed in 0..50 {
                                 let device = match (ease, relative) {
@@ -1615,11 +2247,13 @@ mod sim {
                                     rule,
                                     seed,
                                     jitter,
+                                    constrain: None,
                                 });
                                 let b = o.back_steps();
                                 back += b;
                                 drags_back += usize::from(b > 0);
                                 off += o.path.iter().zip(&o.truth).filter(|(a, b)| a != b).count();
+                                worst_motion = worst_motion.max(o.worst_off());
                                 let e = (o.x_window_moved.0 - o.pointer_moved.0)
                                     .abs()
                                     .max((o.x_window_moved.1 - o.pointer_moved.1).abs());
@@ -1627,7 +2261,7 @@ mod sim {
                                 worst = worst.max(e);
                             }
                             println!(
-                                "{model:?} | {name} {how} | {:.0} | {rule:?} | {drags_back}/50 | {back} | {off} | {ends}/50, {worst}",
+                                "{model:?} | {name} {how} | {:.0} | {rule:?} | {drags_back}/50 | {back} | {off} | {ends}/50, {worst} | {worst_motion}",
                                 1000.0 / period
                             );
                         }
@@ -1650,6 +2284,7 @@ mod sim {
                 rule,
                 seed,
                 jitter: false,
+                constrain: None,
             })
         };
         for model in MODELS {

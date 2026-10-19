@@ -50,7 +50,9 @@ While the extension is there:
   (ICCCM 4.1.5). During a drag with a button held the X app is in charge; the window moves under the pointer and
   the X pointer is kept where the desktop's pointer is (the bridge works out which of the window's positions each
   pointer event is relative to: from the relative motion for a mouse or touchpad, from the pointer's track for a
-  tablet, a VNC or RDP viewer's pointer and touch), so the app's drag loop sees the pointer where it is.
+  tablet, a VNC or RDP viewer's pointer and touch; a move not answered yet counts where the desktop's last
+  replies held the window, so a drag past a screen edge follows too), so the app's drag loop sees the pointer
+  where it is.
 - **The desktop window moves the X window.** A user's move, tiling, maximising, a monitor change: the X window
   is configured to the same position (the size follows the desktop's configure, as before), with the synthetic
   ConfigureNotify.
