@@ -650,9 +650,11 @@ rvnc_has_password() {
 }
 
 # The window extension (-showwindows' window integration): installed where, enabled, loaded, API version.
-# Read-only: gnome-extensions info, gsettings get and one Version() call on the session bus.
+# Read-only: gnome-extensions info, gsettings get, and Version(), Features() and two GetNameOwner calls on the
+# session bus. Judged as the bridge judges it: the name's owner must be gnome-shell's connection (the name is
+# free while the screen is locked, so another process may hold it) and Features must list move-resize.
 doctor_windows_extension() {
-  local shell_run=$1 d dir="" ver="" st="" info api enabled="" el due
+  local shell_run=$1 d dir="" ver="" st="" info api enabled="" el due feats="" owner="" shell="" pid=""
   for d in "${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$WINDOWS_EXT" \
            "/usr/local/share/gnome-shell/extensions/$WINDOWS_EXT" "/usr/share/gnome-shell/extensions/$WINDOWS_EXT"; do
     [ -f "$d/metadata.json" ] && { dir=$d; break; }
@@ -662,6 +664,12 @@ doctor_windows_extension() {
     info=$(t5 gnome-extensions info "$WINDOWS_EXT" 2>/dev/null) && st=$(sed -n 's/^ *State: *//p' <<<"$info" | head -1)
   fi
   api=$(t5 busctl --user call org.xwlbridge.Windows /org/xwlbridge/Windows org.xwlbridge.Windows1 Version 2>/dev/null | sed -n 's/^u //p')
+  if [ -n "$api" ]; then
+    feats=$(t5 busctl --user call org.xwlbridge.Windows /org/xwlbridge/Windows org.xwlbridge.Windows1 Features 2>/dev/null)
+    owner=$(t5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s org.xwlbridge.Windows 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p')
+    shell=$(t5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetNameOwner s org.gnome.Shell 2>/dev/null | sed -n 's/^s "\(.*\)"$/\1/p')
+    [ -n "$owner" ] && pid=$(t5 busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetConnectionUnixProcessID s "$owner" 2>/dev/null | sed -n 's/^u //p')
+  fi
   if el=$(t5 gsettings get org.gnome.shell enabled-extensions 2>/dev/null); then
     case $el in *"'$WINDOWS_EXT'"*) enabled=yes;; *) enabled=no;; esac
   fi
@@ -671,6 +679,12 @@ doctor_windows_extension() {
   if [ "${CFG[extension]}" = off ]; then
     report info gnome.windows_extension "$what: turned off (extension=off)${dir:+; still installed in $dir}" "$without" \
       "To use it: $PROG config set extension auto, run install.sh again, then log out and in once."
+  elif [ -n "$api" ] && { [ -z "$owner" ] || [ "$owner" != "$shell" ]; }; then
+    report warn gnome.windows_extension "org.xwlbridge.Windows is held by ${owner:-an unknown name} (pid ${pid:-unknown}), which is not gnome-shell: the bridge refuses it" \
+      "Another process took the extension's name (it is free while the screen is locked). Find it: ps -p ${pid:-PID}; then log out and in."
+  elif [ -n "$api" ] && ! grep -q '"move-resize"' <<<"$feats"; then
+    report warn gnome.windows_extension "$what answers (API v$api) but can't move windows here: its features are ${feats#as }" \
+      "This mutter has no window tags (GNOME 49 or later is needed): $without"
   elif [ -n "$api" ]; then
     report ok gnome.windows_extension "$what is active (API v$api)${dir:+ ($dir)}"
   elif [ -z "$dir" ]; then

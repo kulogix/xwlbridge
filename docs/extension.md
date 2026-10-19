@@ -42,8 +42,9 @@ With `-showwindows` (per-window mode; not `-showscreen`) the bridge tags each sh
 While the extension is there:
 
 - **The X window moves the desktop window.** When an app moves or resizes its own top-level window (its own
-  drag loop, an animation, a slide-in panel), the bridge sends `MoveResize` with the clamp to the monitor's work
-  area, coalesced to one per frame (the window's frame callback; at most one per 16 ms for a window that does
+  drag loop, an animation, a slide-in panel), the bridge sends `MoveResize` with the clamp to the work area of
+  the monitor it moves to (a held-button drag instead gets mutter's user-move constraints, so it can cross
+  monitors), coalesced to one per frame (the window's frame callback; at most one per 16 ms for a window that does
   not repaint) and one at a time. If the desktop keeps the window elsewhere (an edge, a size limit, a maximised
   window), the X window is put back there and gets the synthetic ConfigureNotify an X window manager sends
   (ICCCM 4.1.5). During a drag with a button held the X app is in charge; the window moves under the pointer and
@@ -55,28 +56,47 @@ While the extension is there:
 - **Placement at map.** A window with USPosition, or PPosition other than 0,0, in WM_NORMAL_HINTS opens at that
   position (`SetInitialPosition`); other windows are placed by GNOME and the X window follows.
 - **Stacking.** GNOME is the only stacking authority: X's stacking order of the shown windows follows
-  `Restacked`. An app's raise (XRaiseWindow, seen as its window going over windows the desktop has above it) or
+  `Restacked`, which lists the windows that are not showing (minimised, on another workspace) at the bottom:
+  they stay mapped in X, and must not take the pointer of a window above them on the desktop. The window the
+  desktop's pointer enters is also raised in X right away (as in 0.1.2), since the desktop's order arrives a
+  little later over D-Bus. An app's raise (XRaiseWindow, seen as its window going over windows the desktop has above it) or
   `_NET_ACTIVE_WINDOW` request activates the window when the app had input (a key or button press on one of its
   windows) in the last 2 s; otherwise the window demands attention instead, at most once per 3 s per window, and
   X goes back to the desktop's order. `_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_STAYS_ON_TOP` keep a window above
   (`SetAbove`), and its transient children with it, so a dialog never opens behind its own above parent.
-- **Attention.** WM_HINTS UrgencyHint or `_NET_WM_STATE_DEMANDS_ATTENTION` -> `SetDemandsAttention`.
+- **Attention.** WM_HINTS UrgencyHint or `_NET_WM_STATE_DEMANDS_ATTENTION` -> `SetDemandsAttention`. When
+  the window gets the keyboard, the bridge removes `_NET_WM_STATE_DEMANDS_ATTENTION` (EWMH makes that the
+  window manager's job).
+- **Always on Top.** The desktop's "Always on Top" on a shown window becomes its `_NET_WM_STATE_ABOVE`, so the
+  user's choice also survives the lock screen.
 - **Resync.** At start, on `MonitorsChanged` and whenever the extension comes back (the lock screen turns it
-  off and on again, as does a shell restart), the bridge reads `GetState` and puts every X window where the
-  desktop has it.
+  off and on again, as does a shell restart), the bridge reads `GetMonitors` and `GetState` and puts every X
+  window where the desktop has it. Replies and signals are put in the desktop's order by their D-Bus message
+  serials (they all leave gnome-shell on one connection), so a late reply never undoes a newer report.
+- **Layout.** The sync is on only while the desktop's monitors are unscaled and lie inside the X screen (X
+  positions are the desktop's, and the pointer reaches only the X screen): on a scaled desktop, or while a
+  fixed-size X screen (Xvfb) is smaller than the monitors, windows keep the 0.1.2 behaviour, and the log says
+  why.
 
 While it is not there, `-showwindows` behaves exactly as 0.1.2 did (and `_NET_SUPPORTED` announces only what
 0.1.2 carries out). The log says which: `window sync with the desktop: extension version 1, ...` or
 `no window sync with the desktop (...): windows keep the 0.1.2 behaviour`.
 
-Not in this phase: HiDPI scaling (X pixels are logical pixels), workspaces, sticky, minimise through the
-extension, keep-below (mutter has no call for it), and the desktop's own "Always on top" reaching X.
+Not in this phase: HiDPI scaling (a scaled desktop keeps the 0.1.2 behaviour), workspaces, sticky, minimise
+through the extension, keep-below (mutter has no call for it).
+
+The bridge accepts the name `org.xwlbridge.Windows` only from gnome-shell's own connection (the owner of
+`org.gnome.Shell`): the name is free while the screen is locked, and another process could take it.
 
 ## Security model
 
-- **Only the bridge's own windows.** A window is reachable only when its Wayland client tagged it with
-  `xdg_toplevel_tag_v1` and the tag starts with `xwlbridge:` (the bridge uses `xwlbridge:<display>:<xid>`).
-  Windows are found by that tag, never by title, app id or position.
+- **Only windows the caller created.** A window is reachable only when it is a Wayland toplevel (not an X11
+  window of GNOME's own Xwayland, not override-redirect), its Wayland client tagged it with
+  `xdg_toplevel_tag_v1`, and the tag starts with `xwlbridge:` (the bridge uses `xwlbridge:<display>:<xid>`).
+  Windows are found by that tag, never by title, app id or position. Tagging is unprivileged, so any process
+  can tag its own windows and then move them, keep them above or raise them, as it could with any X window
+  manager hint; what it cannot do is reach another process's windows (below) or take the keyboard from
+  another app (`Activate`).
 - **Only by the process that owns the window.** Every method that names or lists windows asks the bus for
   the caller's process id (`org.freedesktop.DBus.GetConnectionUnixProcessID`) and serves only windows whose
   Wayland client has the same process id (`Meta.Window.get_pid`). Another process's window, tagged or not,
@@ -84,9 +104,13 @@ extension, keep-below (mutter has no call for it), and the desktop's own "Always
   other windows. Two bridges on one desktop each see only their own windows.
 - **Signals are private.** `Changed`, `Restacked` and `WindowGone` go only to the bus names of the window's
   own process (unicast), never to the whole bus.
+- **No focus stealing.** `Activate` needs the timestamp of the input it follows (0 is refused) and focuses the
+  window only while the keyboard is on no window or on one of the caller's own; otherwise the window demands
+  attention. A timestamp alone would not do: compositor time is the monotonic clock in ms, easy to make up.
 - **Nothing else.** `Version`, `Features` and `GetMonitors` answer anyone: they carry nothing private (the
-  monitor layout is public through GNOME's own D-Bus APIs). Arguments are range-checked; at most 32 callers
-  are remembered and 256 waiting initial positions (each expires after 60 s).
+  monitor layout is public through GNOME's own D-Bus APIs). Arguments are range-checked; at most 64 callers
+  are remembered (4 per process; a process crowds out only its own) and 256 waiting initial positions (64 per
+  process; each expires after 60 s).
 - **Lock screen.** GNOME disables extensions while the screen is locked; the service then goes away and comes
   back at unlock, and the bridge resyncs.
 
@@ -101,9 +125,9 @@ rectangle.
 |---|---|
 | `Version() -> u` | API version: 1 |
 | `Features() -> as` | `move-resize`, `clamp-work-area`, `initial-position`, `activate`, `raise`, `above`, `demands-attention`, `stick`, `workspace`, `minimize`, `state`, `monitors`, `restacked`; empty on a mutter without window tags |
-| `MoveResize(s tag, i x, i y, i w, i h, u flags) -> (iiii)` | Moves and resizes. `w` or `h` 0 keeps the size. Flags: 1 = clamp into the work area of the window's monitor (shrinking it to fit), 2 = user-initiated (mutter's user-action constraints). Returns the rectangle applied: a move is applied at once and the reply is mutter's result; a new size waits for the app to draw it, so the reply is the rectangle asked for after the clamp, and `Changed` carries the final one. A maximized or fullscreen window is not changed; the reply is its rectangle. |
+| `MoveResize(s tag, i x, i y, i w, i h, u flags) -> (iiii)` | Moves and resizes. `w` or `h` 0 keeps the size. Flags: 1 = clamp into the work area of the monitor the rectangle is (mostly) on (shrinking it to fit; a rectangle that is exactly a monitor is left alone), 2 = user-initiated (mutter's user-action constraints). Returns the rectangle applied: a move is applied at once and the reply is mutter's result; a new size waits for the app to draw it, so the reply is the rectangle asked for after the clamp, and `Changed` carries the final one. A maximized or fullscreen window is not changed; the reply is its rectangle. |
 | `SetInitialPosition(s tag, i x, i y)` | Where the window opens. Before the window exists it waits (up to 60 s) and is applied when GNOME first shows it, after GNOME's own placement and before the first frame is drawn, so the window appears there without a jump. For a window already shown, it moves it now. |
-| `Activate(s tag, u timestamp)` | Raises, focuses and switches to the window's workspace. `timestamp` is compositor time in ms (the time of the input event that led to it, e.g. a `wl_pointer`/`wl_keyboard` event), 0 = now. GNOME's focus-stealing prevention applies to old timestamps. |
+| `Activate(s tag, u timestamp)` | Raises, focuses and switches to the window's workspace, if the keyboard is on no window or on one of the caller's; otherwise the window demands attention. `timestamp` is compositor time in ms (the time of the input event that led to it, e.g. a `wl_pointer`/`wl_keyboard` event); 0 is refused (`InvalidArgs`). GNOME's focus-stealing prevention applies to old timestamps. |
 | `Raise(s tag)` | Raises within its layer. |
 | `SetAbove(s tag, b)` | Always on top on / off. |
 | `SetDemandsAttention(s tag, b)` | GNOME's "is ready" attention on / off. |
@@ -116,7 +140,7 @@ rectangle.
 | signal | |
 |---|---|
 | `Changed(s tag, (iiii) rect, i monitor, i workspace, u flags, u serial)` | The window moved, was resized or changed state. Flags: 1 = a user grab (interactive move or resize) is active on it, 2 minimized, 4 maximized, 8 fullscreen, 16 above, 32 focused. Changes are coalesced (one per window per main-loop turn, only when something differs); `serial` grows with every `Changed`. Sent from the first show on. |
-| `Restacked(as tags)` | The stacking order of the caller's windows changed (bottom to top). |
+| `Restacked(as tags)` | The stacking order of the caller's windows changed (bottom to top; windows that are not showing - minimised, on another workspace - first). |
 | `MonitorsChanged()` | Monitors or work areas changed: call `GetMonitors`. |
 | `WindowGone(s tag)` | The window was closed or lost its tag. |
 
@@ -124,9 +148,9 @@ Errors: `org.freedesktop.DBus.Error.InvalidArgs` (a tag without the `xwlbridge:`
 position, size or workspace), `org.xwlbridge.Windows1.Error.NoSuchWindow` (no such window of the caller),
 `org.freedesktop.DBus.Error.AccessDenied` (the bus could not name the caller's process).
 
-**Receiving signals.** The extension sends signals to the bus names that have called it. A client subscribes
-to the signals (a match rule on the sender `org.xwlbridge.Windows`) and then calls any method, for example
-`Version()` at start-up and `GetState()` for a full picture. When the name's owner changes (GNOME restarted,
+**Receiving signals.** The extension sends signals to the bus names that have called it (any method but
+`Version` and `Features`). A client subscribes to the signals (a match rule on the sender
+`org.xwlbridge.Windows`) and then calls `GetState()` for a full picture. When the name's owner changes (GNOME restarted,
 the screen was locked and unlocked, the extension was turned off and on), the client does the same again:
 the new instance knows nothing of earlier callers.
 

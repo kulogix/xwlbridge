@@ -11,14 +11,20 @@
 // changes to them. docs/extension.md describes every method and signal.
 //
 // Security model (the whole point of the checks below):
-// - A window is reachable only if its xdg_toplevel_tag_v1 tag starts with "xwlbridge:". Windows are found by
-//   that tag (Meta.Window.get_tag), never by title, app id or stacking position.
+// - A process can act only on windows it created itself. A window is reachable only if it is a Wayland toplevel
+//   (not an X11 window of GNOME's own Xwayland, not override-redirect) whose xdg_toplevel_tag_v1 tag starts with
+//   "xwlbridge:". Windows are found by that tag (Meta.Window.get_tag), never by title, app id or stacking position.
+//   Tagging is unprivileged, so the prefix is not a credential: what keeps a process from harming others is that
+//   it reaches only its own windows, and that Activate cannot take the keyboard from another app (below).
 // - Every method that names or lists windows asks the bus for the caller's process id
 //   (org.freedesktop.DBus.GetConnectionUnixProcessID) and serves only windows whose Wayland client has that
 //   process id (Meta.Window.get_pid). A window of another process, tagged or not, answers "no such window",
 //   exactly like a tag that does not exist, so callers cannot probe other processes' windows.
+// - Activate focuses the window only while the keyboard is on none of the other apps' windows (no focus, or a
+//   window of the caller's process); otherwise the window demands attention. A timestamp of 0 is refused.
 // - Signals about windows are sent to the owning process's bus names only (unicast), not broadcast.
-// - Version, Features and GetMonitors carry nothing private and answer anyone.
+// - Version, Features and GetMonitors carry nothing private and answer anyone. Per-process caps keep one
+//   process from crowding out another's subscriptions or initial positions.
 // Lock screen: gnome-shell disables extensions in its unlock-dialog mode, so the service goes away while the
 // screen is locked and comes back at unlock; the bridge watches the name and resyncs with GetState.
 
@@ -42,7 +48,7 @@ const ERR_ACCESS_DENIED = 'org.freedesktop.DBus.Error.AccessDenied';
 const ERR_FAILED = 'org.freedesktop.DBus.Error.Failed';
 
 // MoveResize flags
-const MOVE_CLAMP = 1;           // keep the rectangle inside the work area of the window's monitor
+const MOVE_CLAMP = 1;           // keep the rectangle inside the work area of the monitor it is (mostly) on
 const MOVE_USER = 2;            // the move is the user's doing (mutter applies its user-action constraints)
 
 // Changed flags
@@ -55,8 +61,10 @@ const STATE_FOCUSED = 32;
 
 const COORD_LIMIT = 1 << 20;    // |x|, |y| for a desktop position
 const SIZE_LIMIT = 1 << 16;     // width, height
-const MAX_SUBSCRIBERS = 32;     // bus names that get signals
+const MAX_SUBSCRIBERS = 64;     // bus names that get signals
+const MAX_SUBSCRIBERS_PER_PID = 4;
 const MAX_PENDING = 256;        // SetInitialPosition entries waiting for their window
+const MAX_PENDING_PER_PID = 64;
 const PENDING_TTL_US = 60 * GLib.USEC_PER_SEC;
 
 const FEATURES = [
@@ -184,6 +192,9 @@ export default class XwlbridgeWindows extends Extension {
         this._hasTags = typeof Meta.Window.prototype.get_tag === 'function';
         if (!this._hasTags)
             console.warn(`${this.uuid}: this mutter has no window tags (Meta.Window.get_tag); no window can be served`);
+        const proto = Meta.Window.prototype;
+        this._hasVisibility = typeof proto.showing_on_its_workspace === 'function' &&
+            typeof proto.located_on_workspace === 'function';
 
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this._methods());
         this._dbus.export(Gio.DBus.session, OBJECT_PATH);
@@ -191,6 +202,9 @@ export default class XwlbridgeWindows extends Extension {
             Gio.BusNameOwnerFlags.NONE, null,
             () => console.warn(`${this.uuid}: could not own ${BUS_NAME} (another owner?)`));
 
+        // without tags no window can be ours: only Version and Features are served (Features is empty)
+        if (!this._hasTags)
+            return;
         const display = global.display;
         this._connect(display, 'window-created', (_d, win) => this._watchWindow(win));
         this._connect(display, 'restacked', () => this._queueRestack());
@@ -198,6 +212,8 @@ export default class XwlbridgeWindows extends Extension {
         this._connect(display, 'grab-op-end', () => this._grabChanged(null));
         this._connect(display, 'workareas-changed', () => this._queueMonitors());
         this._connect(global.backend.get_monitor_manager(), 'monitors-changed', () => this._queueMonitors());
+        // what is showing changes the order (windows that are not showing go to the bottom)
+        this._connect(global.workspace_manager, 'active-workspace-changed', () => this._queueRestack());
         for (const win of display.list_all_windows())
             this._watchWindow(win);
     }
@@ -233,12 +249,14 @@ export default class XwlbridgeWindows extends Extension {
     // ------------------------------------------------------------------ windows
 
     _watchWindow(win) {
-        if (this._windows.has(win))
+        if (this._windows.has(win) || !this._hasTags)
+            return;
+        // only Wayland toplevels: an X11 window of GNOME's Xwayland can carry a tag too (_NET_WM_WINDOW_TAG), and
+        // an override-redirect window is not the window manager's to move or activate
+        if (win.get_client_type() !== Meta.WindowClientType.WAYLAND || win.is_override_redirect())
             return;
         const entry = {tagIds: [], tracked: null};
         this._windows.set(win, entry);
-        if (!this._hasTags)
-            return;
         entry.tagIds.push(win.connect('notify::tag', () => this._retag(win)));
         entry.tagIds.push(win.connect('unmanaged', () => this._unwatchWindow(win, true)));
         this._retag(win);
@@ -275,6 +293,9 @@ export default class XwlbridgeWindows extends Extension {
             'notify::maximized-horizontally', 'notify::maximized-vertically', 'notify::fullscreen',
             'notify::above', 'notify::appears-focused', 'notify::on-all-workspaces', 'notify::main-monitor'])
             tracked.ids.push(win.connect(signal, dirty));
+        // showing or not moves it in the order Restacked reports
+        for (const signal of ['workspace-changed', 'notify::minimized', 'notify::on-all-workspaces'])
+            tracked.ids.push(win.connect(signal, () => this._queueRestack()));
         tracked.ids.push(win.connect('shown', () => {
             // The first show: mutter has just placed the window and not painted it yet, so a waiting initial
             // position applied here is where the first frame appears (a move before this point is undone by
@@ -394,9 +415,33 @@ export default class XwlbridgeWindows extends Extension {
         }
         const key = `${pid}\n${tag}`;
         this._pending.delete(key);
+        // a process pushes out only its own entries (oldest first); at the global ceiling, the oldest entry of
+        // the process with the most
+        const own = [...this._pending].filter(([, p]) => p.pid === pid);
+        if (own.length >= MAX_PENDING_PER_PID)
+            this._pending.delete(own[0][0]);
         while (this._pending.size >= MAX_PENDING)
-            this._pending.delete(this._pending.keys().next().value);
-        this._pending.set(key, {x, y, expires: now + PENDING_TTL_US});
+            this._pending.delete(this._oldestOfBusiest(this._pending));
+        this._pending.set(key, {pid, x, y, expires: now + PENDING_TTL_US});
+    }
+
+    // The first key (oldest) of the pid with the most entries in map (values carry .pid).
+    _oldestOfBusiest(map) {
+        const counts = new Map();
+        for (const v of map.values())
+            counts.set(v.pid, (counts.get(v.pid) ?? 0) + 1);
+        let busiest = null, most = -1;
+        for (const [pid, n] of counts) {
+            if (n > most) {
+                busiest = pid;
+                most = n;
+            }
+        }
+        for (const [k, v] of map) {
+            if (v.pid === busiest)
+                return k;
+        }
+        return map.keys().next().value;
     }
 
     // ------------------------------------------------------------------ signals out
@@ -469,9 +514,17 @@ export default class XwlbridgeWindows extends Extension {
         }
     }
 
+    // The caller's windows bottom to top: those not showing (minimised, on another workspace) first, below
+    // every showing one. They stay mapped in the caller's X server, so this keeps X's topmost window under any
+    // point a showing one.
     _stacked(pid) {
         const wins = this._trackedWindows(pid);
-        return wins.length > 1 ? global.display.sort_windows_by_stacking(wins) : wins;
+        const sorted = wins.length > 1 ? global.display.sort_windows_by_stacking(wins) : wins;
+        const active = global.workspace_manager.get_active_workspace();
+        const showing = win => this._hasVisibility
+            ? win.showing_on_its_workspace() && win.located_on_workspace(active)
+            : !win.minimized;
+        return [...sorted.filter(w => !showing(w)), ...sorted.filter(showing)];
     }
 
     _emitTo(pid, signal, params) {
@@ -491,9 +544,9 @@ export default class XwlbridgeWindows extends Extension {
 
     // ------------------------------------------------------------------ callers
 
-    // The caller's process id. Every caller is remembered (unique bus names are never reused) and gets the
-    // signals about its own windows until its connection closes.
-    _callerPid(sender) {
+    // The caller's process id. A caller of anything but Version and Features is remembered (unique bus names
+    // are never reused) and gets the signals about its own windows until its connection closes.
+    _callerPid(sender, subscribe = true) {
         const known = this._subscribers.get(sender);
         if (known)
             return Promise.resolve(known.pid);
@@ -513,37 +566,29 @@ export default class XwlbridgeWindows extends Extension {
                 });
         }).then(pid => {
             this._pidLookups.delete(sender);
-            if (this._dbus && pid > 0)
-                this._addSubscriber(sender, pid);
             return pid;
         }, e => {
             this._pidLookups.delete(sender);
             throw e;
         });
         this._pidLookups.set(sender, lookup);
-        return lookup;
+        return lookup.then(pid => {
+            if (subscribe && this._dbus && pid > 0)
+                this._addSubscriber(sender, pid);
+            return pid;
+        });
     }
 
     _addSubscriber(name, pid) {
         if (this._subscribers.has(name))
             return;
-        if (this._subscribers.size >= MAX_SUBSCRIBERS) {
-            // forget a caller that owns no window first (a one-off query), else the oldest
-            const owners = new Set();
-            for (const entry of this._windows.values()) {
-                if (entry.tracked)
-                    owners.add(entry.tracked.pid);
-            }
-            let victim = null;
-            for (const [n, s] of this._subscribers) {
-                if (!owners.has(s.pid)) {
-                    victim = n;
-                    break;
-                }
-            }
-            victim ??= this._subscribers.keys().next().value;
-            this._dropSubscriber(victim);
-        }
+        // a process crowds out only its own names (oldest first); at the global ceiling, the oldest name of the
+        // process with the most
+        const own = [...this._subscribers].filter(([, s]) => s.pid === pid);
+        if (own.length >= MAX_SUBSCRIBERS_PER_PID)
+            this._dropSubscriber(own[0][0]);
+        if (this._subscribers.size >= MAX_SUBSCRIBERS)
+            this._dropSubscriber(this._oldestOfBusiest(this._subscribers));
         const watchId = Gio.bus_watch_name_on_connection(Gio.DBus.session, name,
             Gio.BusNameWatcherFlags.NONE, null, () => this._dropSubscriber(name));
         this._subscribers.set(name, {pid, watchId});
@@ -560,9 +605,9 @@ export default class XwlbridgeWindows extends Extension {
     }
 
     // Runs a method for the caller: fn(pid, args) returns the reply (a GLib.Variant tuple) or null.
-    _serve(fn, args, invocation) {
+    _serve(fn, args, invocation, subscribe = true) {
         const dbus = this._dbus;
-        this._callerPid(invocation.get_sender()).then(pid => {
+        this._callerPid(invocation.get_sender(), subscribe).then(pid => {
             if (this._dbus !== dbus || !dbus)
                 throw new DBusError(ERR_FAILED, 'the extension was disabled');
             invocation.return_value(fn.call(this, pid, args));
@@ -578,16 +623,26 @@ export default class XwlbridgeWindows extends Extension {
 
     _methods() {
         const m = {};
-        const add = (name, fn) => {
-            m[`${name}Async`] = (args, invocation) => this._serve(fn, args, invocation);
+        const add = (name, fn, subscribe = true) => {
+            m[`${name}Async`] = (args, invocation) => this._serve(fn, args, invocation, subscribe);
         };
-        add('Version', () => new GLib.Variant('(u)', [API_VERSION]));
-        add('Features', () => new GLib.Variant('(as)', [this._hasTags ? FEATURES : []]));
+        add('Version', () => new GLib.Variant('(u)', [API_VERSION]), false);
+        add('Features', () => new GLib.Variant('(as)', [this._hasTags ? FEATURES : []]), false);
         add('MoveResize', this._moveResize);
         add('SetInitialPosition', this._setInitialPosition);
         add('Activate', (pid, [tag, timestamp]) => {
             const win = this._find(tag, pid);
-            win.activate(timestamp || global.display.get_current_time_roundtrip());
+            // 0 would be "now", which mutter does not check for focus stealing
+            if (!timestamp)
+                throw new DBusError(ERR_INVALID_ARGS, 'Activate needs the timestamp of the user input it follows');
+            // a timestamp is easy to make up (compositor time is the monotonic clock in ms), so it does not
+            // decide alone: the keyboard is taken only from no window or from the caller's own
+            const focus = global.display.focus_window;
+            if (focus && focus !== win && focus.get_pid() !== pid) {
+                win.set_demands_attention();
+                return null;
+            }
+            win.activate(timestamp);
             return null;
         });
         add('Raise', (pid, [tag]) => {
@@ -672,13 +727,18 @@ export default class XwlbridgeWindows extends Extension {
         return new GLib.Variant('((iiii))', [applied]);
     }
 
+    // Inside the work area of the monitor the rectangle asked for is (mostly) on, which may be another monitor
+    // than the window's now. A rectangle that is exactly a monitor (a borderless "fullscreen" window) stays.
     _clamp(win, r) {
-        let monitor = win.get_monitor();
-        if (monitor < 0) {
-            const rect = new Mtk.Rectangle({x: r.x, y: r.y, width: r.width, height: r.height});
-            monitor = global.display.get_monitor_index_for_rect(rect);
-        }
+        const display = global.display;
+        const rect = new Mtk.Rectangle({x: r.x, y: r.y, width: r.width, height: r.height});
+        let monitor = display.get_monitor_index_for_rect(rect);
         if (monitor < 0)
+            monitor = win.get_monitor();
+        if (monitor < 0)
+            return r;
+        const geometry = display.get_monitor_geometry(monitor);
+        if (geometry.x === r.x && geometry.y === r.y && geometry.width === r.width && geometry.height === r.height)
             return r;
         const wa = win.get_work_area_for_monitor(monitor);
         const width = Math.min(r.width, wa.width);

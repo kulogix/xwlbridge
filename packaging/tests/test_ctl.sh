@@ -89,6 +89,10 @@ cat >"$T/fakegnome/busctl" <<'EOS'
 case "$*" in
   *"get-property org.gnome.Shell /org/gnome/Shell org.gnome.Shell ShellVersion") [ -e "$FAKE_DIR/shell_running" ] && echo 's "50.1"';;
   *"org.xwlbridge.Windows1 Version") [ -e "$FAKE_DIR/ext_active" ] && echo "u 1";;
+  *"org.xwlbridge.Windows1 Features") [ -e "$FAKE_DIR/ext_active" ] && { [ -e "$FAKE_DIR/ext_notags" ] && echo "as 0" || echo 'as 2 "move-resize" "state"'; };;
+  *"GetNameOwner s org.xwlbridge.Windows") [ -e "$FAKE_DIR/ext_active" ] && { [ -e "$FAKE_DIR/ext_squatter" ] && echo 's ":1.73"' || echo 's ":1.5"'; };;
+  *"GetNameOwner s org.gnome.Shell") [ -e "$FAKE_DIR/shell_running" ] && echo 's ":1.5"';;
+  *"GetConnectionUnixProcessID s "*) echo "u 4242";;
   *) false;;
 esac
 EOS
@@ -540,7 +544,11 @@ if command -v python3 >/dev/null; then
   out=$(wdoc); check "doctor: enabled but not loaded by this session -> warn: log out and in" grep -q "^warn .*has not loaded it: log out and in once" <<<"$out"
   : >"$FD/ext_active"
   out=$(wdoc); check "doctor: active -> ok with version and API" grep -q "^ok window extension $EXT_UUID 1.0 is active (API v1)" <<<"$out"
-  rm -f "$FD/ext_active"; printf 'true\n' >"$FD/gsettings.d/disable-user-extensions"
+  : >"$FD/ext_squatter"
+  out=$(wdoc); check "doctor: the name held by a process that is not gnome-shell -> warn, naming it" grep -q "^warn org.xwlbridge.Windows is held by :1.73 (pid 4242), which is not gnome-shell" <<<"$out"
+  rm -f "$FD/ext_squatter"; : >"$FD/ext_notags"
+  out=$(wdoc); check "doctor: a mutter without window tags (no move-resize) -> warn" grep -q "^warn .*can't move windows here" <<<"$out"
+  rm -f "$FD/ext_notags" "$FD/ext_active"; printf 'true\n' >"$FD/gsettings.d/disable-user-extensions"
   out=$(wdoc); check "doctor: user extensions turned off by GNOME -> warn" grep -q "^warn .*GNOME has turned off all user extensions" <<<"$out"
   conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "extension=off"
   out=$(wdoc); check "doctor: extension=off -> info" grep -q "^info .*turned off (extension=off)" <<<"$out"

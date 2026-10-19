@@ -123,6 +123,12 @@ pub struct MoveResize {
     pub flags: u32,
 }
 
+/// How many times in a row a client's own move is put back while the
+/// desktop is busy with the window (`DESKTOP_GRACE`, a grab): a client that
+/// re-asserts its position on every ConfigureNotify then gives up the fight
+/// after this many rounds per desktop report instead of bouncing at X speed.
+pub const PUT_BACKS: u8 = 3;
+
 /// One shown toplevel's sync state.
 #[derive(Debug, Default)]
 struct Win {
@@ -132,7 +138,11 @@ struct Win {
     /// The desktop's rectangle as last reported (a MoveResize reply, a
     /// Changed, a resync); `None` until the desktop has said.
     desk: Option<Rect>,
-    /// The desktop's latest serial for this window.
+    /// The order stamp of the newest desktop report taken into `desk` (the
+    /// extension's message serial: replies and signals come from one
+    /// connection, so their serials are the order the desktop sent them in,
+    /// whatever order the client's threads deliver them in). Older reports
+    /// are stale.
     serial: Option<u32>,
     /// X -> desktop: X's latest rectangle not sent yet (latest wins).
     pending: Option<Rect>,
@@ -140,8 +150,9 @@ struct Win {
     pending_flags: u32,
     /// The MoveResize sent and not answered yet (its requested rectangle).
     in_flight: Option<Rect>,
-    /// The rectangle the desktop applied for our last answered MoveResize.
-    applied: Option<Rect>,
+    /// A MoveResize that timed out: the desktop may still carry it out, and
+    /// its late report is ours, not a desktop move.
+    late: Option<Rect>,
     /// A ConfigureWindow we sent the X window: (its request's sequence
     /// number, the rectangle). The first ConfigureNotify generated at or
     /// after it settles it.
@@ -156,17 +167,24 @@ struct Win {
     /// A user-initiated desktop change that came while a MoveResize was in
     /// flight.
     overridden: Option<Rect>,
+    /// The client's own moves put back since the desktop's last report
+    /// (at most `PUT_BACKS`).
+    put_backs: u8,
 }
 
 /// The geometry sync of every shown toplevel (design section 2's loop and
 /// race rules):
-/// 1. echoes are dropped on both sides: a desktop change equal to what the
-///    desktop applied for us, and an X ConfigureNotify of what we configured
+/// 1. echoes are dropped on both sides: a desktop report of the position
+///    the desktop already had while X's own move waits to go (ours landing,
+///    or a state change), and an X ConfigureNotify of what we configured
 ///    from the desktop (by its request's sequence number); stale reports
-///    (older serials, X events generated before our ConfigureWindow) too;
+///    (older order stamps, X events generated before our ConfigureWindow)
+///    too;
 /// 2. while a button is held on a window, X is authoritative for it (the
 ///    client's own drag loop); otherwise the desktop is;
-/// 3. a user-initiated desktop change cancels a pending X -> desktop move;
+/// 3. a user-initiated desktop change cancels a pending X -> desktop move,
+///    and the client's own moves while the user has the window are put back
+///    (position only, at most `PUT_BACKS` per desktop report);
 /// 4. X -> desktop moves are coalesced: the latest wins, at most one in
 ///    flight per window, sent from the window's frame callback (`frame`);
 /// 5. a clamped move (applied != requested) moves the X window back, with
@@ -178,6 +196,24 @@ struct Win {
 #[derive(Debug, Default)]
 pub struct Geometry {
     wins: HashMap<Xid, Win>,
+}
+
+/// Whether a report stamped `stamp` is newer than what `w` has (no stamp:
+/// newer).
+fn fresh(w: &Win, stamp: Option<u32>) -> bool {
+    match (stamp, w.serial) {
+        (Some(s), Some(cur)) => serial_newer(s, cur),
+        _ => true,
+    }
+}
+
+/// `desk`'s position with `x`'s size.
+fn at_desk(desk: Rect, x: Rect) -> Rect {
+    Rect {
+        w: x.w,
+        h: x.h,
+        ..desk
+    }
 }
 
 impl Geometry {
@@ -222,6 +258,12 @@ impl Geometry {
         self.wins.get(&xid).map(|w| w.x)
     }
 
+    /// Whether a desktop report about `xid` stamped `stamp` is newer than
+    /// every one taken so far.
+    pub fn is_fresh(&self, xid: Xid, stamp: u32) -> bool {
+        self.wins.get(&xid).is_some_and(|w| fresh(w, Some(stamp)))
+    }
+
     /// The bridge configured the X window to `rect` with the request of
     /// sequence number `seq` (for any desktop-originated reason: a `Some`
     /// from this type, or the toplevel's own configure): the ConfigureNotify
@@ -261,9 +303,26 @@ impl Geometry {
             || w.user_at
                 .is_some_and(|t| now.saturating_duration_since(t) < DESKTOP_GRACE);
         if !w.held && desktop_busy {
-            // the user is moving it on the desktop: X goes back
+            // the user is moving it on the desktop: X goes back, to the
+            // desktop's position (its size is the client's: a resize of its
+            // own reaches the desktop with its next frame), a few times per
+            // desktop report at most
             w.pending = None;
-            return w.desk;
+            w.pending_flags = 0;
+            let desk = w.desk?;
+            if (desk.x, desk.y) == (rect.x, rect.y) {
+                return None;
+            }
+            if w.put_backs < PUT_BACKS {
+                w.put_backs += 1;
+                return Some(at_desk(desk, rect));
+            }
+            if !w.grab {
+                // the grab is over and the client insists: it wins
+                w.pending = Some(rect);
+            }
+            // during the grab, its end (a report) settles it
+            return None;
         }
         w.pending = Some(rect);
         None
@@ -295,26 +354,50 @@ impl Geometry {
             return None;
         }
         w.in_flight = Some(rect);
-        let user = if w.held { mr::USER } else { 0 };
+        w.late = None;
+        // a held-button move is the client's own drag: mutter's user-move
+        // constraints apply (it may cross monitors); otherwise it stays in
+        // the work area of the monitor it goes to
+        let flags = if w.held { mr::USER } else { mr::CLAMP };
         Some(MoveResize {
             rect,
-            flags: mr::CLAMP | user | extra,
+            flags: flags | extra,
         })
     }
 
-    /// The reply to the window's MoveResize: the desktop applied `applied`
-    /// (after clamping; for a new size, the size asked for until the client
-    /// has drawn it, which a later `Changed` reports).
-    ///
-    /// The extension applies a move inside the call and reports changes
-    /// from an idle callback, so its reply is newer than every `Changed`
-    /// that came before it, and older than every one after it.
-    pub fn applied(&mut self, xid: Xid, applied: Rect) -> Option<Rect> {
+    /// The reply to the window's MoveResize of `requested`: the desktop
+    /// applied `applied` (after clamping; for a new size, the size asked for
+    /// until the client has drawn it, which a later `Changed` reports).
+    /// `stamp`: the reply's order stamp (see `Win::serial`); a reply older
+    /// than a report already taken settles the request and nothing else.
+    pub fn applied(
+        &mut self,
+        xid: Xid,
+        requested: Rect,
+        applied: Rect,
+        stamp: Option<u32>,
+    ) -> Option<Rect> {
         let w = self.wins.get_mut(&xid)?;
-        let requested = w.in_flight.take()?; // not ours (a resync dropped it)
-        w.applied = Some(applied);
+        if w.in_flight != Some(requested) {
+            return None; // not the request in flight (a reset dropped it)
+        }
+        w.in_flight = None;
+        let user = w.overridden.take();
+        if !fresh(w, stamp) {
+            // the desktop reported a newer state before this reply came in
+            // (the client's threads do not keep the desktop's order): that
+            // state stands, and X follows it unless it moved on itself
+            if w.pending.is_some() || w.held {
+                return None;
+            }
+            let desk = at_desk(w.desk?, w.x);
+            return (desk != w.x).then_some(desk);
+        }
+        if stamp.is_some() {
+            w.serial = stamp;
+        }
         w.desk = Some(applied);
-        if let Some(user) = w.overridden.take() {
+        if let Some(user) = user {
             // the user changed it while ours was in flight, and ours landed
             // on top: X follows the user already, so put the user's result
             // back on the desktop
@@ -331,18 +414,26 @@ impl Geometry {
         (applied != requested && applied != w.x).then_some(applied)
     }
 
-    /// The window's MoveResize failed (an error reply, a timeout, the
-    /// extension went away): forget it; X's next move tries again.
-    pub fn failed(&mut self, xid: Xid) {
+    /// The window's MoveResize failed. `answered`: the desktop answered
+    /// with an error (the move did nothing): forget it, X's next move tries
+    /// again. Otherwise (a timeout, the connection went) the desktop may
+    /// still carry it out: its late report is taken as ours, and X's
+    /// position goes again with the next request.
+    pub fn failed(&mut self, xid: Xid, answered: bool) {
         if let Some(w) = self.wins.get_mut(&xid) {
-            w.in_flight = None;
+            let req = w.in_flight.take();
             w.overridden = None;
-            w.pending = None;
-            w.pending_flags = 0;
+            if answered {
+                w.pending = None;
+                w.pending_flags = 0;
+            } else {
+                w.late = req;
+                w.pending = Some(w.pending.unwrap_or(w.x));
+            }
         }
     }
 
-    /// The desktop's `Changed` for the window.
+    /// The desktop's `Changed` for the window (`serial`: its order stamp).
     pub fn changed(
         &mut self,
         xid: Xid,
@@ -352,12 +443,13 @@ impl Geometry {
         now: Instant,
     ) -> Option<Rect> {
         let w = self.wins.get_mut(&xid)?;
-        if w.serial.is_some_and(|s| !serial_newer(serial, s)) {
+        if !fresh(w, Some(serial)) {
             return None; // stale, or a duplicate
         }
         w.serial = Some(serial);
-        w.desk = Some(rect);
+        let prev = w.desk.replace(rect);
         w.grab = flags & st::USER != 0;
+        w.put_backs = 0;
         if w.held {
             return None; // X is authoritative while a button is held
         }
@@ -365,41 +457,60 @@ impl Geometry {
             w.user_at = Some(now);
             w.pending = None; // a user's change beats a pending X move
             w.pending_flags = 0;
+            w.late = None;
             if w.in_flight.is_some() {
                 w.overridden = Some(rect);
             }
             return (rect != w.x).then_some(rect);
         }
-        if w.in_flight.is_some() || w.applied == Some(rect) {
-            return None; // ours landing (the reply settles it), or its echo
+        if w.in_flight.is_some() {
+            return None; // ours landing, or overtaken by it: the reply settles it
+        }
+        if w.late == Some(rect) {
+            // a request of ours that timed out, carried out late
+            w.late = None;
+            if w.pending.is_some() {
+                return None;
+            }
+        }
+        if w.pending.is_some() && prev.is_some_and(|p| (p.x, p.y) == (rect.x, rect.y)) {
+            // the desktop did not move it (a state change, the echo of a
+            // move of ours): X's own move goes next
+            return None;
         }
         if rect == w.x {
             w.pending = None;
             return None;
         }
         // the desktop moved it on its own (a monitor went, mutter's
-        // constraints): the desktop is authoritative
+        // constraints, unmaximise, untile): the desktop is authoritative
         w.pending = None;
         w.pending_flags = 0;
         Some(rect)
     }
 
-    /// A full resync from `GetState` (the extension came or came back): the
-    /// desktop's rectangle, state bits and serial for the window. Requests
-    /// in flight before are void.
+    /// A full resync from `GetState` (the extension came or came back, or
+    /// the monitors changed): the desktop's rectangle, state bits and order
+    /// stamp for the window. A window reported newer since is left alone,
+    /// and a request in flight is settled by its reply.
     pub fn resync(&mut self, xid: Xid, rect: Rect, flags: u32, serial: u32) -> Option<Rect> {
         let w = self.wins.get_mut(&xid)?;
+        if !fresh(w, Some(serial)) {
+            return None; // a newer report came in first
+        }
         w.serial = Some(serial);
         w.desk = Some(rect);
         w.grab = flags & st::USER != 0;
-        w.in_flight = None;
-        w.overridden = None;
-        w.applied = None;
+        w.put_backs = 0;
+        w.late = None;
         if w.held {
             // X rules while held: push X's rectangle instead
             if rect != w.x {
                 w.pending = Some(w.x);
             }
+            return None;
+        }
+        if w.in_flight.is_some() {
             return None;
         }
         w.pending = None;
@@ -765,6 +876,47 @@ impl Layers {
     pub fn retell(&mut self) {
         self.told.clear();
     }
+
+    /// The desktop reports `xid` above (`on`) or not. When that is not what
+    /// it was told, the user changed it there (Always on Top): it becomes
+    /// the window's own wish, so a retell repeats it. True: X's
+    /// `_NET_WM_STATE` is to follow.
+    pub fn desktop(&mut self, xid: Xid, on: bool) -> bool {
+        if !self.own.contains_key(&xid) || self.told.get(&xid).copied().unwrap_or(false) == on {
+            return false;
+        }
+        self.told.insert(xid, on);
+        self.own.insert(xid, on);
+        true
+    }
+}
+
+/// Whether the desktop's monitors fit the X screen of size `screen` one to
+/// one, which the window sync needs (it puts X windows where the desktop
+/// has them, and pointer input reaches only the X screen): every monitor
+/// unscaled (the X screen is in physical pixels, the desktop's layout in
+/// logical ones) and inside the X screen. Otherwise why not.
+pub fn layout_fits(monitors: &[MonitorInfo], screen: (u16, u16)) -> Result<(), String> {
+    if monitors.is_empty() {
+        return Err("the desktop reports no monitors".into());
+    }
+    let (sw, sh) = (i32::from(screen.0), i32::from(screen.1));
+    for m in monitors {
+        if (m.scale - 1.0).abs() > 1e-6 {
+            return Err(format!(
+                "monitor {} is scaled {}x: the sync needs unscaled monitors for now",
+                m.index, m.scale
+            ));
+        }
+        let r = m.rect;
+        if r.x < 0 || r.y < 0 || r.x + r.w > sw || r.y + r.h > sh {
+            return Err(format!(
+                "monitor {} at {}x{}+{}+{} lies outside the {sw}x{sh} X screen",
+                m.index, r.w, r.h, r.x, r.y
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Demands-attention of the shown toplevels from their hints (WM_HINTS
@@ -899,13 +1051,18 @@ pub enum Event {
         xid: Xid,
         requested: Rect,
         applied: Rect,
+        /// The reply's order stamp (`Stamp`).
+        wire: u32,
     },
     /// A request about `xid` failed. Every MoveResize ends in exactly
-    /// one `Applied` or `Failed`.
+    /// one `Applied` or `Failed`. `answered`: the extension answered with
+    /// an error (the request did nothing); otherwise it timed out or the
+    /// connection went, and the desktop may still carry it out.
     Failed {
         xid: Xid,
         method: &'static str,
         error: String,
+        answered: bool,
     },
     Changed {
         xid: Xid,
@@ -914,15 +1071,26 @@ pub enum Event {
         workspace: i32,
         flags: u32,
         serial: u32,
+        /// The signal's order stamp (`Stamp`).
+        wire: u32,
     },
-    /// Our display's windows, bottom to top.
-    Restacked(Vec<Xid>),
+    /// Our display's windows, bottom to top, and the order stamp.
+    Restacked(Vec<Xid>, u32),
     MonitorsChanged,
     WindowGone(Xid),
-    /// Our display's windows, bottom to top.
-    State(Vec<WindowState>),
+    /// Our display's windows, bottom to top, and the reply's order stamp.
+    State(Vec<WindowState>, u32),
     Monitors(Vec<MonitorInfo>),
 }
+
+/// An order stamp: the extension's D-Bus message serial. Its replies and
+/// signals all leave gnome-shell on one connection, so their serials are
+/// the order the desktop sent them in; the client's threads deliver
+/// replies (the worker) and signals (the signal thread) in either order,
+/// so the reverse thread drops what is older than what it has already
+/// taken (`serial_newer`).
+#[allow(dead_code)] // documentation of the `wire` fields
+pub type Stamp = u32;
 
 /// Without `--features gnome` there is no D-Bus client: no window sync, the
 /// 0.1.2 behaviour (`Client::spawn` says so).
@@ -1021,8 +1189,9 @@ pub mod bus {
         Rect::new(q.0, q.1, q.2, q.3)
     }
 
-    /// `Changed` as an event, if it is about a window of `display`.
-    pub(super) fn changed_event(display: u32, b: ChangedBody) -> Option<Event> {
+    /// `Changed` (of order stamp `wire`) as an event, if it is about a
+    /// window of `display`.
+    pub(super) fn changed_event(display: u32, b: ChangedBody, wire: u32) -> Option<Event> {
         let (t, r, monitor, workspace, flags, serial) = b;
         Some(Event::Changed {
             xid: tag_window(&t, display)?,
@@ -1031,12 +1200,13 @@ pub mod bus {
             workspace,
             flags,
             serial,
+            wire,
         })
     }
 
     /// `GetState`'s reply as an event: our display's windows only (one
     /// without a `rect` is dropped; other missing keys read as 0/false).
-    pub(super) fn state_event(display: u32, b: StateBody) -> Event {
+    pub(super) fn state_event(display: u32, b: StateBody, wire: u32) -> Event {
         Event::State(
             b.into_iter()
                 .filter_map(|(t, props)| {
@@ -1056,6 +1226,7 @@ pub mod bus {
                     })
                 })
                 .collect(),
+            wire,
         )
     }
 
@@ -1073,8 +1244,16 @@ pub mod bus {
         )
     }
 
-    pub(super) fn restacked_event(display: u32, tags: Vec<String>) -> Event {
-        Event::Restacked(tags.iter().filter_map(|t| tag_window(t, display)).collect())
+    pub(super) fn restacked_event(display: u32, tags: Vec<String>, wire: u32) -> Event {
+        Event::Restacked(
+            tags.iter().filter_map(|t| tag_window(t, display)).collect(),
+            wire,
+        )
+    }
+
+    /// A message's order stamp (`super::Stamp`).
+    fn wire(msg: &zbus::Message) -> u32 {
+        msg.primary_header().serial_num().get()
     }
 
     /// An eventfd: readable while events wait.
@@ -1107,6 +1286,9 @@ pub mod bus {
         Owner(Option<String>),
         /// The signal stream ended: the session bus is gone.
         BusLost,
+        /// The client was dropped: close the connection (which ends the
+        /// signal threads) and stop.
+        Quit,
     }
 
     /// What the threads share.
@@ -1198,6 +1380,12 @@ pub mod bus {
         }
     }
 
+    impl Drop for Client {
+        fn drop(&mut self) {
+            let _ = self.cmds.send(Cmd::Quit);
+        }
+    }
+
     struct Worker {
         display: u32,
         shared: Arc<Shared>,
@@ -1237,7 +1425,12 @@ pub mod bus {
                         self.conn = None;
                         self.unavailable("lost the session bus");
                     }
+                    Cmd::Quit => break,
                 }
+            }
+            self.proxy = None;
+            if let Some(conn) = self.conn.take() {
+                let _ = conn.close();
             }
         }
 
@@ -1305,6 +1498,13 @@ pub mod bus {
                 );
                 return;
             };
+            // the name is free while the screen is locked (the extension is
+            // disabled there), so any process may take it: only gnome-shell
+            // itself is the extension
+            match owner_is_the_shell(conn, &owner) {
+                Ok(()) => {}
+                Err(why) => return self.unavailable(&why),
+            }
             let proxy = match zbus::blocking::proxy::Builder::<Proxy>::new(conn)
                 .destination(owner.clone())
                 .and_then(|b| b.path(PATH))
@@ -1383,6 +1583,7 @@ pub mod bus {
                         xid,
                         method,
                         error: "the extension is not available".into(),
+                        answered: true,
                     });
                 }
                 return;
@@ -1396,13 +1597,15 @@ pub mod bus {
                     rect: req,
                     flags,
                 } => proxy
-                    .call::<_, _, Quad>(method, &(t(xid), req.x, req.y, req.w, req.h, flags))
-                    .map(|q| {
-                        Some(Event::Applied {
+                    .call_method(method, &(t(xid), req.x, req.y, req.w, req.h, flags))
+                    .and_then(|m| {
+                        let q: Quad = m.body().deserialize()?;
+                        Ok(Some(Event::Applied {
                             xid,
                             requested: req,
                             applied: rect(q),
-                        })
+                            wire: wire(&m),
+                        }))
                     }),
                 Request::SetInitialPosition { xid, x, y } => {
                     proxy.call(method, &(t(xid), x, y)).map(none)
@@ -1418,9 +1621,10 @@ pub mod bus {
                 Request::SetWorkspace { xid, index } => {
                     proxy.call(method, &(t(xid), index)).map(none)
                 }
-                Request::GetState => proxy
-                    .call::<_, _, StateBody>(method, &())
-                    .map(|b| Some(state_event(d, b))),
+                Request::GetState => proxy.call_method(method, &()).and_then(|m| {
+                    let b: StateBody = m.body().deserialize()?;
+                    Ok(Some(state_event(d, b, wire(&m))))
+                }),
                 Request::GetMonitors => proxy
                     .call::<_, _, Vec<MonitorBody>>(method, &())
                     .map(|b| Some(monitors_event(b))),
@@ -1435,6 +1639,10 @@ pub mod bus {
                             xid,
                             method,
                             error: e.to_string(),
+                            answered: matches!(
+                                e,
+                                zbus::Error::MethodError(..) | zbus::Error::FDO(_)
+                            ),
                         });
                     }
                 }
@@ -1451,9 +1659,42 @@ pub mod bus {
     }
 
     fn name_owner(conn: &Connection) -> Option<String> {
+        owner_of(conn, BUS_NAME)
+    }
+
+    fn owner_of(conn: &Connection, name: &str) -> Option<String> {
         let dbus = zbus::blocking::fdo::DBusProxy::new(conn).ok()?;
-        let name = zbus::names::BusName::try_from(BUS_NAME).ok()?;
+        let name = zbus::names::BusName::try_from(name).ok()?;
         dbus.get_name_owner(name).ok().map(|n| n.to_string())
+    }
+
+    /// The name gnome-shell owns on the session bus.
+    pub const SHELL_NAME: &str = "org.gnome.Shell";
+
+    /// Whether `owner` (the unique name owning `BUS_NAME`) is gnome-shell's
+    /// connection: the extension runs inside gnome-shell, and serves the
+    /// name on gnome-shell's own connection. Otherwise the reason, naming
+    /// the process that holds the name.
+    fn owner_is_the_shell(conn: &Connection, owner: &str) -> Result<(), String> {
+        let shell = owner_of(conn, SHELL_NAME);
+        if shell.as_deref() == Some(owner) {
+            return Ok(());
+        }
+        let pid = zbus::blocking::fdo::DBusProxy::new(conn)
+            .ok()
+            .and_then(|d| {
+                let n = zbus::names::BusName::try_from(owner.to_string()).ok()?;
+                d.get_connection_unix_process_id(n).ok()
+            })
+            .map_or_else(|| "unknown".to_string(), |p| p.to_string());
+        Err(match shell {
+            Some(_) => format!(
+                "{BUS_NAME} is held by {owner} (pid {pid}), which is not gnome-shell: refusing it"
+            ),
+            None => format!(
+                "{BUS_NAME} is held by {owner} (pid {pid}) and gnome-shell is not on this bus: refusing it"
+            ),
+        })
     }
 
     /// A signal of the extension as an event: only from the current owner,
@@ -1465,11 +1706,13 @@ pub mod bus {
             return None;
         }
         let body = msg.body();
+        let stamp = wire(msg);
         match hdr.member()?.as_str() {
-            "Changed" => changed_event(display, body.deserialize::<ChangedBody>().ok()?),
+            "Changed" => changed_event(display, body.deserialize::<ChangedBody>().ok()?, stamp),
             "Restacked" => Some(restacked_event(
                 display,
                 body.deserialize::<Vec<String>>().ok()?,
+                stamp,
             )),
             "MonitorsChanged" => Some(Event::MonitorsChanged),
             "WindowGone" => Some(Event::WindowGone(tag_window(
@@ -1478,6 +1721,15 @@ pub mod bus {
             )?)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+impl Geometry {
+    /// The reply to the request in flight, with no order stamp.
+    fn reply(&mut self, xid: Xid, applied: Rect) -> Option<Rect> {
+        let requested = self.wins.get(&xid)?.in_flight?;
+        self.applied(xid, requested, applied, None)
     }
 }
 
@@ -1592,9 +1844,9 @@ mod tests {
         assert_eq!(g.frame(XID), None, "at most one in flight per window");
         assert_eq!(g.frame(XID), None);
         // the reply: applied as asked; the next frame sends the latest
-        assert_eq!(g.applied(XID, r(130, 100)), None);
+        assert_eq!(g.reply(XID, r(130, 100)), None);
         assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(150, 100)));
-        assert_eq!(g.applied(XID, r(150, 100)), None);
+        assert_eq!(g.reply(XID, r(150, 100)), None);
         assert_eq!(g.frame(XID), None, "nothing left");
     }
 
@@ -1627,7 +1879,13 @@ mod tests {
         let mut g = synced(R0);
         g.button(XID, true);
         g.x_configured(XID, r(300, 100), 1, t0());
-        assert_eq!(g.frame(XID).map(|m| m.flags), Some(mr::CLAMP | mr::USER));
+        // mutter's user-move constraints, not the work-area clamp (which
+        // would keep a self-drag from crossing to another monitor)
+        assert_eq!(g.frame(XID).map(|m| m.flags), Some(mr::USER));
+        g.button(XID, false);
+        g.reply(XID, r(300, 100));
+        g.x_configured(XID, r(310, 100), 2, t0());
+        assert_eq!(g.frame(XID).map(|m| m.flags), Some(mr::CLAMP));
     }
 
     #[test]
@@ -1636,7 +1894,7 @@ mod tests {
         let t = t0();
         g.x_configured(XID, r(1, 1), 1, t);
         assert!(g.frame(XID).is_some());
-        g.failed(XID);
+        g.failed(XID, true);
         assert!(!g.in_flight(XID));
         assert_eq!(g.frame(XID), None, "dropped, not retried every frame");
         g.x_configured(XID, r(2, 2), 2, t);
@@ -1646,8 +1904,8 @@ mod tests {
             "the next move goes"
         );
         // a reply nobody waits for is ignored
-        g.failed(XID);
-        assert_eq!(g.applied(XID, r(2, 2)), None);
+        g.failed(XID, true);
+        assert_eq!(g.reply(XID, r(2, 2)), None);
     }
 
     #[test]
@@ -1656,11 +1914,11 @@ mod tests {
         let t = t0();
         assert_eq!(g.x_configured(1, R0, 1, t), None);
         assert_eq!(g.changed(1, R0, st::USER, 1, t), None);
-        assert_eq!(g.applied(1, R0), None);
+        assert_eq!(g.reply(1, R0), None);
         assert_eq!(g.button(1, true), None);
         assert_eq!(g.resync(1, R0, 0, 1), None);
         g.x_sent(1, R0, 1);
-        g.failed(1);
+        g.failed(1, true);
         assert!(!g.is_tracked(1));
         g.track(1, R0);
         assert!(g.is_tracked(1));
@@ -1678,7 +1936,7 @@ mod tests {
         g.frame(XID).unwrap();
         // mutter reports the move before the reply: ours, in flight
         assert_eq!(g.changed(XID, r(200, 100), 0, 11, t), None);
-        assert_eq!(g.applied(XID, r(200, 100)), None);
+        assert_eq!(g.reply(XID, r(200, 100)), None);
         // and again after it (a later size-changed, same rectangle)
         assert_eq!(g.changed(XID, r(200, 100), 0, 12, t), None);
         assert_eq!(g.frame(XID), None, "converged after one round trip");
@@ -1690,7 +1948,7 @@ mod tests {
         let t = t0();
         g.x_configured(XID, r(200, 100), 1, t);
         g.frame(XID).unwrap();
-        g.applied(XID, r(200, 100));
+        g.reply(XID, r(200, 100));
         // X moved on, then the late echo of the applied rectangle comes
         g.x_configured(XID, r(250, 100), 2, t);
         assert_eq!(
@@ -1799,7 +2057,7 @@ mod tests {
         // a desktop change while held (even a user one) does not move X
         assert_eq!(g.changed(XID, r(0, 0), 0, 11, t), None);
         assert_eq!(g.changed(XID, r(0, 0), st::USER, 12, t), None);
-        assert_eq!(g.applied(XID, r(150, 100)), None);
+        assert_eq!(g.reply(XID, r(150, 100)), None);
         g.x_configured(XID, r(160, 100), 2, t);
         assert_eq!(
             g.frame(XID).map(|m| m.rect),
@@ -1815,7 +2073,7 @@ mod tests {
         g.button(XID, true);
         g.x_configured(XID, r(150, 100), 1, t);
         g.frame(XID).unwrap();
-        g.applied(XID, r(150, 100));
+        g.reply(XID, r(150, 100));
         // a desktop change while held is kept for the release
         assert_eq!(g.changed(XID, r(500, 500), 0, 12, t), None);
         assert_eq!(g.button(XID, false), Some(r(500, 500)));
@@ -1834,7 +2092,7 @@ mod tests {
         g.x_configured(XID, r(150, 100), 1, t);
         g.frame(XID).unwrap();
         assert_eq!(g.button(XID, false), None, "in flight");
-        assert_eq!(g.applied(XID, r(150, 100)), None);
+        assert_eq!(g.reply(XID, r(150, 100)), None);
         g.button(XID, true);
         g.x_configured(XID, r(160, 100), 2, t);
         assert_eq!(g.button(XID, false), None, "pending");
@@ -1899,7 +2157,7 @@ mod tests {
         let max = Rect::new(0, 32, 1920, 1048);
         assert_eq!(g.changed(XID, max, st::USER, 11, t), Some(max));
         g.x_sent(XID, max, 70);
-        assert_eq!(g.applied(XID, r(150, 100)), None, "X stays with the user");
+        assert_eq!(g.reply(XID, r(150, 100)), None, "X stays with the user");
         // the user's result goes back to the desktop
         assert_eq!(
             g.frame(XID),
@@ -1908,7 +2166,7 @@ mod tests {
                 flags: mr::CLAMP | mr::USER
             })
         );
-        assert_eq!(g.applied(XID, max), None);
+        assert_eq!(g.reply(XID, max), None);
         assert_eq!(g.frame(XID), None, "converged");
     }
 
@@ -1920,7 +2178,7 @@ mod tests {
         g.x_configured(XID, r(150, 100), 1, t);
         g.frame(XID).unwrap();
         assert_eq!(g.changed(XID, r(20, 20), 0, 11, t), None, "held back");
-        assert_eq!(g.applied(XID, r(150, 100)), None, "ours is on top");
+        assert_eq!(g.reply(XID, r(150, 100)), None, "ours is on top");
         assert_eq!(g.changed(XID, r(150, 100), 0, 12, t), None, "its echo");
         assert_eq!(g.frame(XID), None);
     }
@@ -1970,7 +2228,7 @@ mod tests {
         g.x_configured(XID, r(-50, 100), 1, t);
         g.frame(XID).unwrap();
         // the desktop kept it inside the work area
-        assert_eq!(g.applied(XID, r(0, 100)), Some(r(0, 100)));
+        assert_eq!(g.reply(XID, r(0, 100)), Some(r(0, 100)));
         g.x_sent(XID, r(0, 100), 90);
         assert_eq!(g.x_configured(XID, r(0, 100), 90, t), None, "our own");
         assert_eq!(g.frame(XID), None);
@@ -1984,7 +2242,7 @@ mod tests {
         g.x_configured(XID, Rect::new(100, 100, 5000, 300), 1, t);
         g.frame(XID).unwrap();
         let fit = Rect::new(100, 100, 1820, 300);
-        assert_eq!(g.applied(XID, fit), Some(fit));
+        assert_eq!(g.reply(XID, fit), Some(fit));
     }
 
     #[test]
@@ -1997,10 +2255,10 @@ mod tests {
         g.x_configured(XID, r(-10, 100), 1, t);
         g.frame(XID).unwrap();
         g.x_configured(XID, r(-20, 100), 2, t);
-        assert_eq!(g.applied(XID, r(0, 100)), None);
+        assert_eq!(g.reply(XID, r(0, 100)), None);
         assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(-20, 100)));
         // the last one: X goes back to the edge, as under an X WM
-        assert_eq!(g.applied(XID, r(0, 100)), Some(r(0, 100)));
+        assert_eq!(g.reply(XID, r(0, 100)), Some(r(0, 100)));
     }
 
     #[test]
@@ -2008,7 +2266,7 @@ mod tests {
         let mut g = synced(R0);
         g.x_configured(XID, r(1, 1), 1, t0());
         g.frame(XID).unwrap();
-        assert_eq!(g.applied(XID, r(1, 1)), None);
+        assert_eq!(g.reply(XID, r(1, 1)), None);
     }
 
     // ---- resync ----
@@ -2020,22 +2278,249 @@ mod tests {
         assert_eq!(g.resync(XID, r(7, 7), 0, 100), Some(r(7, 7)));
         g.x_sent(XID, r(7, 7), 1);
         assert_eq!(g.resync(XID, r(7, 7), 0, 101), None);
-        // a move in flight across a reconnect is void
+        // a move in flight across a resync waits for its reply
         g.x_configured(XID, r(8, 8), 2, t0());
         g.frame(XID).unwrap();
+        assert_eq!(g.resync(XID, r(7, 7), 0, 102), None);
+        assert!(g.in_flight(XID));
+        assert_eq!(g.reply(XID, r(8, 8)), None);
+        // a reconnect voids it, and the stamps restart
+        g.x_configured(XID, r(6, 6), 3, t0());
+        g.frame(XID).unwrap();
+        g.reset();
         assert_eq!(
             g.resync(XID, r(7, 7), 0, 1),
             Some(r(7, 7)),
-            "serials restart"
+            "stamps restart"
         );
         assert!(!g.in_flight(XID));
         // held: X's rectangle is pushed instead
         g.x_sent(XID, r(7, 7), 3);
         g.button(XID, true);
         g.x_configured(XID, r(9, 9), 4, t0());
-        g.frame(XID).unwrap();
         assert_eq!(g.resync(XID, r(7, 7), 0, 5), None);
         assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(9, 9)));
+    }
+
+    // ---- review fixes (research/release/p1/p1-fix.md) ----
+
+    /// The desktop restores the rectangle our last MoveResize got (an
+    /// unmaximise, an untile): X follows it (B1).
+    #[test]
+    fn a_desktop_restore_to_our_last_rectangle_moves_x() {
+        let t = t0();
+        let a = Rect::new(300, 200, 212, 192);
+        let mut g = synced(Rect::new(50, 60, 212, 192));
+        assert_eq!(g.x_configured(XID, a, 10, t), None);
+        let m = g.frame(XID).expect("sent");
+        assert_eq!(g.reply(XID, m.rect), None);
+        assert_eq!(g.changed(XID, a, 0, 11, t), None, "its echo");
+        // maximised: the configure resized X, the Changed moves it
+        let max = Rect::new(0, 32, 1280, 688);
+        g.x_sent(XID, max, 20);
+        assert_eq!(g.x_configured(XID, max, 20, t), None);
+        assert_eq!(
+            g.changed(XID, max, st::MAXIMIZED, 12, t),
+            None,
+            "X is there"
+        );
+        // unmaximised: the size comes back first, then the position
+        let back = Rect::new(0, 32, 212, 192);
+        g.x_sent(XID, back, 30);
+        assert_eq!(g.x_configured(XID, back, 30, t), None);
+        assert_eq!(g.changed(XID, a, 0, 13, t), Some(a), "X follows it back");
+    }
+
+    /// A state-only report (focus, keep-above) while X's own move waits
+    /// does not put X back.
+    #[test]
+    fn a_state_change_does_not_undo_a_pending_x_move() {
+        let t = t0();
+        let mut g = synced(R0);
+        assert_eq!(g.x_configured(XID, r(300, 100), 1, t), None);
+        assert_eq!(g.changed(XID, R0, st::FOCUSED, 11, t), None);
+        assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(300, 100)));
+    }
+
+    /// A GetState computed before a Changed and delivered after it does
+    /// not move X back (M6).
+    #[test]
+    fn an_older_resync_does_not_rewind_a_newer_changed() {
+        let t = t0();
+        let mut g = synced(r(50, 60));
+        let newer = r(700, 300);
+        assert_eq!(g.changed(XID, newer, 0, 20, t), Some(newer));
+        g.x_sent(XID, newer, 5);
+        assert_eq!(g.resync(XID, r(600, 300), 0, 19), None);
+        assert_eq!(g.desk(XID), Some(newer));
+    }
+
+    /// The reply to our move delivered after the echo of a later move:
+    /// the later state stands (M6).
+    #[test]
+    fn a_reply_older_than_a_report_settles_only_its_request() {
+        let t = t0();
+        let mut g = synced(R0);
+        g.x_configured(XID, r(200, 100), 1, t);
+        let m = g.frame(XID).unwrap();
+        // the desktop applied ours (stamp 20), then moved it on its own
+        // (stamp 21); the signal thread is quicker than the worker
+        assert_eq!(g.changed(XID, r(0, 0), 0, 21, t), None, "ours in flight");
+        assert_eq!(
+            g.applied(XID, m.rect, m.rect, Some(20)),
+            Some(r(0, 0)),
+            "X follows the newer report"
+        );
+        assert!(!g.in_flight(XID));
+        // the echo of an earlier position after a newer reply is stale
+        g.x_sent(XID, r(0, 0), 2);
+        g.x_configured(XID, r(40, 0), 3, t);
+        let m = g.frame(XID).unwrap();
+        assert_eq!(g.applied(XID, m.rect, m.rect, Some(30)), None);
+        assert_eq!(g.changed(XID, r(0, 0), 0, 29, t), None, "stale");
+        assert_eq!(g.desk(XID), Some(r(40, 0)));
+    }
+
+    /// A reply is matched to its request: one that is not in flight is
+    /// ignored.
+    #[test]
+    fn a_reply_to_another_request_is_ignored() {
+        let mut g = synced(R0);
+        g.x_configured(XID, r(10, 0), 1, t0());
+        let m = g.frame(XID).unwrap();
+        assert_eq!(g.applied(XID, r(99, 99), r(99, 99), None), None);
+        assert!(g.in_flight(XID), "still waiting for its own");
+        assert_eq!(g.applied(XID, m.rect, m.rect, None), None);
+        assert!(!g.in_flight(XID));
+    }
+
+    /// While the user has the window, a client that re-asserts its
+    /// position is put back a few times per desktop report, not at X
+    /// speed, and only its position (M8).
+    #[test]
+    fn put_backs_during_a_grab_are_bounded_and_keep_the_clients_size() {
+        let t = t0();
+        let mut g = synced(r(400, 300));
+        let user = r(600, 300);
+        assert_eq!(g.changed(XID, user, st::USER, 11, t), Some(user));
+        g.x_sent(XID, user, 1);
+        let mut n = 0;
+        for i in 0..1000u64 {
+            if let Some(back) = g.x_configured(XID, r(400, 300), 2 + 2 * i, t) {
+                n += 1;
+                g.x_sent(XID, back, 3 + 2 * i);
+            }
+        }
+        assert_eq!(n, usize::from(PUT_BACKS));
+        // the next report allows a few more
+        assert_eq!(
+            g.changed(XID, r(610, 300), st::USER, 12, t),
+            Some(r(610, 300))
+        );
+        g.x_sent(XID, r(610, 300), 3000);
+        // a resize of its own during the user's move keeps its size
+        let grown = Rect::new(400, 300, R0.w + 50, R0.h);
+        assert_eq!(
+            g.x_configured(XID, grown, 3001, t),
+            Some(Rect::new(610, 300, R0.w + 50, R0.h))
+        );
+        // the grab ends where the client left X: X follows the desktop
+        g.x_sent(XID, Rect::new(610, 300, R0.w + 50, R0.h), 3002);
+        for i in 0..10u64 {
+            if let Some(back) = g.x_configured(XID, r(400, 300), 3003 + 2 * i, t) {
+                g.x_sent(XID, back, 3004 + 2 * i);
+            }
+        }
+        assert_eq!(g.x_rect(XID), Some(r(400, 300)), "it gave up");
+        assert_eq!(g.changed(XID, r(610, 300), 0, 13, t), Some(r(610, 300)));
+        // after the grace, a client that insists wins
+        g.x_sent(XID, r(610, 300), 4000);
+        let later = ms(t, 50);
+        let mut back = 0;
+        for i in 0..10u64 {
+            if let Some(b) = g.x_configured(XID, r(400, 300), 4001 + 2 * i, later) {
+                back += 1;
+                g.x_sent(XID, b, 4002 + 2 * i);
+            }
+        }
+        assert!(back <= usize::from(PUT_BACKS));
+        assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(400, 300)));
+    }
+
+    /// A MoveResize that times out may still land: its late report is
+    /// ours, and X's newer position goes next (fallback review).
+    #[test]
+    fn a_timed_out_move_that_lands_late_is_ours() {
+        let t = t0();
+        let mut g = synced(R0);
+        g.x_configured(XID, r(100, 300), 1, t);
+        let a = g.frame(XID).unwrap();
+        g.x_configured(XID, r(500, 300), 2, t);
+        g.failed(XID, false); // timed out
+        assert_eq!(g.changed(XID, a.rect, 0, 11, t), None, "no X move");
+        assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(500, 300)));
+        // an error reply did nothing: forget it
+        let mut g = synced(R0);
+        g.x_configured(XID, r(100, 300), 1, t);
+        g.frame(XID).unwrap();
+        g.failed(XID, true);
+        assert!(!g.pending(XID) && !g.in_flight(XID));
+        // a timeout with X still where it asked: sent again (a no-op if it
+        // landed)
+        let mut g = synced(R0);
+        g.x_configured(XID, r(100, 300), 1, t);
+        g.frame(XID).unwrap();
+        g.failed(XID, false);
+        assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(100, 300)));
+    }
+
+    #[test]
+    fn the_layout_must_be_unscaled_and_on_the_x_screen() {
+        let m = |index, rect, scale| MonitorInfo {
+            index,
+            rect,
+            work_area: rect,
+            scale,
+            primary: index == 0,
+        };
+        let one = m(0, Rect::new(0, 0, 1280, 720), 1.0);
+        assert_eq!(layout_fits(std::slice::from_ref(&one), (1280, 720)), Ok(()));
+        assert_eq!(
+            layout_fits(
+                &[one.clone(), m(1, Rect::new(1280, 0, 1280, 720), 1.0)],
+                (2560, 720)
+            ),
+            Ok(())
+        );
+        // a monitor added and the X screen could not grow (Xvfb)
+        assert!(
+            layout_fits(
+                &[one.clone(), m(1, Rect::new(1280, 0, 1280, 720), 1.0)],
+                (1280, 720)
+            )
+            .is_err()
+        );
+        // scaled: the X screen is physical, the layout logical
+        assert!(layout_fits(&[m(0, Rect::new(0, 0, 1280, 720), 2.0)], (2560, 1440)).is_err());
+        assert!(layout_fits(&[m(0, Rect::new(0, 0, 1280, 720), 1.25)], (1600, 900)).is_err());
+        assert!(layout_fits(&[], (1280, 720)).is_err());
+    }
+
+    #[test]
+    fn always_on_top_from_the_desktop_becomes_the_windows_own() {
+        let mut l = Layers::new();
+        l.set(1, true, None);
+        assert_eq!(l.changes(), vec![(1, true)]);
+        assert!(!l.desktop(1, true), "what it was told");
+        assert!(l.desktop(1, false), "the user turned it off");
+        assert!(!l.above(1));
+        assert_eq!(l.changes(), vec![], "nothing to tell back");
+        l.retell();
+        assert_eq!(l.changes(), vec![], "a retell repeats the user's choice");
+        assert!(l.desktop(1, true));
+        l.retell();
+        assert_eq!(l.changes(), vec![(1, true)]);
+        assert!(!l.desktop(2, true), "unknown windows are not taken");
     }
 
     #[test]
@@ -2045,7 +2530,7 @@ mod tests {
         g.frame(XID).unwrap();
         g.reset();
         assert!(!g.in_flight(XID));
-        assert_eq!(g.applied(XID, r(1, 1)), None, "a late reply is ignored");
+        assert_eq!(g.reply(XID, r(1, 1)), None, "a late reply is ignored");
         assert_eq!(g.frame(XID), None);
         assert!(g.is_tracked(XID));
     }
@@ -2075,7 +2560,7 @@ mod tests {
                     x: m.rect.x.max(0),
                     ..m.rect
                 };
-                if let Some(back) = g.applied(XID, desk) {
+                if let Some(back) = g.reply(XID, desk) {
                     seq += 1;
                     g.x_sent(XID, back, seq);
                     x = back;
@@ -2089,7 +2574,7 @@ mod tests {
                 x: m.rect.x.max(0),
                 ..m.rect
             };
-            if let Some(back) = g.applied(XID, desk) {
+            if let Some(back) = g.reply(XID, desk) {
                 x = back;
             }
         }
@@ -2198,7 +2683,7 @@ mod tests {
         assert_eq!(g.x_configured(XID, x, 1, t), None);
         let m = g.frame(XID).expect("the client's resize goes out");
         assert_eq!(m.rect, x);
-        assert_eq!(g.applied(XID, x), None);
+        assert_eq!(g.reply(XID, x), None);
         let stale = Rect::new(100, 100, 400, 300);
         assert_eq!(
             g.changed(
@@ -2294,7 +2779,7 @@ mod tests {
             if let Some(m) = g.frame(XID) {
                 assert_ne!(m.flags & mr::USER, 0, "a held drag is the user's");
                 desk_actual = m.rect.x; // mutter moves it in the call
-                assert_eq!(g.applied(XID, m.rect), None);
+                assert_eq!(g.reply(XID, m.rect), None);
             }
             assert_eq!(root, p, "the X pointer is where the desktop's is");
         }
@@ -2575,7 +3060,8 @@ mod bus_tests {
         assert_eq!(
             changed_event(
                 2,
-                (ours.clone(), (1, 2, 3, 4), 1, ALL_WORKSPACES, st::USER, 9)
+                (ours.clone(), (1, 2, 3, 4), 1, ALL_WORKSPACES, st::USER, 9),
+                44
             ),
             Some(Event::Changed {
                 xid: 0x400001,
@@ -2583,16 +3069,17 @@ mod bus_tests {
                 monitor: 1,
                 workspace: ALL_WORKSPACES,
                 flags: st::USER,
-                serial: 9
+                serial: 9,
+                wire: 44,
             })
         );
         assert_eq!(
-            changed_event(2, (theirs.clone(), (1, 2, 3, 4), 0, 0, 0, 9)),
+            changed_event(2, (theirs.clone(), (1, 2, 3, 4), 0, 0, 0, 9), 45),
             None
         );
         assert_eq!(
-            restacked_event(2, vec![ours, theirs, "junk".into(), tag(2, 5)]),
-            Event::Restacked(vec![0x400001, 5])
+            restacked_event(2, vec![ours, theirs, "junk".into(), tag(2, 5)], 46),
+            Event::Restacked(vec![0x400001, 5], 46)
         );
         assert_eq!(
             monitors_event(vec![(
@@ -2636,7 +3123,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import System from 'system';
 
-const [address, version, features] = System.programArgs;
+const [address, version, features, squat] = System.programArgs;
 const IFACE = `<node><interface name="org.xwlbridge.Windows1">
  <method name="Version"><arg type="u" direction="out"/></method>
  <method name="Features"><arg type="as" direction="out"/></method>
@@ -2743,8 +3230,14 @@ const test = {
 };
 Gio.DBusExportedObject.wrapJSObject(IFACE, windows).export(conn, '/org/xwlbridge/Windows');
 Gio.DBusExportedObject.wrapJSObject(TEST, test).export(conn, '/org/xwlbridge/Test');
-Gio.bus_own_name_on_connection(conn, 'org.xwlbridge.Windows', Gio.BusNameOwnerFlags.NONE,
+// the extension runs in gnome-shell: the bridge accepts only the owner of org.gnome.Shell
+// ("squat": a process that took the name but is not gnome-shell)
+const own = () => Gio.bus_own_name_on_connection(conn, 'org.xwlbridge.Windows', Gio.BusNameOwnerFlags.NONE,
     () => print('OWNED'), null);
+if (squat === 'squat')
+    own();
+else
+    Gio.bus_own_name_on_connection(conn, 'org.gnome.Shell', Gio.BusNameOwnerFlags.NONE, own, null);
 new GLib.MainLoop(null, false).run();
 "#;
 
@@ -2798,10 +3291,15 @@ new GLib.MainLoop(null, false).run();
     }
 
     fn serve(bus: &Bus, version: u32, features: &str) -> Fake {
+        serve_as(bus, version, features, "shell")
+    }
+
+    /// `who`: "shell" (it is gnome-shell's connection) or "squat" (not).
+    fn serve_as(bus: &Bus, version: u32, features: &str, who: &str) -> Fake {
         let mut child = Command::new("gjs")
             .arg("-m")
             .arg(bus.dir.join("fake.js"))
-            .args([bus.address.as_str(), &version.to_string(), features])
+            .args([bus.address.as_str(), &version.to_string(), features, who])
             .stdout(Stdio::piped())
             .spawn()
             .expect("gjs");
@@ -2851,6 +3349,43 @@ new GLib.MainLoop(null, false).run();
     fn settle(c: &Client, d: Duration) -> Vec<Event> {
         std::thread::sleep(d);
         c.events().collect()
+    }
+
+    /// `e` with its order stamp 0 (stamps are the bus's serials).
+    fn unstamped(e: Event) -> Event {
+        match e {
+            Event::Applied {
+                xid,
+                requested,
+                applied,
+                ..
+            } => Event::Applied {
+                xid,
+                requested,
+                applied,
+                wire: 0,
+            },
+            Event::Changed {
+                xid,
+                rect,
+                monitor,
+                workspace,
+                flags,
+                serial,
+                ..
+            } => Event::Changed {
+                xid,
+                rect,
+                monitor,
+                workspace,
+                flags,
+                serial,
+                wire: 0,
+            },
+            Event::Restacked(o, _) => Event::Restacked(o, 0),
+            Event::State(s, _) => Event::State(s, 0),
+            e => e,
+        }
     }
 
     #[test]
@@ -2906,18 +3441,19 @@ new GLib.MainLoop(null, false).run();
         });
         let e = wait_for(&c, &mut seen, |e| matches!(e, Event::Applied { .. }));
         assert_eq!(
-            e,
+            e.map(unstamped),
             Some(Event::Applied {
                 xid: mine,
                 requested: rect,
                 applied: Rect::new(0, 10, 100, 100),
+                wire: 0,
             }),
             "the (iiii) reply"
         );
         c.send(Request::Raise { xid: 0x400002 });
         let e = wait_for(&c, &mut seen, |e| matches!(e, Event::Failed { .. }));
         assert!(
-            matches!(&e, Some(Event::Failed { xid: 0x400002, method: "Raise", error }) if error.contains("NoSuchWindow")),
+            matches!(&e, Some(Event::Failed { xid: 0x400002, method: "Raise", error, answered: true }) if error.contains("NoSuchWindow")),
             "{e:?}"
         );
         for r in [
@@ -2954,18 +3490,21 @@ new GLib.MainLoop(null, false).run();
         ] {
             c.send(r);
         }
-        let e = wait_for(&c, &mut seen, |e| matches!(e, Event::State(_)));
+        let e = wait_for(&c, &mut seen, |e| matches!(e, Event::State(..)));
         assert_eq!(
-            e,
-            Some(Event::State(vec![WindowState {
-                xid: mine,
-                rect: Rect::new(10, 20, 300, 200),
-                monitor: 1,
-                workspace: ALL_WORKSPACES,
-                flags: st::FOCUSED,
-                serial: 7,
-                shown: true,
-            }])),
+            e.map(unstamped),
+            Some(Event::State(
+                vec![WindowState {
+                    xid: mine,
+                    rect: Rect::new(10, 20, 300, 200),
+                    monitor: 1,
+                    workspace: ALL_WORKSPACES,
+                    flags: st::FOCUSED,
+                    serial: 7,
+                    shown: true,
+                }],
+                0
+            )),
             "only display 5's windows, and only with a rectangle"
         );
         c.send(Request::GetMonitors);
@@ -3011,8 +3550,19 @@ new GLib.MainLoop(null, false).run();
             .unwrap();
         test_call(&test, "Emit");
         let got = settle(&c, Duration::from_millis(500));
+        let stamps: Vec<u32> = got
+            .iter()
+            .filter_map(|e| match e {
+                Event::Changed { wire, .. } | Event::Restacked(_, wire) => Some(*wire),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stamps.len() == 2 && serial_newer(stamps[1], stamps[0]),
+            "stamps in the extension's order: {stamps:?}"
+        );
         assert_eq!(
-            got,
+            got.into_iter().map(unstamped).collect::<Vec<_>>(),
             vec![
                 Event::Changed {
                     xid: mine,
@@ -3020,9 +3570,10 @@ new GLib.MainLoop(null, false).run();
                     monitor: 1,
                     workspace: ALL_WORKSPACES,
                     flags: st::USER,
-                    serial: 103
+                    serial: 103,
+                    wire: 0,
                 },
-                Event::Restacked(vec![1, 3]),
+                Event::Restacked(vec![1, 3], 0),
                 Event::MonitorsChanged,
                 Event::WindowGone(mine),
             ],
@@ -3047,6 +3598,18 @@ new GLib.MainLoop(null, false).run();
             drop(other);
             std::thread::sleep(Duration::from_millis(100));
         }
+
+        // a compatible one that is not gnome-shell (the name is free while
+        // the screen is locked): refused
+        let squatter = serve_as(&bus, 1, "move-resize", "squat");
+        let got = settle(&c, Duration::from_millis(400));
+        assert!(
+            !got.iter().any(|e| matches!(e, Event::Available { .. })),
+            "a squatter: {got:?}"
+        );
+        assert!(!c.available());
+        drop(squatter);
+        std::thread::sleep(Duration::from_millis(100));
 
         // a compatible one again: available again
         let _ext = serve(&bus, 2, "move-resize");
@@ -3228,15 +3791,17 @@ mod e2e_tests {
         // the window as the desktop has it, once shown
         let state = loop {
             c.send(Request::GetState);
-            let Event::State(s) = wait(&mut q, &mut wl, &c, |e| matches!(e, Event::State(_)))
+            let Event::State(s, swire) =
+                wait(&mut q, &mut wl, &c, |e| matches!(e, Event::State(..)))
             else {
                 unreachable!()
             };
             if let Some(ws) = s.into_iter().find(|ws| ws.xid == XID && ws.shown) {
-                break ws;
+                break (ws, swire);
             }
             std::thread::sleep(Duration::from_millis(100));
         };
+        let (state, swire) = state;
         eprintln!("e2e: shown as {state:?}");
         assert_eq!((state.rect.w, state.rect.h), (w, h));
         c.send(Request::GetMonitors);
@@ -3256,7 +3821,7 @@ mod e2e_tests {
         // the left edge of the work area; the desktop clamps; X goes back
         let mut g = Geometry::new();
         g.track(XID, state.rect);
-        assert_eq!(g.resync(XID, state.rect, state.flags, state.serial), None);
+        assert_eq!(g.resync(XID, state.rect, state.flags, swire), None);
         let past = Rect::new(wa.x - 50, wa.y + 40, w, h);
         let t = Instant::now();
         assert_eq!(g.x_configured(XID, past, 1, t), None);
@@ -3266,8 +3831,12 @@ mod e2e_tests {
             rect: m.rect,
             flags: m.flags,
         });
-        let Event::Applied { applied, .. } =
-            wait(&mut q, &mut wl, &c, |e| matches!(e, Event::Applied { .. }))
+        let Event::Applied {
+            applied,
+            requested,
+            wire: awire,
+            ..
+        } = wait(&mut q, &mut wl, &c, |e| matches!(e, Event::Applied { .. }))
         else {
             unreachable!()
         };
@@ -3277,14 +3846,15 @@ mod e2e_tests {
             Rect::new(wa.x, wa.y + 40, w, h),
             "clamped to the work area"
         );
-        assert_eq!(g.applied(XID, applied), Some(applied), "X goes back");
+        assert_eq!(
+            g.applied(XID, requested, applied, Some(awire)),
+            Some(applied),
+            "X goes back"
+        );
         g.x_sent(XID, applied, 2);
         // the desktop's report of it is an echo
         let Event::Changed {
-            rect,
-            flags,
-            serial,
-            ..
+            rect, flags, wire, ..
         } = wait(
             &mut q,
             &mut wl,
@@ -3294,7 +3864,7 @@ mod e2e_tests {
         else {
             unreachable!()
         };
-        assert_eq!(g.changed(XID, rect, flags, serial, Instant::now()), None);
+        assert_eq!(g.changed(XID, rect, flags, wire, Instant::now()), None);
         assert_eq!(g.frame(XID), None, "converged after one round trip");
 
         // state requests come back as state bits

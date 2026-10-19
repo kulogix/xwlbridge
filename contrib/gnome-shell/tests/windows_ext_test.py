@@ -236,6 +236,11 @@ PASS = 0
 FAIL = 0
 
 
+def now_ms():
+    """An input timestamp as the compositor makes them (CLOCK_MONOTONIC in ms)."""
+    return int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000) & 0xffffffff
+
+
 def check(name, cond, detail=''):
     global PASS, FAIL
     if cond:
@@ -327,6 +332,15 @@ def main():
     check('clamp: size limited to the work area', tuple(reply[0]) == tuple(wa0), (reply, wa0))
     ok = pump(wl, 5, lambda: (c := last_changed(ext, tag_a)) is not None and tuple(c[1]) == tuple(wa0))
     check('Changed(A) = the work area', ok, (last_changed(ext, tag_a), wa0))
+    # -- the clamp is the target monitor's, and a monitor-sized rectangle stays
+    m1, wa1 = mons[1][1], mons[1][2]
+    reply = ext.call('MoveResize', '(siiiiu)', tag_a, wa1[0] + 40, wa1[1] + 40, 300, 200, 1)
+    check('clamp: a move to the other monitor goes there', tuple(reply[0]) == (wa1[0] + 40, wa1[1] + 40, 300, 200),
+          (reply, wa1))
+    pump(wl, 2)
+    reply = ext.call('MoveResize', '(siiiiu)', tag_a, *m0[1], 1)
+    check('clamp: a monitor-sized rectangle is not shrunk', tuple(reply[0]) == tuple(m0[1]), (reply, m0))
+    pump(wl, 2)
     ext.call('MoveResize', '(siiiiu)', tag_a, 200, 150, 420, 320, 0)
     pump(wl, 3, lambda: (c := last_changed(ext, tag_a)) is not None and tuple(c[1]) == (200, 150, 420, 320))
 
@@ -372,7 +386,9 @@ def main():
     ok = pump(wl, 3, lambda: (c := last_changed(ext, tag_a)) is not None and not c[4] & 16)
     check('SetAbove(false) -> cleared', ok, last_changed(ext, tag_a))
 
-    ext.call('Activate', '(su)', tag_a, 0)
+    check('Activate(timestamp 0) -> InvalidArgs', ext.error('Activate', '(su)', tag_a, 0) ==
+          'org.freedesktop.DBus.Error.InvalidArgs')
+    ext.call('Activate', '(su)', tag_a, now_ms())
     ok = pump(wl, 3, lambda: (c := last_changed(ext, tag_a)) is not None and c[4] & 32)
     check('Activate -> focused (32)', ok, last_changed(ext, tag_a))
 
@@ -404,16 +420,33 @@ def main():
     tag_d = 'xwlbridge:99:0x400002'
     d = Toplevel(wl, tag_d, size=(200, 150))
     pump(wl, 4, lambda: (s := state_of(ext, tag_d)) is not None and s['shown'])
-    ext.call('Activate', '(su)', tag_d, 0)
+    ext.call('Activate', '(su)', tag_d, now_ms())
     pump(wl, 2)
     restacks = [args[0] for name, args in ext.signals if name == 'Restacked']
     check('Restacked lists our windows bottom-to-top', bool(restacks) and restacks[-1] == [tag_a, tag_d], restacks[-3:])
     st = ext.call('GetState')[0]
     check('GetState stack order matches', [t for t, dd in sorted(st, key=lambda e: e[1]['stack'])] == [tag_a, tag_d], st)
-    ext.call('Activate', '(su)', tag_a, 0)
+    ext.call('Activate', '(su)', tag_a, now_ms())
     pump(wl, 2)
     restacks = [args[0] for name, args in ext.signals if name == 'Restacked']
     check('Activate(A) -> Restacked [D, A]', bool(restacks) and restacks[-1] == [tag_d, tag_a], restacks[-3:])
+    # -- a window that is not showing goes below every showing one (it stays mapped in X)
+    ext.call('Minimize', '(sb)', tag_a, True)
+    pump(wl, 2)
+    restacks = [args[0] for name, args in ext.signals if name == 'Restacked']
+    check('Minimize(A) -> Restacked [A, D]', bool(restacks) and restacks[-1] == [tag_a, tag_d], restacks[-3:])
+    ext.call('Minimize', '(sb)', tag_a, False)
+    ext.call('Activate', '(su)', tag_a, now_ms())
+    pump(wl, 2)
+    if ext.error('SetWorkspace', '(si)', tag_a, 1) is None:  # a second workspace exists (dynamic workspaces)
+        pump(wl, 2)
+        restacks = [args[0] for name, args in ext.signals if name == 'Restacked']
+        check('A on another workspace -> Restacked [A, D]', bool(restacks) and restacks[-1] == [tag_a, tag_d],
+              restacks[-3:])
+        ext.call('SetWorkspace', '(si)', tag_a, 0)
+        pump(wl, 2)
+    ext.call('Activate', '(su)', tag_a, now_ms())
+    pump(wl, 2)
 
     lout, _ = listener.communicate(timeout=10)
     check('a process that never called the extension received no signal', lout.strip() == '0', lout)
