@@ -1,0 +1,8 @@
+{
+  "uuid": "xwlbridge-windows@xwlbridge",
+  "name": "X11 window integration (xwlbridge)",
+  "description": "Lets the xwlbridge X11 bridge keep the X windows it shows on the desktop (-showwindows) in step with GNOME: an X window that moves or resizes itself moves on the desktop too, X windows open where the app asks, and desktop moves, maximising, stacking and focus reach the X app. It answers only the bridge process that owns a window, and only for windows the bridge tagged as its own (xwlbridge:...). No other window can be read or changed through it.",
+  "shell-version": ["49", "50"],
+  "url": "https://github.com/kulogix/xwlbridge",
+  "version-name": "1.0"
+}

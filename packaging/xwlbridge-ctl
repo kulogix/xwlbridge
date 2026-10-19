@@ -49,12 +49,14 @@ die() { local rc=$1; shift; say "$*"; exit "$rc"; }
 
 # ---------------------------------------------------------------- configuration
 
-CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display)
+CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension)
 declare -A CFG=(
   [engine]=auto [capture]=area [uidisplay]=auto [server]=vncserver-x11 [rfb_port]=5900
   [server_log]=30 [server_args]="" [log]=normal [bridge_args]="" [xvnc]=auto [xvfb]=auto
-  [backend]=gnome [bridge]=auto [display]=auto
+  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto
 )
+# the GNOME Shell extension for -showwindows' window integration (install.sh installs it; setting `extension`)
+WINDOWS_EXT=xwlbridge-windows@xwlbridge
 CFG_FILE=""
 CFG_ERRORS=()
 CFG_WARNINGS=()
@@ -106,6 +108,7 @@ cfg_validate() {
   [[ ${CFG[uidisplay]} =~ ^(auto|none|[[:alnum:]._-]*:[0-9]+(\.[0-9]+)?)$ ]] || CFG_ERRORS+=("uidisplay: '${CFG[uidisplay]}' is not auto, none or an X display such as :0")
   case ${CFG[backend]} in gnome|wlr|auto) ;; *) CFG_ERRORS+=("backend: '${CFG[backend]}' is not gnome, wlr or auto");; esac
   case ${CFG[log]} in quiet|normal|verbose) ;; *) CFG_ERRORS+=("log: '${CFG[log]}' is not quiet, normal or verbose");; esac
+  case ${CFG[extension]} in auto|off) ;; *) CFG_ERRORS+=("extension: '${CFG[extension]}' is not auto or off");; esac
   if [ -n "${CFG[rfb_port]}" ] && [ "${CFG[rfb_port]}" != realvnc ]; then
     if [[ ! ${CFG[rfb_port]} =~ ^[0-9]{1,5}$ ]] || (( 10#${CFG[rfb_port]} < 1 || 10#${CFG[rfb_port]} > 65535 )); then
       CFG_ERRORS+=("rfb_port: '${CFG[rfb_port]}' is not a TCP port (1-65535), realvnc or empty")
@@ -281,7 +284,7 @@ rfb_port_number() {
 # the reason in ERR on a configuration error, EX_TEMPFAIL when the desktop's X
 # display that RealVNC's windows need is not there (yet).
 build_command() {
-  CMD=(); NOTES=("${CFG_WARNINGS[@]}"); ERR=""; ENGINE=""; ENGINE_BIN=""
+  CMD=(); CMD_ENV=(); NOTES=("${CFG_WARNINGS[@]}"); ERR=""; ENGINE=""; ENGINE_BIN=""
   if [ ${#CFG_ERRORS[@]} -gt 0 ]; then ERR="configuration errors: ${CFG_ERRORS[*]}"; return $EX_CONFIG; fi
   local bridge server refusals engine=${CFG[engine]}
   if [[ -v BRIDGE_OVERRIDES[engine] ]]; then engine=${BRIDGE_OVERRIDES[engine],,}; fi
@@ -305,6 +308,8 @@ build_command() {
     *) ERR="bridge_args: invalid -engine '${BRIDGE_OVERRIDES[engine]}'"; return $EX_CONFIG;;
   esac
   ENGINE=$engine
+  # extension=off: the bridge leaves the window extension alone even where GNOME runs it
+  [ "${CFG[extension]}" = off ] && CMD_ENV+=(XWLBRIDGE_WINDOWS_EXTENSION=off)
   local w
   if [ "$MODE" = display ]; then
     # the bridge's X display alone, for X11 tools (xwlbridge.service): no VNC server, no RealVNC UI
@@ -444,6 +449,7 @@ cmd_run() {
   local n; for n in "${NOTES[@]}"; do say "$n"; done
   prepare_engine_path || die 1 "cannot prepare $(runtime_dir)/bin"
   say "config ${CFG_FILE:-(built-in defaults)}; engine $ENGINE${ENGINE_BIN:+ ($ENGINE_BIN)}"
+  [ ${#CMD_ENV[@]} -eq 0 ] || { export "${CMD_ENV[@]}"; say "environment: ${CMD_ENV[*]}"; }
   say "starting: $(shell_quote "${CMD[@]}")"
   exec "${CMD[@]}"
 }
@@ -454,6 +460,7 @@ cmd_command() {
   [ $rc -eq 0 ] || die "$rc" "$ERR"
   local n; for n in "${NOTES[@]}"; do say "$n"; done
   [ -n "$ENGINE_BIN" ] && say "engine $ENGINE: $ENGINE_BIN (via $(runtime_dir)/bin first on PATH)"
+  [ ${#CMD_ENV[@]} -eq 0 ] || say "environment: ${CMD_ENV[*]}"
   shell_quote "${CMD[@]}"
 }
 
@@ -526,7 +533,7 @@ ensure_config_file() {
 
 default_of() {
   case $1 in
-    engine|xvnc|xvfb|uidisplay|bridge|display) echo auto;; capture) echo area;; server) echo vncserver-x11;;
+    engine|xvnc|xvfb|uidisplay|bridge|display|extension) echo auto;; capture) echo area;; server) echo vncserver-x11;;
     rfb_port) echo 5900;; server_log) echo 30;; log) echo normal;; backend) echo gnome;; *) echo "";;
   esac
 }
@@ -640,6 +647,49 @@ rvnc_has_password() {
     [ -r "$f" ] && grep -qiE '^[[:space:]]*Password[[:space:]]*=[[:space:]]*[^[:space:]]' "$f" 2>/dev/null && return 0
   done
   return 1
+}
+
+# The window extension (-showwindows' window integration): installed where, enabled, loaded, API version.
+# Read-only: gnome-extensions info, gsettings get and one Version() call on the session bus.
+doctor_windows_extension() {
+  local shell_run=$1 d dir="" ver="" st="" info api enabled="" el due
+  for d in "${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$WINDOWS_EXT" \
+           "/usr/local/share/gnome-shell/extensions/$WINDOWS_EXT" "/usr/share/gnome-shell/extensions/$WINDOWS_EXT"; do
+    [ -f "$d/metadata.json" ] && { dir=$d; break; }
+  done
+  [ -n "$dir" ] && ver=$(sed -n 's/.*"version-name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/metadata.json" | head -1)
+  if [ -n "$shell_run" ] && command -v gnome-extensions >/dev/null 2>&1; then
+    info=$(t5 gnome-extensions info "$WINDOWS_EXT" 2>/dev/null) && st=$(sed -n 's/^ *State: *//p' <<<"$info" | head -1)
+  fi
+  api=$(t5 busctl --user call org.xwlbridge.Windows /org/xwlbridge/Windows org.xwlbridge.Windows1 Version 2>/dev/null | sed -n 's/^u //p')
+  if el=$(t5 gsettings get org.gnome.shell enabled-extensions 2>/dev/null); then
+    case $el in *"'$WINDOWS_EXT'"*) enabled=yes;; *) enabled=no;; esac
+  fi
+  due=$(t5 gsettings get org.gnome.shell disable-user-extensions 2>/dev/null)
+  local what="window extension $WINDOWS_EXT${ver:+ $ver}"
+  local without="Without it -showwindows works as before: an X window that moves itself moves only inside X, and new windows open where GNOME puts them."
+  if [ "${CFG[extension]}" = off ]; then
+    report info gnome.windows_extension "$what: turned off (extension=off)${dir:+; still installed in $dir}" "$without" \
+      "To use it: $PROG config set extension auto, run install.sh again, then log out and in once."
+  elif [ -n "$api" ]; then
+    report ok gnome.windows_extension "$what is active (API v$api)${dir:+ ($dir)}"
+  elif [ -z "$dir" ]; then
+    report info gnome.windows_extension "$what is not installed" "$without" "install.sh installs and enables it (unless --no-extension or extension=off)."
+  elif [ "$due" = true ]; then
+    report warn gnome.windows_extension "$what is installed, but GNOME has turned off all user extensions" \
+      "GNOME does this after gnome-shell crashed right after starting. Turn them back on: gsettings set org.gnome.shell disable-user-extensions false"
+  elif [ "$enabled" = no ]; then
+    report warn gnome.windows_extension "$what is installed ($dir) but not enabled" \
+      "gnome-extensions enable $WINDOWS_EXT   (GNOME on Wayland loads a newly installed extension at the next login: log out and in once)"
+  elif [ -z "$shell_run" ]; then
+    report info gnome.windows_extension "$what is installed${enabled:+ and enabled}; not checked further (no running GNOME Shell)"
+  elif [ -z "$st" ] || [ "$st" = INITIALIZED ]; then
+    report warn gnome.windows_extension "$what is installed and enabled, but this GNOME session has not loaded it: log out and in once" \
+      "GNOME on Wayland loads a newly installed extension at the next login."
+  else
+    report warn gnome.windows_extension "$what is installed and enabled, but GNOME reports it as $st (its service does not answer)" \
+      "gnome-extensions info $WINDOWS_EXT; journalctl --user -b | grep $WINDOWS_EXT"
+  fi
 }
 
 cmd_doctor() {
@@ -924,6 +974,7 @@ cmd_doctor() {
     fi
   fi
   fi   # MODE=realvnc
+  doctor_windows_extension "$shell_run"
   if [ "$(t5 systemctl is-active gnome-remote-desktop.service 2>/dev/null)" = active ]; then
     report info gnome.remote_login "GNOME Remote Login (system gnome-remote-desktop, RDP) is active; no conflict with VNC"
   fi

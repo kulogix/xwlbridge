@@ -1,10 +1,12 @@
 #!/bin/bash
 # Installs xwlbridge for the current user (no root needed): the bridge, xwlbridge-ctl,
-# the systemd user services (started with the GNOME session) and a settings file.
+# the systemd user services (started with the GNOME session), a settings file and the
+# GNOME Shell extension xwlbridge-windows@xwlbridge (window integration for -showwindows).
 # Running it again upgrades in place; settings are kept. An xwlrvnc install (this
 # project's name before 0.1.0) is taken over once: xwlbridge-ctl migrate.
 #
 #   ./install.sh [--bin PATH] [--prefix DIR] [--service S] [--port N] [--engine E] [--no-enable] [--no-start]
+#                [--no-extension]
 #
 #   --bin PATH     the xwlbridge binary (default: ./xwlbridge in a release bundle, else
 #                  the source tree's target/dist/xwlbridge or target/release/xwlbridge)
@@ -20,13 +22,18 @@
 #   --engine E     engine for a new settings file (auto|builtin|xvnc|xvfb|xwayland; default auto)
 #   --no-enable    do not enable the service for future sessions
 #   --no-start     do not start (or restart) it now
+#   --no-extension do not install the GNOME Shell extension xwlbridge-windows@xwlbridge
+#                  (and remove a copy an earlier install.sh put there); sets extension=off
+#                  in the settings, so later upgrades leave it out too. Without the
+#                  extension -showwindows works as in 0.1.2. Installed (the default), it is
+#                  enabled and starts after one log-out/log-in on Wayland
 #
 # Remove with: ~/.local/share/xwlbridge/uninstall.sh
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-BIN="" PREFIX="$HOME/.local" PORT="" ENGINE="" ENABLE=1 START=1 SERVICE=auto
+BIN="" PREFIX="$HOME/.local" PORT="" ENGINE="" ENABLE=1 START=1 SERVICE=auto EXTENSION=1
 while [ $# -gt 0 ]; do
   case $1 in
     --bin) BIN=$2; shift 2;;
@@ -35,8 +42,9 @@ while [ $# -gt 0 ]; do
     --engine) ENGINE=$2; shift 2;;
     --no-enable) ENABLE=0; shift;;
     --no-start) START=0; shift;;
+    --no-extension) EXTENSION=0; shift;;
     --service) SERVICE=$2; shift 2;;
-    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "install.sh: unknown option $1 (try --help)" >&2; exit 2;;
   esac
 done
@@ -79,6 +87,12 @@ grep -q -- '-backend.*gnome' <<<"$help" || die "$BIN was built without the GNOME
 grep -q -- 'xvnc' <<<"$help" || warn "$BIN was built without the stock engines (feature xvfb): only engine=builtin works"
 bver=$("$BIN" -version 2>&1 | head -1)
 
+# the window extension: in a bundle beside install.sh, in the source tree under contrib/
+EXT_UUID=xwlbridge-windows@xwlbridge EXT_SRC=""
+for d in "$SRC/gnome-shell/$EXT_UUID" "$SRC/../contrib/gnome-shell/$EXT_UUID"; do
+  [ -f "$d/metadata.json" ] && [ -f "$d/extension.js" ] && { EXT_SRC=$d; break; }
+done
+
 CONF_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 BINDIR=$PREFIX/bin
 SHARE=$PREFIX/share/xwlbridge
@@ -89,6 +103,8 @@ CFGDIR=$CONF_HOME/xwlbridge
 CFG=$CFGDIR/xwlbridge.conf
 MANIFEST=$SHARE/manifest
 APPDIR=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+EXT_BASE=${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell
+EXT_DIR=$EXT_BASE/extensions/$EXT_UUID
 
 UPGRADE=0; OLD_VERSION=""
 if [ -f "$MANIFEST" ]; then UPGRADE=1; OLD_VERSION=$(sed -n 's/^version //p' "$MANIFEST" | head -1); fi
@@ -199,6 +215,100 @@ else
   fi
 fi
 
+# ------------------------------------------------------------- GNOME Shell extension (window integration)
+# xwlbridge-windows@xwlbridge serves -showwindows (docs/extension.md). It is copied into the user's
+# extensions directory and added to org.gnome.shell enabled-extensions: GNOME on Wayland loads an extension
+# it did not know at login only, so a new one starts after one log-out/log-in. The manifest's
+# "extension-enabled" line records that this installer enabled it (uninstall.sh then disables it again).
+EXT_ENABLED=0 EXT_NOTE=""
+[ $UPGRADE = 1 ] && grep -qxF "extension-enabled $EXT_UUID" "$MANIFEST" && EXT_ENABLED=1
+gs_list() {  # gs_list KEY: org.gnome.shell's string list KEY, one item per line (fails without gsettings/dconf)
+  local v it
+  v=$(timeout 5 gsettings get org.gnome.shell "$1" 2>/dev/null) || return 1
+  case $v in *'"'*|*'\'*) return 1;; esac   # an item with quotes: leave the list to the user
+  v=${v#@as }; v=${v#[}; v=${v%]}
+  local IFS=,
+  for it in $v; do
+    it=${it#"${it%%[![:space:]]*}"}; it=${it%"${it##*[![:space:]]}"}; it=${it#\'}; it=${it%\'}
+    [ -n "$it" ] && printf '%s\n' "$it"
+  done
+  return 0
+}
+gs_set_list() {  # gs_set_list KEY ITEM...: writes the list and checks it was stored (dconf reachable)
+  local key=$1 out="" it; shift
+  for it in "$@"; do out+="${out:+, }'$it'"; done
+  timeout 5 gsettings set org.gnome.shell "$key" "[$out]" 2>/dev/null || return 1
+  local want=""; [ $# -eq 0 ] || want=$(printf '%s\n' "$@")
+  [ "$(gs_list "$key")" = "$want" ]
+}
+ext_enable() {  # enables the extension for the next login (and now, where the running shell knows it already)
+  local en dis
+  en=$(gs_list enabled-extensions) || return 1
+  dis=$(gs_list disabled-extensions) || dis=""
+  if grep -qxF "$EXT_UUID" <<<"$en"; then
+    return 0
+  fi
+  # enabled by an earlier install.sh and no longer enabled: the user turned it off (Extensions app,
+  # gnome-extensions disable); an upgrade leaves that choice alone
+  if [ $UPGRADE = 1 ] && [ $EXT_ENABLED = 1 ]; then
+    EXT_NOTE="kept disabled: it was turned off since the last install (turn it on in Extensions, or: gnome-extensions enable $EXT_UUID)"
+    return 0
+  fi
+  # a running shell that already knows the extension enables it now (and updates the lists itself)
+  if timeout 5 gnome-extensions enable "$EXT_UUID" >/dev/null 2>&1 && gs_list enabled-extensions | grep -qxF "$EXT_UUID"; then
+    EXT_ENABLED=1; return 0
+  fi
+  if grep -qxF "$EXT_UUID" <<<"$dis"; then
+    mapfile -t rest < <(grep -vxF "$EXT_UUID" <<<"$dis")
+    gs_set_list disabled-extensions "${rest[@]}" || return 1
+  fi
+  mapfile -t items < <(printf '%s\n' "$en" | grep -v '^$')
+  gs_set_list enabled-extensions "${items[@]}" "$EXT_UUID" || return 1
+  EXT_ENABLED=1
+}
+ext_disable() {  # undoes ext_enable (call it as: ext_disable || true)
+  timeout 5 gnome-extensions disable "$EXT_UUID" >/dev/null 2>&1
+  local en dis
+  if en=$(gs_list enabled-extensions) && grep -qxF "$EXT_UUID" <<<"$en"; then
+    mapfile -t rest < <(grep -vxF "$EXT_UUID" <<<"$en"); gs_set_list enabled-extensions "${rest[@]}"
+  fi
+  if dis=$(gs_list disabled-extensions) && grep -qxF "$EXT_UUID" <<<"$dis"; then
+    mapfile -t rest < <(grep -vxF "$EXT_UUID" <<<"$dis"); gs_set_list disabled-extensions "${rest[@]}"
+  fi
+  EXT_ENABLED=0
+}
+if [ $EXTENSION = 0 ]; then
+  "$BINDIR/xwlbridge-ctl" config set extension off 2>/dev/null || warn "could not set extension=off in $CFG"
+fi
+EXT_WANT=$("$BINDIR/xwlbridge-ctl" config get extension 2>/dev/null) || EXT_WANT=auto
+SHELLV=$(timeout 5 gnome-shell --version 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)
+if [ "$EXT_WANT" = off ]; then
+  if [ $EXT_ENABLED = 1 ]; then ext_disable || true; say "disabled the GNOME Shell extension $EXT_UUID"; fi
+  [ -e "$EXT_DIR" ] && grep -qxF "file $EXT_DIR/extension.js" "$MANIFEST" 2>/dev/null && say "removing the GNOME Shell extension $EXT_UUID (extension=off)"
+  say "GNOME Shell extension $EXT_UUID: not installed (extension=off; -showwindows works as in 0.1.2)"
+elif [ -z "$EXT_SRC" ]; then
+  warn "the GNOME Shell extension $EXT_UUID is not in this package; -showwindows works as in 0.1.2"
+elif [ -n "$SHELLV" ] && ! grep -qE "\"$SHELLV\"" "$EXT_SRC/metadata.json"; then
+  say "GNOME Shell extension $EXT_UUID: not installed (it is for GNOME Shell 49 and 50; this is $SHELLV)"
+else
+  ext_changed=0
+  for f in metadata.json extension.js; do cmp -s -- "$EXT_SRC/$f" "$EXT_DIR/$f" || ext_changed=1; done
+  ext_new=0; [ -f "$EXT_DIR/extension.js" ] || ext_new=1
+  for d in "$EXT_BASE" "$EXT_BASE/extensions" "$EXT_DIR"; do [ -e "$d" ] || CREATED_DIRS+=("$d"); done
+  put 0644 "$EXT_SRC/metadata.json" "$EXT_DIR/metadata.json"
+  put 0644 "$EXT_SRC/extension.js" "$EXT_DIR/extension.js"
+  if ext_enable; then
+    if [ -n "$EXT_NOTE" ]; then say "GNOME Shell extension $EXT_UUID: installed, $EXT_NOTE"
+    elif [ $ext_new = 1 ]; then say "GNOME Shell extension $EXT_UUID: installed and enabled. It starts after you log out and in once (GNOME on Wayland loads new extensions at login)"
+    elif [ $ext_changed = 1 ]; then say "GNOME Shell extension $EXT_UUID: updated; GNOME runs the new version after you log out and in once"
+    else say "GNOME Shell extension $EXT_UUID: installed and enabled"; fi
+  else
+    warn "installed the GNOME Shell extension $EXT_UUID in $EXT_DIR but could not enable it (no gsettings/dconf here?)"
+    warn "  enable it from your session: gnome-extensions enable $EXT_UUID, then log out and in once"
+  fi
+  say "  (opt out: ./install.sh --no-extension, or xwlbridge-ctl config set extension off and run install.sh again)"
+fi
+
 # ------------------------------------------------------------- manifest
 OLD_FILES=()
 [ $UPGRADE = 1 ] && mapfile -t OLD_FILES < <(sed -n 's/^file //p' "$MANIFEST")
@@ -210,6 +320,7 @@ OLD_FILES=()
   for f in "${NEW_FILES[@]}"; do echo "file $f"; done
   echo "file $SHARE/vnc-before.list"
   if [ $CREATED_CFG = 1 ] || grep -q '^config ' "$MANIFEST" 2>/dev/null; then echo "config $CFG"; fi
+  [ $EXT_ENABLED = 1 ] && echo "extension-enabled $EXT_UUID"
   printf '%s\n' "${CREATED_DIRS[@]}" | LC_ALL=C sort -u | sed 's/^/dir /'
 } >"$MANIFEST.new"
 echo "file $MANIFEST" >>"$MANIFEST.new"
@@ -218,6 +329,10 @@ mv -f -- "$MANIFEST.new" "$MANIFEST"
 for f in "${OLD_FILES[@]}"; do
   grep -qxF "file $f" "$MANIFEST" || { rm -f -- "$f"; say "removed obsolete $f"; }
 done
+# extension=off after an install with the extension: its directory, once empty (only what this installer created)
+if [ "$EXT_WANT" = off ] && [ -d "$EXT_DIR" ]; then
+  while IFS= read -r d; do [ -d "$d" ] && rmdir -- "$d" 2>/dev/null || true; done < <(printf '%s\n' "${CREATED_DIRS[@]}" | grep -xF -e "$EXT_DIR" -e "$EXT_BASE/extensions" -e "$EXT_BASE" | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)
+fi
 
 # ------------------------------------------------------------- service
 if ! systemctl --user show-environment >/dev/null 2>&1; then
