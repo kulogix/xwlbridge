@@ -2,7 +2,7 @@
 
 All notable changes to xwlbridge are listed here. The format follows Keep a Changelog.
 
-## Unreleased
+## 0.2.0 (2026-10-19)
 
 ### Added
 
