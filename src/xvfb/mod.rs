@@ -89,6 +89,7 @@ mod record;
 mod reverse;
 // -showwindows' pointer during a held self-drag of a synced window (reverse.rs)
 mod selfdrag;
+mod tray;
 mod wlhost;
 // -showwindows' window sync with the desktop (reverse.rs)
 mod winsync;
@@ -1021,6 +1022,14 @@ fn supervise(server: Arc<Server>, display: u32, auth: Auth) {
             // here, a panic, or a failure part way through Agent::new
             let _teardown = Teardown(server.clone());
             let mut agent = Agent::new(server.clone(), display, auth.clone())?;
+            // the X tray, shown on the desktop (kept for as long as this agent runs)
+            let _tray = server.config.showwindows.then(|| {
+                let tray = tray::start(display, auth.clone());
+                if tray.is_some() {
+                    crate::log!("-showwindows: the system tray is up");
+                }
+                tray
+            });
             if let Some(devs) = agent.reverse.as_ref().filter(|_| server.config.showwindows) {
                 // one reverse thread for the process: it outlives agent restarts
                 // (the master device stays, and the thread re-reads windows)
