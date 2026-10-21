@@ -112,6 +112,10 @@ pub struct StreamState {
     /// The negotiated size, when it differs from what the layout said.
     pub size_mismatch: Option<(u32, u32)>,
     pub frames: u64,
+    /// The negotiated format is one our framebuffer can take byte for byte
+    /// (8-bit BGRx/BGRA in the sRGB colour description); frames of any other
+    /// are dropped, never shown with the wrong colours.
+    usable: bool,
 }
 
 /// One monitor's capture stream.
@@ -163,8 +167,46 @@ fn int_range(default: i32, min: i32, max: i32) -> spa::pod::Value {
     )))
 }
 
+/// The colour descriptions an 8-bit sRGB framebuffer can hold as-is: BT.709
+/// (= sRGB) primaries with an SDR transfer function, or no description at all
+/// (mutter before 50 announces none). mutter 50 tags its 8-bit formats
+/// BT.709/gamma 2.2 and offers 10-bit/FP16 only as BT.2020/PQ (HDR monitors);
+/// a PQ- or HLG-encoded frame copied into the X framebuffer would show washed
+/// out, shifted colours, so such a stream is refused rather than displayed.
+fn sdr_colorimetry(primaries: u32, transfer: u32) -> bool {
+    use spa::sys::*;
+    matches!(
+        primaries,
+        SPA_VIDEO_COLOR_PRIMARIES_UNKNOWN | SPA_VIDEO_COLOR_PRIMARIES_BT709
+    ) && matches!(
+        transfer,
+        SPA_VIDEO_TRANSFER_UNKNOWN
+            | SPA_VIDEO_TRANSFER_GAMMA22
+            | SPA_VIDEO_TRANSFER_SRGB
+            | SPA_VIDEO_TRANSFER_BT709
+    )
+}
+
+/// An `Id` choice property (enum of `alts`, default first).
+fn id_enum(key: u32, alts: &[u32]) -> spa::pod::Property {
+    prop(
+        key,
+        spa::pod::Value::Choice(spa::pod::ChoiceValue::Id(spa::utils::Choice(
+            spa::utils::ChoiceFlags::empty(),
+            spa::utils::ChoiceEnum::Enum {
+                default: spa::utils::Id(alts[0]),
+                alternatives: alts.iter().map(|&a| spa::utils::Id(a)).collect(),
+            },
+        ))),
+    )
+}
+
 /// What we accept: raw BGRx or BGRA (mutter's two SDR formats, both our byte
-/// order) and any size (a monitor stream's is fixed by mutter anyway).
+/// order) and any size (a monitor stream's is fixed by mutter anyway), in the
+/// sRGB colour description only (see [`sdr_colorimetry`]). The colour
+/// properties are not mandatory, so a producer that announces none (mutter
+/// < 50) still matches; one that announces another (an HDR-encoded 8-bit
+/// stream) does not.
 ///
 /// With `fps`, also a maximum frame rate, which mutter enforces by skipping
 /// frames that come too soon and redrawing later to deliver their damage.
@@ -219,6 +261,18 @@ fn enum_format(width: u32, height: u32, fps: Option<u32>) -> Vec<u8> {
             }
         ),
     );
+    obj.properties.push(id_enum(
+        spa::sys::SPA_FORMAT_VIDEO_colorPrimaries,
+        &[spa::sys::SPA_VIDEO_COLOR_PRIMARIES_BT709],
+    ));
+    obj.properties.push(id_enum(
+        spa::sys::SPA_FORMAT_VIDEO_transferFunction,
+        &[
+            spa::sys::SPA_VIDEO_TRANSFER_GAMMA22,
+            spa::sys::SPA_VIDEO_TRANSFER_SRGB,
+            spa::sys::SPA_VIDEO_TRANSFER_BT709,
+        ],
+    ));
     if let Some(fps) = fps {
         let fps = fps.max(1);
         obj.properties.push(spa::pod::property!(
@@ -328,6 +382,7 @@ impl Capture {
             lost: false,
             size_mismatch: None,
             frames: 0,
+            usable: true,
         }));
         let listener = stream
             .add_local_listener_with_user_data(state.clone())
@@ -365,15 +420,21 @@ impl Capture {
                 }
                 let mut st = st.borrow_mut();
                 let (w, h) = (info.size().width, info.size().height);
-                if !matches!(info.format(), VideoFormat::BGRx | VideoFormat::BGRA) {
+                let (primaries, transfer) = (info.color_primaries(), info.transfer_function());
+                let format_ok = matches!(info.format(), VideoFormat::BGRx | VideoFormat::BGRA);
+                let colour_ok = sdr_colorimetry(primaries, transfer);
+                // param_changed only fires on a change of the format
+                if !format_ok || !colour_ok {
                     crate::warning!(
-                        "gnome: stream {} negotiated unsupported format {:?}",
+                        "gnome: stream {} negotiated {:?} (colour primaries {primaries}, transfer \
+                         {transfer}), which is not 8-bit sRGB; its frames are dropped",
                         st.key,
                         info.format()
                     );
                 }
+                st.usable = format_ok && colour_ok;
                 crate::vlog!(
-                    "gnome: stream {} format {:?} {w}x{h} max {}/{} fps",
+                    "gnome: stream {} format {:?} {w}x{h} max {}/{} fps colour {primaries}/{transfer}",
                     st.key,
                     info.format(),
                     info.max_framerate().num,
@@ -422,6 +483,9 @@ impl Capture {
                     // size 0: a cursor-only (or failed) buffer, whose damage meta
                     // is stale; the pixels we already have stay valid
                     if corrupted || size == 0 || stride <= 0 {
+                        continue;
+                    }
+                    if !st.usable {
                         continue;
                     }
                     let Some(src) = d.data() else { continue };
@@ -611,7 +675,96 @@ fn to_argb(data: &[u8], width: u32, height: u32, stride: i32, bgra: bool) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use super::to_argb;
+    use super::{enum_format, sdr_colorimetry, to_argb};
+    use pipewire::spa;
+    use spa::pod::{ChoiceValue, Value};
+    use spa::sys::*;
+    use spa::utils::{ChoiceEnum, Id};
+
+    #[test]
+    fn sdr_colorimetry_accepts_srgb_and_undescribed() {
+        assert!(sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_GAMMA22
+        ));
+        assert!(sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_SRGB
+        ));
+        assert!(sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_BT709
+        ));
+        // mutter < 50 describes nothing
+        assert!(sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_UNKNOWN,
+            SPA_VIDEO_TRANSFER_UNKNOWN
+        ));
+    }
+
+    #[test]
+    fn sdr_colorimetry_refuses_hdr_and_wide_gamut() {
+        // what mutter 50 tags its 10-bit/FP16 HDR-monitor formats with
+        assert!(!sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+            SPA_VIDEO_TRANSFER_SMPTE2084
+        ));
+        assert!(!sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_SMPTE2084
+        ));
+        assert!(!sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT709,
+            SPA_VIDEO_TRANSFER_ARIB_STD_B67
+        ));
+        assert!(!sdr_colorimetry(
+            SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+            SPA_VIDEO_TRANSFER_GAMMA22
+        ));
+    }
+
+    /// The EnumFormat we offer names the sRGB description (BT.709 primaries,
+    /// SDR transfer functions only), so PipeWire can never pair us with a PQ
+    /// stream, and the properties are not mandatory (pre-50 mutter has none).
+    #[test]
+    fn enum_format_pins_sdr_colour_description() {
+        let bytes = enum_format(1280, 720, None);
+        let (_, value) =
+            spa::pod::deserialize::PodDeserializer::deserialize_any_from(&bytes).expect("pod");
+        let Value::Object(obj) = value else {
+            panic!("not an object")
+        };
+        let ids = |key: u32| -> (Id, Vec<Id>, u32) {
+            let p = obj
+                .properties
+                .iter()
+                .find(|p| p.key == key)
+                .expect("property present");
+            let Value::Choice(ChoiceValue::Id(spa::utils::Choice(
+                _,
+                ChoiceEnum::Enum {
+                    default,
+                    alternatives,
+                },
+            ))) = &p.value
+            else {
+                panic!("not an Id enum: {:?}", p.value)
+            };
+            (*default, alternatives.clone(), p.flags.bits())
+        };
+        let (d, alts, flags) = ids(SPA_FORMAT_VIDEO_colorPrimaries);
+        assert_eq!(d, Id(SPA_VIDEO_COLOR_PRIMARIES_BT709));
+        assert_eq!(alts, vec![Id(SPA_VIDEO_COLOR_PRIMARIES_BT709)]);
+        assert_eq!(flags & SPA_POD_PROP_FLAG_MANDATORY, 0);
+        let (d, alts, flags) = ids(SPA_FORMAT_VIDEO_transferFunction);
+        assert_eq!(d, Id(SPA_VIDEO_TRANSFER_GAMMA22));
+        assert!(!alts.contains(&Id(SPA_VIDEO_TRANSFER_SMPTE2084)));
+        assert!(!alts.contains(&Id(SPA_VIDEO_TRANSFER_ARIB_STD_B67)));
+        assert_eq!(flags & SPA_POD_PROP_FLAG_MANDATORY, 0);
+        for alt in alts {
+            assert!(sdr_colorimetry(SPA_VIDEO_COLOR_PRIMARIES_BT709, alt.0));
+        }
+    }
 
     #[test]
     fn rgba_to_argb() {
