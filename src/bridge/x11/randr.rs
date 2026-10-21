@@ -405,6 +405,18 @@ impl Screen {
             .map_or(0, |o| o.output_id)
     }
 
+    /// The refresh (mHz) of the primary output's current mode (see
+    /// [`primary_output`](Self::primary_output)), 0 if unknown.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    pub fn primary_refresh_mhz(&self) -> u32 {
+        let id = self.primary_output();
+        self.outputs
+            .iter()
+            .find(|o| o.output_id == id)
+            .and_then(|o| self.modes.iter().find(|m| m.info.id == o.mode))
+            .map_or(0, |m| refresh_mhz(&m.info))
+    }
+
     /// `RRGetMonitors`: one monitor per active output, named after it, as
     /// Xorg's automatic monitors (one per active CRTC) are; the primary
     /// output's is the primary monitor.
@@ -838,6 +850,38 @@ impl Output {
     }
 }
 
+/// The dot clock of a blanking-free `width`x`height` mode at `refresh_mhz`
+/// (60 Hz when unknown). RandR's dot clock is 32-bit: a big fast mode
+/// (7680x4320@144 needs 4.78 GHz) can't be expressed, so this saturates to the
+/// fastest refresh X can state for that size rather than wrapping to a
+/// nonsense one (14.5 Hz).
+pub fn dot_clock(width: u16, height: u16, refresh_mhz: u32) -> u32 {
+    let px = u64::from(width) * u64::from(height);
+    let clock = if refresh_mhz > 0 {
+        px * u64::from(refresh_mhz) / 1000
+    } else {
+        px * 60
+    };
+    u32::try_from(clock).unwrap_or(u32::MAX)
+}
+
+/// A mode's refresh in millihertz (0 when it has no timings).
+pub fn refresh_mhz(info: &x11rb_protocol::protocol::randr::ModeInfo) -> u32 {
+    let total = u64::from(info.htotal) * u64::from(info.vtotal);
+    if total == 0 {
+        return 0;
+    }
+    let mut mhz = u64::from(info.dot_clock) * 1000 / total;
+    let flags = u32::from(info.mode_flags);
+    if flags & 0x10 != 0 {
+        mhz /= 2; // doublescan
+    }
+    if flags & 0x20 != 0 {
+        mhz *= 2; // interlace
+    }
+    mhz as u32
+}
+
 impl Mode {
     /// The dot clock of a blanking-free `width`x`height` mode at `refresh_mhz`
     /// (60 Hz when unknown). RandR's dot clock is 32-bit: a big fast mode
@@ -845,13 +889,7 @@ impl Mode {
     /// the fastest refresh X can state for that size rather than wrapping to a
     /// nonsense one (14.5 Hz).
     fn clock(width: u16, height: u16, refresh_mhz: u32) -> u32 {
-        let px = u64::from(width) * u64::from(height);
-        let clock = if refresh_mhz > 0 {
-            px * u64::from(refresh_mhz) / 1000
-        } else {
-            px * 60
-        };
-        u32::try_from(clock).unwrap_or(u32::MAX)
+        dot_clock(width, height, refresh_mhz)
     }
 
     fn new(id: u32, width: u16, height: u16, refresh_mhz: u32) -> Self {
@@ -979,6 +1017,23 @@ mod tests {
         let o = s.output_by_wl_name(wl_name).unwrap();
         let m = s.modes.iter().find(|m| m.info.id == o.mode).unwrap();
         f64::from(m.info.dot_clock) / (f64::from(m.info.htotal) * f64::from(m.info.vtotal))
+    }
+
+    #[test]
+    fn primary_refresh() {
+        let mut s = Screen::new(640, 480);
+        assert!(s.sync_wayland_output(9, b"HEADLESS-2", 1280, 0, 1920, 1080, 1920, 1080, 144_000));
+        // no GNOME primary yet: the first active output stands for it
+        assert_eq!(s.primary_refresh_mhz(), 144_000);
+        let mut s = Screen::new(640, 480);
+        assert!(s.sync_wayland_output(7, b"HEADLESS-1", 0, 0, 1280, 800, 1280, 800, 60_000));
+        assert!(s.sync_wayland_output(9, b"HEADLESS-2", 1280, 0, 1920, 1080, 1920, 1080, 144_000));
+        assert_eq!(s.primary_refresh_mhz(), 60_000);
+        s.set_primary(9);
+        assert_eq!(s.primary_refresh_mhz(), 144_000);
+        // what X can state at 8K is less than asked: the saturated clock's refresh
+        assert!(s.sync_wayland_output(9, b"HEADLESS-2", 1280, 0, 7680, 4320, 7680, 4320, 144_000));
+        assert_eq!(s.primary_refresh_mhz(), 129_453);
     }
 
     #[test]

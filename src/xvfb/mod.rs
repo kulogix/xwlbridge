@@ -116,6 +116,40 @@ static A11Y_BUS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// How often to re-check who is watching and whether the keymap changed.
 const HOUSEKEEPING: Duration = Duration::from_millis(500);
+
+/// Whether two refresh rates (mHz) are the same for RandR's purposes: within
+/// 0.5 % or 0.5 Hz, so Xvnc's own 59.96 Hz mode stands for a 60 Hz desktop.
+fn same_refresh(a: u32, b: u32) -> bool {
+    let tol = (a.max(b) / 200).max(500);
+    a.abs_diff(b) <= tol
+}
+
+/// Whether to re-mode Xvnc's output (now stating `current` mHz) for a desktop
+/// refreshing at `want` mHz on a `w`x`h` screen: only when the mode X can
+/// state for it (RandR's 32-bit dot clock saturates for big fast screens) is
+/// a different rate and closer to `want` than the current one: a 16384x16384
+/// screen can say 16 Hz at most, so an output already stating 60 stays.
+fn remode_for_refresh(current: u32, want: u32, w: u16, h: u16) -> bool {
+    let clock = crate::bridge::x11::randr::dot_clock(w, h, want);
+    let can = (u64::from(clock) * 1000 / (u64::from(w) * u64::from(h)).max(1)) as u32;
+    !same_refresh(can, current) && can.abs_diff(want) < current.abs_diff(want)
+}
+
+/// The refresh (mHz) of the first CRTC's current mode, as the X server states
+/// it (Xvnc's own modes: 59.96 Hz at 1920x1080, 59.38 at 640x480).
+fn current_refresh_mhz(conn: &RustConnection, root: Window) -> Option<u32> {
+    let res = randr::get_screen_resources_current(conn, root)
+        .ok()?
+        .reply()
+        .ok()?;
+    let crtc = *res.crtcs.first()?;
+    let info = randr::get_crtc_info(conn, crtc, res.config_timestamp)
+        .ok()?
+        .reply()
+        .ok()?;
+    let mode = res.modes.iter().find(|m| m.id == info.mode)?;
+    Some(crate::bridge::x11::randr::refresh_mhz(mode))
+}
 /// How long a client's resize may take to reach the desktop (as for the
 /// built-in engine's `RRSetCrtcConfig`).
 const DYNRES_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1164,6 +1198,9 @@ struct Agent {
     gc: u32,
     width: u16,
     height: u16,
+    /// The refresh (mHz) the one RandR output states: the desktop's primary
+    /// monitor's (Xvnc; it starts with its own ~60 Hz mode).
+    refresh_mhz: u32,
     shm: Shm,
     /// What wakes our poll: the backend's thread on new damage, the RECORD
     /// thread, the clipboard and cursor. Shared with the closures they hold,
@@ -1573,6 +1610,8 @@ impl Agent {
                 None
             }
         };
+        // the refresh the server's one output states now, 0 if unknown
+        let refresh_mhz = current_refresh_mhz(&conn, root).unwrap_or(0);
         Ok(Agent {
             server,
             display,
@@ -1583,6 +1622,7 @@ impl Agent {
             gc,
             width,
             height,
+            refresh_mhz,
             shm,
             wake,
             damage_atom,
@@ -2415,28 +2455,37 @@ impl Agent {
     /// and RandR monitors carry the desktop's output names and geometry, so X
     /// tools see "DP-1" where the desktop has it.
     fn sync_screen(&mut self) -> Result<(), AnyError> {
-        let (w, h, monitors) = {
+        let (w, h, hz, monitors) = {
             let s = self.server.screen.lock().unwrap();
             let m: Vec<_> = s
                 .outputs
                 .iter()
                 .map(|o| (o.name.clone(), o.x, o.y, o.width, o.height))
                 .collect();
-            (s.width, s.height, m)
+            (s.width, s.height, s.primary_refresh_mhz(), m)
         };
         // while a client's resize is on its way to the desktop (or another
         // client is still in the middle of one), the desktop's size is the
         // old one: following it would undo the client's resize
         let busy =
             self.dynres_out.is_some() || self.dynres_next.is_some() || self.settle_at.is_some();
-        if (w, h) != (self.width, self.height)
+        // Xvnc's one output states the primary monitor's refresh (X clients
+        // pacing themselves read it), so a refresh change alone re-modes it
+        let refresh_changed = self.resizable
+            && self.resizer.is_none()
+            && hz != 0
+            && remode_for_refresh(self.refresh_mhz, hz, w, h);
+        if ((w, h) != (self.width, self.height) || refresh_changed)
             && w > 0
             && h > 0
             && !busy
             && self.refused != Some((w, h))
         {
             if self.resizable {
-                self.resize(w, h)?;
+                self.resize(w, h, hz)?;
+                if hz != 0 {
+                    self.refresh_mhz = hz;
+                }
             } else if !self.warned_fixed {
                 crate::warning!(
                     "xvfb: the desktop is now {w}x{h} but Xvfb stays {}x{}; use -engine xvnc to follow it",
@@ -2457,7 +2506,7 @@ impl Agent {
 
     /// Sets the screen to `w`x`h`: by having Xwayland's compositor configure
     /// it, or through RandR (Xvnc).
-    fn resize(&mut self, w: u16, h: u16) -> Result<(), AnyError> {
+    fn resize(&mut self, w: u16, h: u16, refresh_mhz: u32) -> Result<(), AnyError> {
         if let Some(r) = self.resizer.clone() {
             return match self.resize_by_host(&r, w, h)? {
                 Some((w, h)) => {
@@ -2467,7 +2516,7 @@ impl Agent {
                 None => Ok(()),
             };
         }
-        self.resize_randr(w, h)
+        self.resize_randr(w, h, refresh_mhz)
     }
 
     /// Asks Xwayland's compositor for `w`x`h` and waits (up to 3 s) for the
@@ -2507,27 +2556,38 @@ impl Agent {
         }
     }
 
-    /// Sets the screen (and its one output) to `w`x`h` through RandR,
-    /// creating the mode.
-    fn resize_randr(&mut self, w: u16, h: u16) -> Result<(), AnyError> {
+    /// Sets the screen (and its one output) to `w`x`h` at `refresh_mhz` (0:
+    /// any) through RandR, creating the mode. A listed mode of that size
+    /// within half a percent (or 0.5 Hz) of the refresh X can state for it is
+    /// reused (Xvnc's own ~60 Hz modes for a 60 Hz desktop).
+    fn resize_randr(&mut self, w: u16, h: u16, refresh_mhz: u32) -> Result<(), AnyError> {
         let res = randr::get_screen_resources_current(&self.conn, self.root)?.reply()?;
         let (Some(&output), Some(&crtc)) = (res.outputs.first(), res.crtcs.first()) else {
             return Err("the X server has no RandR output".into());
         };
         let info = randr::get_output_info(&self.conn, output, res.config_timestamp)?.reply()?;
+        let want_clock = crate::bridge::x11::randr::dot_clock(w, h, refresh_mhz);
+        let want_mhz = (u64::from(want_clock) * 1000 / (u64::from(w) * u64::from(h)).max(1)) as u32;
+        let fits = |m: &randr::ModeInfo| {
+            refresh_mhz == 0 || same_refresh(crate::bridge::x11::randr::refresh_mhz(m), want_mhz)
+        };
         let mode = match res
             .modes
             .iter()
-            .find(|m| m.width == w && m.height == h && info.modes.contains(&m.id))
+            .find(|m| m.width == w && m.height == h && info.modes.contains(&m.id) && fits(m))
         {
             Some(m) => m.id,
             None => {
-                let name = format!("{w}x{h}");
+                let name = if refresh_mhz == 0 {
+                    format!("{w}x{h}")
+                } else {
+                    format!("{w}x{h}_{}.{:02}", want_mhz / 1000, want_mhz % 1000 / 10)
+                };
                 let mi = randr::ModeInfo {
                     id: 0,
                     width: w,
                     height: h,
-                    dot_clock: u32::from(w).saturating_mul(u32::from(h)).saturating_mul(60),
+                    dot_clock: want_clock,
                     hsync_start: w,
                     hsync_end: w,
                     htotal: w,
@@ -2545,25 +2605,41 @@ impl Agent {
                 id
             }
         };
-        // the screen has to hold the CRTC at every step
-        let (gw, gh) = (self.width.max(w), self.height.max(h));
-        if (gw, gh) != (self.width, self.height) {
-            randr::set_screen_size(&self.conn, self.root, gw, gh, mm(gw), mm(gh))?;
-        }
-        randr::set_crtc_config(
-            &self.conn,
-            crtc,
-            res.timestamp,
-            res.config_timestamp,
-            0,
-            0,
-            mode,
-            randr::Rotation::ROTATE0,
-            &[output],
-        )?
-        .reply()?;
-        if (gw, gh) != (w, h) {
+        // The screen has to hold the CRTC at every step. Growing: the screen
+        // first; shrinking: the CRTC first. When one side grows and the other
+        // shrinks (a rotation: 1920x1080 -> 1080x1920), switch the CRTC off,
+        // size the screen, switch it on, as xrandr and RealVNC do -- growing to
+        // the union first showed X clients a 1920x1920 screen the desktop never
+        // had, and x11vnc -xrandr once crashed on it (display matrix,
+        // live_rotate_90).
+        let set_crtc = |mode: u32, outputs: &[u32]| -> Result<(), AnyError> {
+            randr::set_crtc_config(
+                &self.conn,
+                crtc,
+                res.timestamp,
+                res.config_timestamp,
+                0,
+                0,
+                mode,
+                randr::Rotation::ROTATE0,
+                outputs,
+            )?
+            .reply()?;
+            Ok(())
+        };
+        if (w > self.width && h < self.height) || (w < self.width && h > self.height) {
+            set_crtc(0, &[])?;
             randr::set_screen_size(&self.conn, self.root, w, h, mm(w), mm(h))?;
+            set_crtc(mode, &[output])?;
+        } else {
+            let (gw, gh) = (self.width.max(w), self.height.max(h));
+            if (gw, gh) != (self.width, self.height) {
+                randr::set_screen_size(&self.conn, self.root, gw, gh, mm(gw), mm(gh))?;
+            }
+            set_crtc(mode, &[output])?;
+            if (gw, gh) != (w, h) {
+                randr::set_screen_size(&self.conn, self.root, w, h, mm(w), mm(h))?;
+            }
         }
         crate::log!("xvfb: screen resized to {w}x{h}");
         self.adopt_size(w, h)
@@ -2773,7 +2849,7 @@ impl Agent {
         } else {
             return Ok(());
         }
-        self.resize(target.0, target.1)
+        self.resize(target.0, target.1, self.refresh_mhz)
     }
 
     /// RandR 1.5 monitors named and placed like the desktop's outputs.
@@ -3441,5 +3517,33 @@ mod tests {
     #[test]
     fn missing_sections_give_up() {
         assert!(include_keymap("xkb_keymap { xkb_keycodes \"evdev\" {}; };", 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::{remode_for_refresh, same_refresh};
+
+    #[test]
+    fn xvnc_modes_stand_for_the_desktop_refresh_within_tolerance() {
+        assert!(same_refresh(59_963, 60_000)); // Xvnc's 1920x1080
+        assert!(same_refresh(60_000, 59_940)); // a 59.94 Hz monitor
+        assert!(!same_refresh(59_375, 60_000)); // Xvnc's 640x480: 0.625 Hz off
+        assert!(same_refresh(144_000, 143_500)); // 0.5 % at 144 Hz is 0.72 Hz
+        assert!(!same_refresh(120_000, 144_000));
+        assert!(!same_refresh(0, 60_000));
+    }
+
+    #[test]
+    fn remode_only_towards_the_desktop_refresh() {
+        assert!(remode_for_refresh(59_375, 60_000, 640, 480)); // Xvnc's 640x480 -> 60
+        assert!(!remode_for_refresh(59_963, 60_000, 1920, 1080)); // close enough
+        assert!(remode_for_refresh(59_963, 144_000, 1920, 1080));
+        // 8K@144 can only say 129.45 Hz, still closer than 60
+        assert!(remode_for_refresh(60_000, 144_000, 7680, 4320));
+        assert!(!remode_for_refresh(129_453, 144_000, 7680, 4320));
+        // 16384x16384 can say at most 16 Hz: never re-mode a 60 Hz output to that
+        assert!(!remode_for_refresh(60_000, 60_000, 16384, 16384));
+        assert!(!remode_for_refresh(59_000, 60_000, 16384, 16384));
     }
 }
