@@ -106,6 +106,7 @@ impl Balloons {
     }
 
     /// Whether a message is being assembled for `icon`.
+    #[allow(dead_code)]
     pub fn busy(&self, icon: u32) -> bool {
         self.open.contains_key(&icon)
     }

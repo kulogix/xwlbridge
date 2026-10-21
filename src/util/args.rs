@@ -35,6 +35,10 @@ macro_rules! arg_default {
     ($ty:ty, flag) => {
         false
     };
+    // a setting that is on unless it is asked for: `-notray`
+    ($ty:ty, noflag) => {
+        true
+    };
     ($ty:ty, value, $vn:literal) => {
         ::core::option::Option::None
     };
@@ -47,6 +51,9 @@ macro_rules! arg_default {
 macro_rules! arg_usage {
     ($ty:ty, flag, $field:ident) => {
         format!("-{}", opt_name!($field))
+    };
+    ($ty:ty, noflag, $field:ident) => {
+        format!("-no{}", opt_name!($field))
     };
     ($ty:ty, value, $field:ident, $vn:literal) => {
         format!("-{} {}", opt_name!($field), $vn)
@@ -116,6 +123,9 @@ macro_rules! arg_repeat {
 macro_rules! arg_apply {
     ($ty:ty, flag, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident) => {
         $field = true;
+    };
+    ($ty:ty, noflag, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident) => {
+        $field = false;
     };
     ($ty:ty, value, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident, $vn:literal) => {{
         let raw = take_value!($inline, $argv, $i, $field);

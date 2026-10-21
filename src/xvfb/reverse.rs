@@ -549,6 +549,8 @@ struct Atoms {
     net_wm_state_above: u32,
     net_wm_state_stays_on_top: u32,
     net_wm_state_demands_attention: u32,
+    /// Marks the tray's containers (`xvfb::tray`), which hold the tray icons.
+    tray_container: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -960,6 +962,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_wm_state_above: atom(b"_NET_WM_STATE_ABOVE")?,
         net_wm_state_stays_on_top: atom(b"_NET_WM_STATE_STAYS_ON_TOP")?,
         net_wm_state_demands_attention: atom(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
+        tray_container: atom(crate::xvfb::tray::dock::CONTAINER.as_bytes())?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -1232,6 +1235,9 @@ impl State {
         if self.windows.contains_key(&w) || w == self.root {
             return;
         }
+        if self.tray_icon(w) {
+            return;
+        }
         let Ok(Ok(attrs)) = self.x.get_window_attributes(w).map(|c| c.reply()) else {
             return;
         };
@@ -1255,6 +1261,40 @@ impl State {
         if let Err(e) = result {
             crate::warning!("-showwindows: can't show {w:#x}: {e}");
         }
+    }
+
+    /// Whether `w` is a tray container or a tray icon (see [`crate::xvfb::tray`]): a tray icon is
+    /// shown in the desktop's top bar (through its StatusNotifierItem), never as a window of its own,
+    /// and its container holds it, parked off the screen, for as long as it is docked.
+    fn tray_icon(&self, w: Window) -> bool {
+        let Ok(cookie) =
+            self.x
+                .get_property(false, w, self.atoms.tray_container, AtomEnum::WINDOW, 0, 1)
+        else {
+            return false;
+        };
+        if cookie.reply().is_ok_and(|r| r.value_len > 0) {
+            return true;
+        }
+        // the icon itself: it has no property to say so, its parent (the container) has
+        let Ok(cookie) = self.x.query_tree(w) else {
+            return false;
+        };
+        let Ok(tree) = cookie.reply() else {
+            return false;
+        };
+        tree.parent != self.root
+            && self
+                .x
+                .get_property(
+                    false,
+                    tree.parent,
+                    self.atoms.tray_container,
+                    AtomEnum::WINDOW,
+                    0,
+                    1,
+                )
+                .is_ok_and(|c| c.reply().is_ok_and(|r| r.value_len > 0))
     }
 
     /// The X-side part of showing `w`: its geometry, a DAMAGE object, and

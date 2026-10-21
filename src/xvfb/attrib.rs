@@ -99,6 +99,16 @@ pub struct Sig {
 }
 
 impl Fake {
+    /// Whether this request must never reach the desktop, whoever else
+    /// `Rules::classify` would take it for: the agent's own input, which only
+    /// ever drives windows on this display (its window management, its focus
+    /// helper, and the tray's clicks on a status icon: see `xvfb::tray`).
+    /// The forwarder asks this before anything else, so that no rule and no
+    /// binding of the event can make it reach the desktop.
+    pub fn stays_here(&self) -> bool {
+        self.who.class == Class::Agent
+    }
+
     fn matches(&self, s: &Sig) -> bool {
         if self.type_ != s.type_ {
             return false;
@@ -247,6 +257,21 @@ mod tests {
             time,
             xy,
             xy_raw: None,
+        }
+    }
+
+    #[test]
+    fn the_agents_own_input_never_goes_to_the_desktop() {
+        for (class, stays) in [
+            (Class::Agent, true),
+            (Class::Helper, false),
+            (Class::Driver, false),
+            (Class::Other, false),
+        ] {
+            let mut w = (*who(1, Class::Agent)).clone();
+            w.class = class;
+            let f = fake(&Arc::new(w), BUTTON_PRESS, 1, 0, 0, 100);
+            assert_eq!(f.stays_here(), stays, "{class:?}");
         }
     }
 

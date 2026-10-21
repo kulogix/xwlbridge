@@ -89,6 +89,8 @@ mod record;
 mod reverse;
 // -showwindows' pointer during a held self-drag of a synced window (reverse.rs)
 mod selfdrag;
+// the -showwindows X tray (gnome and xvfb only; see tray::enabled for the setting)
+#[cfg_attr(not(all(feature = "gnome", feature = "xvfb")), allow(dead_code))]
 mod tray;
 mod wlhost;
 // -showwindows' window sync with the desktop (reverse.rs)
@@ -1023,10 +1025,10 @@ fn supervise(server: Arc<Server>, display: u32, auth: Auth) {
             let _teardown = Teardown(server.clone());
             let mut agent = Agent::new(server.clone(), display, auth.clone())?;
             // the X tray, shown on the desktop (kept for as long as this agent runs)
-            let _tray = server.config.showwindows.then(|| {
-                let tray = tray::start(display, auth.clone());
+            let _tray = (server.config.showwindows && server.config.tray()).then(|| {
+                let tray = tray::start(display, auth.clone(), None);
                 if tray.is_some() {
-                    crate::log!("-showwindows: the system tray is up");
+                    crate::log!("-showwindows: the X system tray is shown on the desktop");
                 }
                 tray
             });
@@ -2202,7 +2204,13 @@ impl Agent {
             return true;
         };
         use attrib::Class;
+        // the agent's own input drives windows on this display only (the tray's clicks above all):
+        // never the desktop's
+        if fake.stays_here() {
+            return false;
+        }
         let why = match fake.who.class {
+            // (one that still got here, from an older attribution: the engine's own)
             Class::Agent | Class::Driver => return true,
             Class::Helper => {
                 "it drives windows on this display (an engine helper, -xtesthelpers)".to_string()

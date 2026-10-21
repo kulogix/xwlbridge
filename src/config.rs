@@ -35,6 +35,8 @@ define_config! {
         fps: Option<u32> = value("n"),
         /// show the X windows clients map on the stock engines' display natively on the desktop, with the desktop's input on them going to them only (experimental)
         showwindows: bool = flag,
+        /// with -showwindows: the X system tray, its icons in the desktop's top bar (an XEmbed to StatusNotifierItem proxy; X tray apps need the AppIndicator extension, and the menu of each icon opens with the "-notray" form of their entry); off: -showwindows leaves the tray alone, as before 0.3
+        tray: bool = noflag,
         /// with -showwindows: show the whole X screen as one window (its X windows composited in stacking order over a plain background, like a rootful X server), instead of one window per X window
         showscreen: bool = flag,
         /// let clients change the resolution (RealVNC also needs the dynres hook); on GNOME, one of the monitor's own modes, temporarily: the layout it replaced comes back once the viewers have gone and at exit
@@ -93,6 +95,16 @@ define_config! {
         quiet: bool = flag,
         /// log extra detail
         verbose: bool = flag,
+    }
+}
+
+impl Config {
+    /// Whether X tray icons are shown on the desktop: the `-showwindows` tray, with the gnome and xvfb
+    /// features (`-notray` turns it off; without them there is no tray at all).
+    #[cfg_attr(not(all(feature = "gnome", feature = "xvfb")), allow(dead_code))]
+    pub fn tray(&self) -> bool {
+        let _ = self;
+        cfg!(all(feature = "gnome", feature = "xvfb")) && self.tray
     }
 }
 
