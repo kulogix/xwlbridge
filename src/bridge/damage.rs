@@ -53,7 +53,13 @@ pub struct DamageSink {
 }
 
 impl DamageSink {
-    pub fn create(&self, client: Arc<Client>, id: u32, drawable: u32, level: u8) {
+    /// DamageCreate. As in the X.org server (`ProcDamageCreate` damages a
+    /// window's whole `borderClip` right away), the new object starts with the
+    /// entire drawable damaged and reports it at its level: clients such as
+    /// x11vnc fetch the screen when that first report comes and otherwise
+    /// trust damage alone, so without it a screen that changed before they
+    /// watched stays stale for them until something else changes.
+    pub fn create(&self, client: Arc<Client>, id: u32, drawable: u32, level: u8, geom: (u16, u16)) {
         let mut objs = self.objects.lock().unwrap();
         let was_active = objs.iter().any(|o| !o.client.is_dead());
         objs.push(DamageObj {
@@ -63,6 +69,16 @@ impl DamageSink {
             level,
             region: Vec::new(),
         });
+        if geom.0 > 0 && geom.1 > 0 {
+            let whole = Rectangle {
+                x: 0,
+                y: 0,
+                width: geom.0,
+                height: geom.1,
+            };
+            let o = objs.last_mut().expect("just pushed");
+            report(o, &[whole], geom);
+        }
         if !was_active {
             crate::vlog!("damage tracking started");
         }
@@ -194,38 +210,44 @@ impl DamageSink {
         let mut objs = self.objects.lock().unwrap();
         objs.retain(|o| !o.client.is_dead());
         for o in objs.iter_mut() {
-            match o.level {
-                RAW => {
-                    // nothing accumulates: subtract is a no-op at this level, so
-                    // a region here would only ever grow (x11vnc uses RAW)
-                    notify(o, &new, geom);
-                }
-                DELTA => {
-                    // exact delta is `new - region`, but reporting all of `new`
-                    // over-reports safely and needs no region algebra
-                    o.region.extend_from_slice(&new);
-                    notify(o, &new, geom);
-                }
-                BBOX => {
-                    let old = bbox(&o.region).map(tuple);
-                    o.region.extend_from_slice(&new);
-                    let now = bbox(&o.region);
-                    if old != now.map(tuple)
-                        && let Some(now) = now
-                    {
-                        notify(o, &[now], geom);
-                    }
-                }
-                NON_EMPTY => {
-                    let was_empty = o.region.is_empty();
-                    o.region.extend_from_slice(&new);
-                    if was_empty && !o.region.is_empty() {
-                        notify_non_empty(o, geom);
-                    }
-                }
-                _ => o.region.extend_from_slice(&new),
+            report(o, &new, geom);
+        }
+    }
+}
+
+/// Adds `new` (root coordinates) to one object's damage and reports it as the
+/// object's level asks.
+fn report(o: &mut DamageObj, new: &[Rectangle], geom: (u16, u16)) {
+    match o.level {
+        RAW => {
+            // nothing accumulates: subtract is a no-op at this level, so a
+            // region here would only ever grow (x11vnc uses RAW)
+            notify(o, new, geom);
+        }
+        DELTA => {
+            // exact delta is `new - region`, but reporting all of `new`
+            // over-reports safely and needs no region algebra
+            o.region.extend_from_slice(new);
+            notify(o, new, geom);
+        }
+        BBOX => {
+            let old = bbox(&o.region).map(tuple);
+            o.region.extend_from_slice(new);
+            let now = bbox(&o.region);
+            if old != now.map(tuple)
+                && let Some(now) = now
+            {
+                notify(o, &[now], geom);
             }
         }
+        NON_EMPTY => {
+            let was_empty = o.region.is_empty();
+            o.region.extend_from_slice(new);
+            if was_empty && !o.region.is_empty() {
+                notify_non_empty(o, geom);
+            }
+        }
+        _ => o.region.extend_from_slice(new),
     }
 }
 
@@ -325,5 +347,87 @@ mod tests {
             "its wake is never called again"
         );
         assert_eq!(Arc::strong_count(&calls), 1, "and was dropped");
+    }
+
+    // --- a new object starts with the whole drawable damaged (xwlrvnc 3ef1511)
+
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    fn client() -> (Arc<Client>, UnixStream) {
+        let (a, b) = UnixStream::pair().unwrap();
+        b.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        (Client::new(a).unwrap(), b)
+    }
+
+    /// The DamageNotify events waiting on the client's socket: (level, damage
+    /// id, area x, y, w, h).
+    fn events(b: &mut UnixStream) -> Vec<(u8, u32, i16, i16, u16, u16)> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 32];
+        while b.read_exact(&mut buf).is_ok() {
+            let first = EXTENSIONS.lookup(b"DAMAGE").unwrap().first_event;
+            assert_eq!(buf[0], first);
+            let le16 = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
+            out.push((
+                buf[1],
+                u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+                le16(16) as i16,
+                le16(18) as i16,
+                le16(20),
+                le16(22),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn create_reports_the_whole_drawable_at_every_level() {
+        for level in [RAW, DELTA, BBOX, NON_EMPTY] {
+            let sink = DamageSink::default();
+            let (c, mut b) = client();
+            sink.create(c, 0x2c, 0x1e, level, (1280, 720));
+            let ev = events(&mut b);
+            assert_eq!(ev, vec![(level, 0x2c, 0, 0, 1280, 720)], "level {level}");
+        }
+    }
+
+    #[test]
+    fn after_the_initial_report_damage_follows_the_level() {
+        let sink = DamageSink::default();
+        let (raw, mut braw) = client();
+        let (ne, mut bne) = client();
+        sink.create(raw.clone(), 1, 0x1e, RAW, (800, 600));
+        sink.create(ne.clone(), 2, 0x1e, NON_EMPTY, (800, 600));
+        assert_eq!(events(&mut braw).len(), 1);
+        assert_eq!(events(&mut bne).len(), 1);
+        let r = Rectangle {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        sink.add_damage(&[r], (800, 600));
+        // RAW reports every rectangle; NonEmpty stays quiet until subtracted
+        assert_eq!(events(&mut braw), vec![(RAW, 1, 10, 20, 30, 40)]);
+        assert!(events(&mut bne).is_empty());
+        sink.subtract(&ne, 2, None);
+        sink.add_damage(&[r], (800, 600));
+        assert_eq!(events(&mut bne), vec![(NON_EMPTY, 2, 0, 0, 800, 600)]);
+    }
+
+    #[test]
+    fn a_new_object_reports_the_whole_drawable_even_when_the_screen_is_static() {
+        // a second viewer (a VNC server starting late) makes its object while
+        // nothing changes: it must still be told to fetch the screen
+        let sink = DamageSink::default();
+        let (a, mut ba) = client();
+        let (b, mut bb) = client();
+        sink.create(a, 1, 0x1e, RAW, (640, 480));
+        assert_eq!(events(&mut ba), vec![(RAW, 1, 0, 0, 640, 480)]);
+        sink.create(b, 2, 0x1e, RAW, (640, 480));
+        assert_eq!(events(&mut bb), vec![(RAW, 2, 0, 0, 640, 480)]);
     }
 }

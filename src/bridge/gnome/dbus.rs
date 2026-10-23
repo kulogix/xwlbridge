@@ -127,9 +127,19 @@ pub fn extension_state(conn: &Connection, uuid: &str) -> Option<u32> {
         .map(|v| v as u32)
 }
 
-/// Reads the current monitor layout. Mirrored monitors share one logical
-/// monitor; only the first is mirrored into X, since they show the same thing.
-pub fn display_state(conn: &Connection) -> zbus::Result<Vec<Monitor>> {
+/// What the X screen does not depend on: the monitor's colour state and its
+/// RGB range (`color-mode`, `rgb-range`), as `GetCurrentState` gives them.
+pub(super) type ColourState = Vec<(String, Option<i32>, Option<i32>)>;
+
+/// Reads the current monitor layout (mirrored monitors share one logical
+/// monitor; only the first is mirrored into X, since they show the same
+/// thing), and the monitors' colour state, to tell a change of it (HDR, RGB
+/// range) from a change of the layout.
+pub fn display_state_detailed(conn: &Connection) -> zbus::Result<(Vec<Monitor>, ColourState)> {
+    display_state_everything(conn)
+}
+
+fn display_state_everything(conn: &Connection) -> zbus::Result<(Vec<Monitor>, ColourState)> {
     let dc = Proxy::new(conn, DC, "/org/gnome/Mutter/DisplayConfig", DC)?;
     let (_serial, monitors, logical, props): (
         u32,
@@ -140,6 +150,13 @@ pub fn display_state(conn: &Connection) -> zbus::Result<Vec<Monitor>> {
     // layout-mode 2 = physical (logical coordinates are physical pixels)
     let physical_layout = props.get("layout-mode").and_then(|v| u32::try_from(v).ok()) == Some(2);
     let mut out = Vec::new();
+    let mut colour: ColourState = monitors
+        .iter()
+        .map(|m| {
+            let num = |k: &str| m.2.get(k).and_then(|v| i32::try_from(v).ok());
+            (m.0.0.clone(), num("color-mode"), num("rgb-range"))
+        })
+        .collect();
     for (x, y, scale, transform, primary, mons, _) in logical {
         let Some((connector, ..)) = mons.first() else {
             continue;
@@ -176,7 +193,8 @@ pub fn display_state(conn: &Connection) -> zbus::Result<Vec<Monitor>> {
             primary,
         });
     }
-    Ok(out)
+    colour.sort();
+    Ok((out, colour))
 }
 
 /// A monitor's modes (`GetCurrentState`'s per-monitor list) as X lists

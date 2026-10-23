@@ -55,6 +55,7 @@ use zbus::blocking::Connection;
 
 use crate::bridge::Server;
 use crate::bridge::dynres::ModeRequest;
+use crate::bridge::placeholder;
 use crate::config::CursorType;
 use capture::{Capture, CursorTrack, Pw};
 use dbus::{Monitor, Session, Signal};
@@ -86,6 +87,31 @@ const CLOSE_CLASSIFY: Duration = Duration::from_secs(3);
 const LOCK_POLL: Duration = Duration::from_millis(250);
 /// A close this soon after a monitor change is the change's doing.
 const MONITOR_CLOSE_WINDOW: Duration = Duration::from_secs(2);
+/// How long a `MonitorsChanged` burst is collected before it is acted on (a
+/// colour-mode flip, a no-op apply, a mode set come as a burst of signals).
+const MONITORS_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How long to wait before retrying a `GetCurrentState` that failed after a
+/// `MonitorsChanged` (SE4): each further failure doubles the wait, up to one
+/// of these; the list's length is also how many times it is retried (0.5, 1,
+/// 2 and 4 s, then every 4 s for ~30 s), after which the layout in use stays
+/// until the next change rather than a stale one being used for a session.
+const REFRESH_BACKOFF: [Duration; 8] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(4),
+    Duration::from_secs(4),
+    Duration::from_secs(4),
+    Duration::from_secs(4),
+];
+
+/// How long to wait before retry number `n` (0-based) of a failed
+/// `GetCurrentState`, `None` once they are exhausted.
+fn backoff(n: u32) -> Option<Duration> {
+    REFRESH_BACKOFF.get(n as usize).copied()
+}
+
 /// When a capture stream or the input connection dies, how long to wait for
 /// mutter's `Closed` signal before taking it for a stream failure (recreate at
 /// once) rather than a close (lock, or the local user's "stop"): mutter tears
@@ -249,7 +275,9 @@ pub fn spawn(server: Arc<Server>) {
         .name("gnome".into())
         .spawn(move || {
             let mut backend = Backend::new(server, conn, rx, wake);
-            backend.refresh_outputs(false);
+            if let Err(e) = backend.refresh_outputs(false) {
+                crate::warning!("gnome: can't read the monitor layout: {e}");
+            }
             backend.keymap_watch = KeymapWatch::connect();
             match backend.keymap_watch.as_mut().and_then(KeymapWatch::take) {
                 Some(text) => backend.apply_keymap(text),
@@ -332,8 +360,23 @@ struct Backend {
     closed_pending: Option<Instant>,
     last_lock_poll: Option<Instant>,
     last_monitors_changed: Option<Instant>,
-    /// The X screen shows the "locked" picture, not a stale desktop frame.
-    placeholder_shown: bool,
+    /// A `MonitorsChanged` waiting for its burst to end, and when it
+    /// arrived.
+    monitors_pending: Option<Instant>,
+    /// The layout the running session was started for ([`XLayout`]): the
+    /// next session is restarted only if reading the layout again gives
+    /// another one.
+    session_layout: Option<XLayout>,
+    /// A `GetCurrentState` after a `MonitorsChanged` failed: when to try
+    /// again and how many times it has.
+    refresh_retry: Option<(Instant, u32)>,
+    /// The monitors' colour state (`color-mode`, `rgb-range`) as last read:
+    /// not something the X screen depends on.
+    colour: dbus::ColourState,
+    /// The picture on the X screen while no session runs
+    /// ([`placeholder::Kind`]), so that a new X framebuffer (a size change)
+    /// is painted again instead of black.
+    placeholder: Option<crate::bridge::placeholder::Kind>,
     /// The session bus closed our connection at this time; see
     /// [`BUS_LOST_GRACE`].
     bus_lost: Option<Instant>,
@@ -373,6 +416,12 @@ struct Backend {
     /// last, and when: put back once someone watched since and nobody does
     /// any more (unless the monitors changed some other way meanwhile).
     dynres_saved: Option<DynresSaved>,
+    /// When a layout change of the user's (not ours) was last seen in
+    /// `MonitorsChanged` (SE3).
+    dynres_user_at: Option<Instant>,
+    /// An X client's resolution change has been waiting for the user to
+    /// confirm theirs (logged once).
+    dynres_held_logged: bool,
     /// A change mutter accepted that the RandR model does not show yet.
     dynres_wait: Option<DynresWait>,
     /// `-pwrmgr`: wake outputs from power save for capture.
@@ -389,10 +438,44 @@ struct Backend {
 }
 
 struct DynresSaved {
+    /// The layout to put back: the user's.
     original: display::Layout,
+    /// What the desktop shows because of the last resolution change (the
+    /// user's own change on top of it otherwise).
     applied: display::Layout,
     at: Instant,
+    /// When `original` was last read from a layout that was the user's (not
+    /// one of ours). A layout change seen within
+    /// [`USER_CHANGE_PENDING`] of the user's confirmed change is that
+    /// confirmation, not the user changing their mind again.
+    original_at: Instant,
 }
+
+impl DynresSaved {
+    /// SE2: the layout changed to `layout` without us. If it is not the one
+    /// our last change left, it is the user's (the end of a Settings change,
+    /// a monitor plugged in, another scale, another primary) and becomes the
+    /// one to restore. One that is again within [`USER_CHANGE_PENDING`] of
+    /// our taking theirs over is a step of the same change, or its
+    /// confirmation (GNOME's "Keep these display settings?" answers with a
+    /// `MonitorsChanged` too), not a new one.
+    fn note_user_layout(&mut self, layout: &display::Layout, now: Instant) {
+        if layout == &self.applied {
+            return;
+        }
+        if layout != &self.original && now.duration_since(self.original_at) > USER_CHANGE_PENDING {
+            crate::vlog!("gnome: the user's layout is now {}", layout.describe());
+            self.original = layout.clone();
+            self.original_at = now;
+        }
+        self.applied = layout.clone();
+    }
+}
+
+/// How long after the user's own change of the layout (GNOME's "Keep these
+/// display settings?" was answered, or never appeared) a `MonitorsChanged` is
+/// the confirmation of that change rather than another one.
+const USER_CHANGE_PENDING: Duration = Duration::from_secs(30);
 
 struct DynresWait {
     id: u64,
@@ -461,6 +544,8 @@ impl Backend {
             dynres,
             dynres_keep: config.dynreskeep,
             dynres_saved: None,
+            dynres_user_at: None,
+            dynres_held_logged: false,
             dynres_wait: None,
             pwrmgr,
             woke: None,
@@ -489,7 +574,11 @@ impl Backend {
             closed_pending: None,
             last_lock_poll: None,
             last_monitors_changed: None,
-            placeholder_shown: false,
+            monitors_pending: None,
+            session_layout: None,
+            refresh_retry: None,
+            colour: Vec::new(),
+            placeholder: None,
             bus_lost: None,
             group: 0,
             clip_generation: None,
@@ -511,6 +600,8 @@ impl Backend {
             while let Ok(sig) = self.signals.try_recv() {
                 self.on_signal(sig);
             }
+            self.retry_refresh();
+            self.monitors_changed();
             self.check_health();
             self.tick_clip_watch();
             self.tick_idle_clip();
@@ -947,12 +1038,16 @@ impl Backend {
 
     fn start_session(&mut self) {
         if self.monitors.is_empty() {
-            self.refresh_outputs(true);
+            if let Err(e) = self.refresh_outputs(true) {
+                crate::warning!("gnome: can't read the monitor layout: {e}");
+            }
             if self.monitors.is_empty() {
                 self.retry_at = Instant::now() + RETRY_ERROR;
                 return;
             }
         }
+        // what this session is for: a layout read later is compared with it
+        self.session_layout = Some(self.x_layout());
         if self.pw.is_none() {
             match Pw::new() {
                 Ok(pw) => self.pw = Some(pw),
@@ -974,7 +1069,7 @@ impl Backend {
                 // the bus answers: whatever failed before, it isn't gone
                 self.bus_lost = None;
                 self.locked_logged = false;
-                self.placeholder_shown = false;
+                self.placeholder = None;
                 // input from now until the devices are up waits for them
                 self.server.input.accept_pending();
                 let pending = session
@@ -1073,6 +1168,7 @@ impl Backend {
     }
 
     fn stop_session(&mut self, why: &str) {
+        self.session_layout = None;
         if let Some(active) = self.active.take() {
             crate::log!(
                 "gnome: remote desktop session stopped after {:.1}s ({why})",
@@ -1156,14 +1252,9 @@ impl Backend {
                 self.bus_lost.get_or_insert_with(Instant::now);
             }
             Signal::MonitorsChanged => {
+                // acted on once the burst is over (monitors_changed)
                 self.last_monitors_changed = Some(Instant::now());
-                self.refresh_outputs(true);
-                self.dynres_check_wait();
-                // monitor streams whose rect changed are gone; re-record them all
-                if self.active.is_some() {
-                    self.stop_session("monitors changed");
-                    self.retry_at = Instant::now();
-                }
+                self.monitors_pending.get_or_insert_with(Instant::now);
             }
             Signal::SelectionOwnerChanged {
                 path,
@@ -1527,7 +1618,7 @@ impl Backend {
                 &self.server,
                 crate::bridge::placeholder::Kind::Stopped,
             );
-            self.placeholder_shown = false; // a lock must still replace it
+            self.placeholder = Some(crate::bridge::placeholder::Kind::Stopped);
         }
     }
 
@@ -1563,12 +1654,14 @@ impl Backend {
     }
 
     fn show_locked_placeholder(&mut self) {
-        if !self.placeholder_shown && self.active.is_none() {
+        if self.placeholder != Some(crate::bridge::placeholder::Kind::Locked)
+            && self.active.is_none()
+        {
             crate::bridge::placeholder::paint(
                 &self.server,
                 crate::bridge::placeholder::Kind::Locked,
             );
-            self.placeholder_shown = true;
+            self.placeholder = Some(crate::bridge::placeholder::Kind::Locked);
             crate::vlog!("gnome: showing the locked placeholder");
         }
     }
@@ -1615,29 +1708,142 @@ impl Backend {
         (x, y)
     }
 
-    /// Re-reads mutter's layout into the RandR model.
-    fn refresh_outputs(&mut self, notify: bool) {
-        match dbus::display_state(&self.conn) {
-            Ok(monitors) => {
-                if monitors != self.monitors {
-                    for m in &monitors {
-                        crate::log!(
-                            "gnome: monitor {} {}x{} at {},{} (logical {}x{})",
-                            m.connector,
-                            m.width,
-                            m.height,
-                            m.lx,
-                            m.ly,
-                            m.lw,
-                            m.lh
-                        );
-                    }
-                }
-                self.monitors = monitors;
-                self.apply_outputs(notify);
+    /// Re-reads mutter's layout into the RandR model. `Ok` whether the
+    /// layout changed.
+    fn refresh_outputs(&mut self, notify: bool) -> Result<bool, zbus::Error> {
+        let (monitors, colour) = dbus::display_state_detailed(&self.conn)?;
+        let changed = monitors != self.monitors || colour != self.colour;
+        if changed {
+            for m in &monitors {
+                crate::vlog!(
+                    "gnome: monitor {} {}x{} at {},{} (logical {}x{})",
+                    m.connector,
+                    m.width,
+                    m.height,
+                    m.lx,
+                    m.ly,
+                    m.lw,
+                    m.lh
+                );
             }
-            Err(e) => crate::warning!("gnome: can't read the monitor layout: {e}"),
         }
+        self.monitors = monitors;
+        self.colour = colour;
+        self.apply_outputs(notify);
+        Ok(changed)
+    }
+
+    /// Acts on the `MonitorsChanged` burst once it is over
+    /// ([`MONITORS_DEBOUNCE`]), and retries a layout that could not be read.
+    ///
+    /// The session is restarted only if the layout the desktop reports now is
+    /// not the one it was started for ([`XLayout`]): a colour mode (HDR), an
+    /// RGB range, a refresh rate (a monitor stream is capped anyway), a
+    /// no-op apply or any other change capture and input do not depend on
+    /// leaves it running, so gnome-shell's sharing indicator does not blink,
+    /// keys and buttons held stay down on the same devices, and a reader is
+    /// not held up waiting for a new stream. A stream that renegotiates its
+    /// format is handled by the stream (`capture.rs`).
+    fn monitors_changed(&mut self) {
+        if self
+            .monitors_pending
+            .is_none_or(|at| at.elapsed() < MONITORS_DEBOUNCE)
+        {
+            return;
+        }
+        self.monitors_pending = None;
+        let was_active = self.active.is_some();
+        let before = self.x_layout();
+        match self.refresh_outputs(was_active) {
+            Ok(_) => self.refresh_retry = None,
+            Err(e) => {
+                self.monitor_retry(&e);
+                return;
+            }
+        }
+        // -dynres: whose change was that?
+        self.dynres_saw_change();
+        if !was_active || self.active.is_none() {
+            return;
+        }
+        let after = self.x_layout();
+        if self.session_layout.as_ref() == Some(&after) {
+            crate::vlog!(
+                "gnome: monitors changed, the layout the session is for did not ({} monitor(s))",
+                after.len()
+            );
+            self.dynres_check_wait();
+            return;
+        }
+        crate::log!(
+            "gnome: the monitor layout changed ({} -> {} monitor(s)); restarting the session",
+            before.len(),
+            after.len()
+        );
+        // monitor streams whose rect changed are gone; re-record them
+        self.stop_session("monitors changed");
+        self.retry_at = Instant::now();
+    }
+
+    /// A `GetCurrentState` after a `MonitorsChanged` failed: keep the layout
+    /// in use (and the session running on it, which is still what the
+    /// monitors show) and try again, backing off. The session is only ever
+    /// rebuilt from a layout that was read (SE4): a failed read stops the
+    /// retries but touches neither the layout in use nor the session, and a
+    /// new `MonitorsChanged` starts over.
+    fn monitor_retry(&mut self, e: &zbus::Error) {
+        let now = Instant::now();
+        let n = self.refresh_retry.map_or(0, |(_, n)| n);
+        if n == 0 {
+            crate::warning!(
+                "gnome: can't read the monitor layout ({e}); trying again (the layout in use stays)"
+            );
+        }
+        match backoff(n) {
+            Some(delay) => self.refresh_retry = Some((now + delay, n + 1)),
+            None => {
+                crate::warning!(
+                    "gnome: the monitor layout still can't be read ({e}); \
+                     the layout in use stays until the next change"
+                );
+                self.refresh_retry = None;
+            }
+        }
+    }
+
+    /// Reads the layout again once a failed read is due to be retried.
+    fn retry_refresh(&mut self) {
+        if let Some((at, _)) = self.refresh_retry
+            && Instant::now() >= at
+        {
+            self.refresh_retry = None;
+            self.monitors_pending = Some(Instant::now() - MONITORS_DEBOUNCE);
+        }
+    }
+
+    /// What a session is started for, and what capture and input depend on:
+    /// the monitors' physical sizes and arrangement (so the X screen and
+    /// every stream's rectangle), and which one is primary. Not their colour
+    /// mode, refresh rate or name.
+    fn x_layout(&self) -> XLayout {
+        let mut v: Vec<_> = self
+            .monitors
+            .iter()
+            .map(|m| {
+                (
+                    m.connector.clone(),
+                    m.lx,
+                    m.ly,
+                    m.width,
+                    m.height,
+                    m.lw,
+                    m.lh,
+                    m.primary,
+                )
+            })
+            .collect();
+        v.sort();
+        v
     }
 
     fn apply_outputs(&mut self, notify: bool) {
@@ -1682,13 +1888,33 @@ impl Backend {
                 .map_or(0, |m| self.keys[&m.connector]);
             changed |= screen.set_primary(primary);
         }
+        let before = self.server.geometry();
         self.server.sync_screen(notify && changed);
         let origin = self.logical_origin();
         if let Some(eis) = self.active.as_ref().and_then(|a| a.eis.as_ref()) {
             eis.set_origin(origin);
         }
+        // a new X framebuffer is black: the picture it showed is painted again
+        let after = self.server.geometry();
+        if (after.width, after.height) != (before.width, before.height) {
+            self.paint_placeholder();
+        }
+    }
+
+    /// Keeps the picture the X screen shows instead of the desktop (the
+    /// padlock while the screen is locked, the pause sign after the local user
+    /// stopped sharing) across a new X framebuffer, which is black (F5): a
+    /// size change while it is shown paints it again.
+    fn paint_placeholder(&mut self) {
+        if let Some(kind) = self.placeholder {
+            placeholder::paint(&self.server, kind);
+        }
     }
 }
+
+/// What a capture session depends on, one entry per monitor (see
+/// [`Backend::x_layout`]).
+type XLayout = Vec<(String, i32, i32, u32, u32, i32, i32, bool)>;
 
 /// `-dynres` and `-pwrmgr`.
 impl Backend {
@@ -1717,6 +1943,24 @@ impl Backend {
         if self.dynres_wait.is_some() {
             return;
         }
+        // SE3: not while the user may still be confirming a change of their
+        // own (GNOME's "Keep these display settings?"): any ApplyMonitorsConfig
+        // of ours in that time would answer it for them
+        if self
+            .dynres_user_at
+            .is_some_and(|at| at.elapsed() < USER_CHANGE_PENDING)
+            && self.server.dynres.busy()
+        {
+            if !self.dynres_held_logged {
+                crate::log!(
+                    "gnome: a resolution change requested by an X client waits: the display \
+                     settings may still be being confirmed"
+                );
+                self.dynres_held_logged = true;
+            }
+            return;
+        }
+        self.dynres_held_logged = false;
         if let Some(req) = self.server.dynres.take() {
             self.dynres_start(req);
         }
@@ -1759,7 +2003,7 @@ impl Backend {
         let layout = match state.plan(&connector, width.into(), height.into())? {
             display::Plan::Unchanged => {
                 // mutter runs it already; the model just had not caught up
-                self.refresh_outputs(true);
+                self.refresh_outputs(true).ok();
                 return Ok(());
             }
             display::Plan::Apply(layout) => layout,
@@ -1773,11 +2017,22 @@ impl Backend {
         let now = Instant::now();
         if self.dynres_keep {
             // nothing will be put back, so nothing to remember
-            self.refresh_outputs(true);
+            self.refresh_outputs(true).ok();
             return Ok(());
         }
         match self.dynres_saved.as_mut() {
             Some(saved) => {
+                // SE2: the desktop is not where we left it: the user changed
+                // the layout in between, and theirs is what is put back
+                if state.layout != saved.applied {
+                    crate::log!(
+                        "gnome: the monitors were reconfigured since the last resolution change; \
+                         {} is what will be restored",
+                        state.layout.describe()
+                    );
+                    saved.original = state.layout;
+                    saved.original_at = now;
+                }
                 saved.applied = layout;
                 saved.at = now;
             }
@@ -1786,6 +2041,7 @@ impl Backend {
                     original: state.layout,
                     applied: layout,
                     at: now,
+                    original_at: now,
                 })
             }
         }
@@ -1798,7 +2054,7 @@ impl Backend {
             self.dynres_saved = None;
         }
         self.sync_undo_pending();
-        self.refresh_outputs(true);
+        self.refresh_outputs(true).ok();
         Ok(())
     }
 
@@ -1829,9 +2085,32 @@ impl Backend {
         }
     }
 
-    /// Puts back the layout our resolution changes replaced, unless the
-    /// monitors were reconfigured some other way since (the local user, a
-    /// hotplug), which then stands.
+    /// A `MonitorsChanged` was acted on: was it a change of the user's?
+    ///
+    /// SE2: what the user set is what is put back at the end. A layout that
+    /// is not the one our last change left is theirs (the end of a Settings
+    /// change, a monitor plugged in, another scale, another primary) and
+    /// becomes the one to restore. One that is again within
+    /// [`USER_CHANGE_PENDING`] of our taking theirs over is a step of the
+    /// same change, or its confirmation (GNOME's "Keep these display
+    /// settings?" answers with a `MonitorsChanged` too), not a new one.
+    fn dynres_saw_change(&mut self) {
+        if !self.dynres {
+            return;
+        }
+        let Ok(state) = display::State::read(&self.conn) else {
+            return;
+        };
+        let now = Instant::now();
+        self.dynres_user_at = Some(now);
+        if let Some(saved) = self.dynres_saved.as_mut() {
+            saved.note_user_layout(&state.layout, now);
+        }
+    }
+
+    /// Puts back the layout the user had before our resolution changes, unless
+    /// they changed it themselves since (that one then stays:
+    /// [`Self::dynres_saw_change`] kept track).
     fn revert_dynres(&mut self, why: &str) {
         let Some(saved) = self.dynres_saved.take() else {
             return;
@@ -1844,12 +2123,16 @@ impl Backend {
                 return;
             }
         };
-        if state.layout != saved.applied {
+        if state.layout != saved.applied && state.layout != saved.original {
+            // a change nobody told us about (SE2): theirs, and it stays
             crate::log!(
                 "gnome: the monitors were reconfigured since an X client changed the resolution; \
                  leaving them as they are"
             );
             return;
+        }
+        if state.layout == saved.original {
+            return; // already back where the user had it
         }
         if !state.can_apply(&saved.original) {
             crate::warning!(
@@ -1865,7 +2148,7 @@ impl Backend {
                     "gnome: restored the monitor configuration ({why}): {}",
                     saved.original.describe()
                 );
-                self.refresh_outputs(true);
+                self.refresh_outputs(true).ok();
             }
             Err(e) => crate::warning!("gnome: can't restore the monitor configuration: {e}"),
         }
@@ -1965,5 +2248,97 @@ impl Backend {
         self.server
             .dynres
             .set_undo_pending(self.dynres_saved.is_some() || self.woke.is_some());
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::{REFRESH_BACKOFF, backoff};
+    use std::time::Duration;
+
+    /// SE4: a `GetCurrentState` that failed after a `MonitorsChanged` is
+    /// retried at 0.5, 1, 2, 4 s and then every 4 s, for ~30 s in all, and
+    /// then left to the next change (never used to rebuild a session).
+    #[test]
+    fn a_failed_layout_read_is_retried_with_a_bounded_backoff() {
+        let waits: Vec<Duration> = (0..).map_while(backoff).collect();
+        assert_eq!(waits.len(), REFRESH_BACKOFF.len());
+        let secs: Vec<f32> = waits.iter().map(|d| d.as_secs_f32()).collect();
+        assert_eq!(secs, [0.5, 1.0, 2.0, 4.0, 4.0, 4.0, 4.0, 4.0]);
+        // grows, then stays at the cap
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*waits.last().unwrap(), Duration::from_secs(4));
+        let total: Duration = waits.iter().sum();
+        assert!((Duration::from_secs(20)..=Duration::from_secs(30)).contains(&total));
+        assert_eq!(backoff(waits.len() as u32), None);
+        assert_eq!(backoff(u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod dynres_tests {
+    use super::{DynresSaved, USER_CHANGE_PENDING};
+    use crate::bridge::gnome::display::{Layout, Logical};
+    use std::time::{Duration, Instant};
+
+    fn layout(scale: f64) -> Layout {
+        Layout(vec![Logical {
+            x: 0,
+            y: 0,
+            scale,
+            transform: 0,
+            primary: true,
+            monitors: vec![("Meta-0".into(), "1920x1080".into())],
+            props: Vec::new(),
+        }])
+    }
+
+    fn saved(original: Layout, applied: Layout, at: Instant) -> DynresSaved {
+        DynresSaved {
+            original,
+            applied,
+            at,
+            original_at: at,
+        }
+    }
+
+    /// SE2: the user's change after an X client's resolution change is what
+    /// is put back once the viewers leave; so is the next one.
+    #[test]
+    fn the_users_layout_is_the_one_restored() {
+        let t0 = Instant::now();
+        let (l0, l1, l2, l3) = (layout(1.0), layout(1.25), layout(1.5), layout(2.0));
+        // the user had l0, an X client's resolution change left l1
+        let mut s = saved(l0.clone(), l1.clone(), t0);
+        // a MonitorsChanged that is not a change: nothing
+        s.note_user_layout(&l1.clone(), t0 + Duration::from_secs(1));
+        assert_eq!(s.original, l0);
+        // the user sets another scale in Settings: that is what is restored
+        s.note_user_layout(&l2, t0 + Duration::from_secs(60));
+        assert_eq!(s.original, l2);
+        // our own change of the resolution again is not the user's
+        let before = s.original.clone();
+        s.note_user_layout(&l2, t0 + Duration::from_secs(70));
+        assert_eq!(s.original, before);
+        // and a later change of theirs again
+        s.note_user_layout(&l3, t0 + Duration::from_secs(120));
+        assert_eq!(s.original, l3);
+    }
+
+    /// The confirmation of the user's own change (GNOME's dialog goes away,
+    /// or the change is kept) is not a new layout, even if it comes back to
+    /// the one before: their change is still what the end restores.
+    #[test]
+    fn a_confirmation_within_the_window_is_not_a_new_layout() {
+        let t0 = Instant::now();
+        let (l0, l1, trial) = (layout(1.0), layout(1.25), layout(1.0));
+        assert!(USER_CHANGE_PENDING >= Duration::from_secs(20));
+        let mut s = saved(l0, l1, t0);
+        s.note_user_layout(&trial, t0 + Duration::from_secs(60));
+        // the trial ran out 20 s later: the layout before it is back, and it
+        // is the user's
+        s.note_user_layout(&layout(1.0), t0 + Duration::from_secs(80));
+        assert_eq!(s.original, layout(1.0));
+        assert_eq!(s.applied, layout(1.0));
     }
 }

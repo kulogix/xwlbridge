@@ -1293,11 +1293,13 @@ impl Connection {
             Request::DamageCreate(r) => {
                 if self.server.config.damage() {
                     crate::bridge::profile::damage_create(u8::from(r.level));
+                    let geom = self.server.geometry();
                     self.server.damage.create(
                         self.client.clone(),
                         r.damage,
                         r.drawable,
                         u8::from(r.level),
+                        (geom.width, geom.height),
                     );
                 }
             }
