@@ -69,7 +69,7 @@ const PENDING_TTL_US = 60 * GLib.USEC_PER_SEC;
 
 const FEATURES = [
     'move-resize', 'clamp-work-area', 'initial-position', 'activate', 'raise', 'above', 'demands-attention',
-    'stick', 'workspace', 'minimize', 'state', 'monitors', 'restacked',
+    'stick', 'workspace', 'minimize', 'state', 'monitors', 'restacked', 'work-area',
 ];
 
 const IFACE_XML = `
@@ -127,6 +127,9 @@ const IFACE_XML = `
     </method>
     <method name="GetMonitors">
       <arg type="a(i(iiii)(iiii)db)" name="monitors" direction="out"/>
+    </method>
+    <method name="GetWorkArea">
+      <arg type="(iiii)" name="workArea" direction="out"/>
     </method>
     <signal name="Changed">
       <arg type="s" name="tag"/>
@@ -691,6 +694,7 @@ export default class XwlbridgeWindows extends Extension {
         });
         add('GetState', this._getState);
         add('GetMonitors', this._getMonitors);
+        add('GetWorkArea', this._getWorkArea);
         return m;
     }
 
@@ -784,5 +788,12 @@ export default class XwlbridgeWindows extends Extension {
                 rectArray(workspace.get_work_area_for_monitor(i)), display.get_monitor_scale(i), i === primary]);
         }
         return new GLib.Variant('(a(i(iiii)(iiii)db))', [out]);
+    }
+
+    // The work area of the active workspace across every monitor (what _NET_WORKAREA is), asked for only when
+    // this version of the extension is there ('work-area' in FEATURES).
+    _getWorkArea() {
+        const ws = global.workspace_manager.get_active_workspace();
+        return new GLib.Variant('((iiii))', [rectArray(ws.get_work_area_all_monitors())]);
     }
 }

@@ -972,6 +972,7 @@ pub enum Request {
     Minimize { xid: Xid, on: bool },
     GetState,
     GetMonitors,
+    GetWorkArea,
 }
 
 #[cfg_attr(not(feature = "gnome"), allow(dead_code))] // the D-Bus client's
@@ -989,6 +990,7 @@ impl Request {
             Request::Minimize { .. } => "Minimize",
             Request::GetState => "GetState",
             Request::GetMonitors => "GetMonitors",
+            Request::GetWorkArea => "GetWorkArea",
         }
     }
 
@@ -1003,7 +1005,7 @@ impl Request {
             | Request::Stick { xid, .. }
             | Request::SetWorkspace { xid, .. }
             | Request::Minimize { xid, .. } => Some(xid),
-            Request::GetState | Request::GetMonitors => None,
+            Request::GetState | Request::GetMonitors | Request::GetWorkArea => None,
         }
     }
 }
@@ -1081,6 +1083,8 @@ pub enum Event {
     /// Our display's windows, bottom to top, and the reply's order stamp.
     State(Vec<WindowState>, u32),
     Monitors(Vec<MonitorInfo>),
+    /// The active workspace's work area across every monitor (`GetWorkArea`).
+    WorkArea(Rect),
 }
 
 /// An order stamp: the extension's D-Bus message serial. Its replies and
@@ -1630,6 +1634,9 @@ pub mod bus {
                 Request::GetMonitors => proxy
                     .call::<_, _, Vec<MonitorBody>>(method, &())
                     .map(|b| Some(monitors_event(b))),
+                Request::GetWorkArea => proxy
+                    .call::<_, _, (i32, i32, i32, i32)>(method, &())
+                    .map(|r| Some(Event::WorkArea(rect(r)))),
             };
             match result {
                 Ok(Some(e)) => self.shared.emit(e),
