@@ -133,6 +133,33 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 /// A client's screen size and what the desktop made of it.
 type DynresResult = ((u16, u16), Result<(), String>);
 
+/// A RandR 1.5 monitor as the desktop has it: its name (the output's), its
+/// geometry, and whether it is the desktop's primary output.
+#[derive(Clone, PartialEq, Debug)]
+struct Monitor {
+    name: Vec<u8>,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    primary: bool,
+}
+
+/// The index of the monitor that is RandR's primary: the desktop's primary
+/// output, or the first monitor if the desktop names none.
+fn primary_index(monitors: &[Monitor]) -> usize {
+    monitors.iter().position(|m| m.primary).unwrap_or(0)
+}
+
+/// The desktop's primary output as RandR is to have it: `known` is the
+/// last one RandR was given, `screen` the output that is the desktop's
+/// now (0: it names none). A desktop that names none keeps `known` (RandR
+/// always has a primary monitor, and a backend without one must not take
+/// it away); the first answer then goes to RandR, whatever it is.
+fn primary_to_set(known: u32, screen: u32) -> u32 {
+    if screen != 0 { screen } else { known }
+}
+
 /// A screen size a client set, not handed to the desktop yet.
 #[derive(Clone, Copy)]
 struct DynresNext {
@@ -1226,10 +1253,14 @@ struct Agent {
     refused: Option<(u16, u16)>,
     /// Xvfb's size, which clients may shrink but nothing can grow back past.
     fixed: (u16, u16),
+    /// The desktop's primary output as last seen (`primary_to_set`), when
+    /// it named one.
+    primary: u32,
     /// Whether RandR 1.5 (monitors, screen change events) is there.
     randr15: bool,
-    /// The desktop's outputs as last given to RandR: name and geometry.
-    monitors: Vec<(Vec<u8>, i16, i16, u16, u16)>,
+    /// The desktop's outputs as last given to RandR: name, geometry and
+    /// whether each is the desktop's primary.
+    monitors: Vec<Monitor>,
     /// RandR monitors we created, to delete when the layout changes.
     monitor_atoms: Vec<u32>,
     warned_fixed: bool,
@@ -1618,6 +1649,7 @@ impl Agent {
             resizer,
             refused: None,
             fixed: (width, height),
+            primary: 0,
             randr15: false,
             monitors: Vec::new(),
             monitor_atoms: Vec::new(),
@@ -2415,15 +2447,30 @@ impl Agent {
     /// and RandR monitors carry the desktop's output names and geometry, so X
     /// tools see "DP-1" where the desktop has it.
     fn sync_screen(&mut self) -> Result<(), AnyError> {
-        let (w, h, monitors) = {
+        let (w, h, monitors, primary) = {
             let s = self.server.screen.lock().unwrap();
-            let m: Vec<_> = s
+            // the desktop's primary output (with GNOME, the one of its top
+            // bar), wherever it is in the list: RandR's primary monitor
+            let primary = s.primary_output();
+            let m: Vec<Monitor> = s
                 .outputs
                 .iter()
-                .map(|o| (o.name.clone(), o.x, o.y, o.width, o.height))
+                .map(|o| Monitor {
+                    name: o.name.clone(),
+                    x: o.x,
+                    y: o.y,
+                    width: o.width,
+                    height: o.height,
+                    // only an attached output can be the primary monitor's
+                    primary: o.connected && o.mode != 0 && o.output_id == primary,
+                })
                 .collect();
-            (s.width, s.height, m)
+            (s.width, s.height, m, primary)
         };
+        let primary = primary_to_set(self.primary, primary);
+        if primary != 0 {
+            self.primary = primary;
+        }
         // while a client's resize is on its way to the desktop (or another
         // client is still in the middle of one), the desktop's size is the
         // old one: following it would undo the client's resize
@@ -2446,6 +2493,8 @@ impl Agent {
                 self.warned_fixed = true;
             }
         }
+        // the primary is part of what makes a change (a Settings change of
+        // the primary alone changes nothing else), and so it is of `Monitor`
         if monitors != self.monitors && self.randr15 {
             if let Err(e) = self.set_monitors(&monitors) {
                 crate::vlog!("xvfb: can't name RandR monitors: {e}");
@@ -2776,20 +2825,31 @@ impl Agent {
         self.resize(target.0, target.1)
     }
 
-    /// RandR 1.5 monitors named and placed like the desktop's outputs.
-    fn set_monitors(&mut self, monitors: &[(Vec<u8>, i16, i16, u16, u16)]) -> Result<(), AnyError> {
+    /// RandR 1.5 monitors named and placed like the desktop's outputs; the
+    /// desktop's primary output is the primary monitor (`xrandr --listmonitors`
+    /// puts the `*` there), the first one if it names none.
+    fn set_monitors(&mut self, monitors: &[Monitor]) -> Result<(), AnyError> {
         for atom in self.monitor_atoms.drain(..) {
             randr::delete_monitor(&self.conn, self.root, atom)?;
         }
         let res = randr::get_screen_resources_current(&self.conn, self.root)?.reply()?;
-        for (i, (name, x, y, w, h)) in monitors.iter().enumerate() {
+        let primary = primary_index(monitors);
+        for (i, m) in monitors.iter().enumerate() {
+            let Monitor {
+                name,
+                x,
+                y,
+                width: w,
+                height: h,
+                ..
+            } = m;
             let atom = self.conn.intern_atom(false, name)?.reply()?.atom;
             randr::set_monitor(
                 &self.conn,
                 self.root,
                 randr::MonitorInfo {
                     name: atom,
-                    primary: i == 0,
+                    primary: i == primary,
                     automatic: false,
                     x: *x,
                     y: *y,
@@ -3148,6 +3208,57 @@ fn include_keymap(text: &str, group: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Monitor, primary_index, primary_to_set};
+
+    /// The desktop's monitors, as `sync_screen` reads them: output 0 and 1
+    /// side by side, `primary` naming the one GNOME shows its top bar on.
+    fn two_heads(primary: u32) -> Vec<Monitor> {
+        [(7, 0, "DP-1"), (9, 1280, "HDMI-1")]
+            .into_iter()
+            .map(|(id, x, name)| Monitor {
+                name: name.into(),
+                x,
+                y: 0,
+                width: 1280,
+                height: 800,
+                primary: id == primary,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_desktops_primary_is_randrs_wherever_it_is() {
+        // p2_fix item 1: the primary is the desktop's (with GNOME, where
+        // its top bar is), not the first output
+        assert_eq!(primary_index(&two_heads(7)), 0);
+        assert_eq!(primary_index(&two_heads(9)), 1);
+        // a desktop that names none: the first monitor
+        assert_eq!(primary_index(&two_heads(0)), 0);
+        assert_eq!(primary_index(&[]), 0);
+    }
+
+    #[test]
+    fn a_primary_only_change_reaches_randr() {
+        // p2_fix E: the change detection compares these monitors; the
+        // primary alone is part of them (before, the tuple was
+        // (name, x, y, w, h) and a primary-only change was lost)
+        let before = two_heads(7);
+        let after = two_heads(9);
+        assert_ne!(before, after);
+        // and only the primary differs: same names and rectangles
+        let geometry = |v: &[Monitor]| {
+            v.iter()
+                .map(|m| (m.name.clone(), m.x, m.y, m.width, m.height))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(geometry(&before), geometry(&after));
+        // a primary that does not exist keeps the one RandR has
+        assert_eq!(primary_to_set(9, 0), 9);
+        assert_eq!(primary_to_set(9, 7), 7);
+        // nothing known yet
+        assert_eq!(primary_to_set(0, 0), 0);
+    }
+
     #[test]
     fn a_bell_sounds_unless_the_client_asked_for_the_event_only() {
         let bell = |event_only| super::xkb::BellNotifyEvent {
