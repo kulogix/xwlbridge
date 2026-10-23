@@ -112,10 +112,26 @@ pub struct StreamState {
     /// The negotiated size, when it differs from what the layout said.
     pub size_mismatch: Option<(u32, u32)>,
     pub frames: u64,
-    /// The negotiated format is one our framebuffer can take byte for byte
-    /// (8-bit BGRx/BGRA in the sRGB colour description); frames of any other
-    /// are dropped, never shown with the wrong colours.
+    /// The stream's format is one our framebuffer can take byte for byte
+    /// (8-bit BGRx/BGRA), and its colour description is an SDR one; frames of
+    /// any other are dropped, never shown with the wrong colours.
     usable: bool,
+}
+
+/// Checks a format of ours, saying why not when it is not.
+fn check_format(key: u32, info: &spa::param::video::VideoInfoRaw) -> bool {
+    let format_ok = matches!(info.format(), VideoFormat::BGRx | VideoFormat::BGRA);
+    let colour_ok = sdr_colorimetry(info.color_primaries(), info.transfer_function());
+    if !format_ok || !colour_ok {
+        crate::warning!(
+            "gnome: stream {key} is {:?} (colour primaries {}, transfer {}), which is not 8-bit \
+             BGRx in the sRGB colour description; its frames are dropped",
+            info.format(),
+            info.color_primaries(),
+            info.transfer_function()
+        );
+    }
+    format_ok && colour_ok
 }
 
 /// One monitor's capture stream.
@@ -420,25 +436,18 @@ impl Capture {
                 }
                 let mut st = st.borrow_mut();
                 let (w, h) = (info.size().width, info.size().height);
-                let (primaries, transfer) = (info.color_primaries(), info.transfer_function());
-                let format_ok = matches!(info.format(), VideoFormat::BGRx | VideoFormat::BGRA);
-                let colour_ok = sdr_colorimetry(primaries, transfer);
-                // param_changed only fires on a change of the format
-                if !format_ok || !colour_ok {
-                    crate::warning!(
-                        "gnome: stream {} negotiated {:?} (colour primaries {primaries}, transfer \
-                         {transfer}), which is not 8-bit sRGB; its frames are dropped",
-                        st.key,
-                        info.format()
-                    );
-                }
-                st.usable = format_ok && colour_ok;
+                // the stream's own format is what the stream agreed on and
+                // is held to: its colour description is an SDR one (see
+                // `sdr_colorimetry`), whatever the output's colour state
+                st.usable = check_format(st.key, &info);
                 crate::vlog!(
-                    "gnome: stream {} format {:?} {w}x{h} max {}/{} fps colour {primaries}/{transfer}",
+                    "gnome: stream {} format {:?} {w}x{h} max {}/{} fps colour {}/{}",
                     st.key,
                     info.format(),
                     info.max_framerate().num,
-                    info.max_framerate().denom
+                    info.max_framerate().denom,
+                    info.color_primaries(),
+                    info.transfer_function()
                 );
                 if (w, h) != (st.width, st.height) {
                     st.size_mismatch = Some((w, h));
