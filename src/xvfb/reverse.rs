@@ -549,6 +549,8 @@ struct Atoms {
     net_wm_state_above: u32,
     net_wm_state_stays_on_top: u32,
     net_wm_state_demands_attention: u32,
+    net_workarea: u32,
+    gtk_workareas: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -686,6 +688,13 @@ struct Sync {
     on: bool,
     /// The desktop's monitors as last reported (None: not yet).
     monitors: Option<Vec<winsync::MonitorInfo>>,
+    /// The desktop's monitors were asked for (`GetMonitors` sent) and
+    /// have not answered yet.
+    monitors_asked: bool,
+    /// The extension has `GetWorkArea` (its `work-area` feature).
+    work_area: bool,
+    /// The desktop's work area across its monitors, as last reported.
+    work_area_value: Option<winsync::Rect>,
     /// Why the layout keeps the sync off, as last logged.
     layout_why: Option<String>,
     /// The order stamp of the stacking order in `order`.
@@ -703,6 +712,114 @@ struct Sync {
     /// one waits for its pacing time (`winsync::send_due`).
     sent_at: HashMap<Window, Instant>,
     due: HashMap<Window, Instant>,
+}
+
+impl Sync {
+    /// The desktop's monitors: the sync follows the layout, on or off (A).
+    fn got_monitors(&mut self, list: Vec<winsync::MonitorInfo>, screen: (u16, u16)) -> Turn {
+        let fits = winsync::layout_fits(&list, screen);
+        self.monitors = Some(list);
+        self.monitors_asked = false;
+        self.follow(fits)
+    }
+
+    /// Asks for the desktop's monitors (one request at a time: the answer
+    /// to the first is as new as the layout).
+    fn ask_monitors(&mut self) {
+        if !self.available {
+            return;
+        }
+        if !self.monitors_asked {
+            self.monitors_asked = true;
+            self.client.send(Request::GetMonitors);
+        }
+        if self.work_area {
+            self.client.send(Request::GetWorkArea);
+        }
+    }
+
+    /// `_NET_WORKAREA`'s rectangle (see `work_area`).
+    fn work_area(&self, screen: (u16, u16)) -> Option<winsync::Rect> {
+        let monitors = self.monitors.as_deref()?;
+        let area = match (self.work_area, self.work_area_value) {
+            (true, Some(r)) => r,
+            _ => monitors.iter().find(|m| m.primary)?.work_area,
+        };
+        Some(work_area(monitors, Some(area), screen))
+    }
+
+    /// The layout the desktop's monitors make on the X screen: the sync
+    /// goes on or off accordingly (a reason to keep it off is logged when
+    /// it changes).
+    fn follow(&mut self, fits: Result<(), String>) -> Turn {
+        match &fits {
+            Ok(()) => self.layout_why = None,
+            Err(why) => {
+                if self.layout_why.as_ref() != Some(why) {
+                    crate::log!(
+                        "-showwindows: no window sync with the desktop ({why}): windows keep the 0.1.2 behaviour"
+                    );
+                    self.layout_why = Some(why.clone());
+                }
+            }
+        }
+        match (fits.is_ok(), self.on) {
+            (true, false) => Turn::On,
+            (false, true) => Turn::Off,
+            _ => Turn::AsIs,
+        }
+    }
+}
+
+/// `_NET_WORKAREA`: the desktop's work area `area` (what the desktop
+/// says, or the primary monitor's), as far as the X screen.
+///
+/// A work area is one rectangle, and the work areas of two monitors need
+/// not make one (the top bar takes a band off one of them: the other's
+/// work area sticks out above it). When the area does not hold the work
+/// area of every monitor whose work area is not the whole of it, it is the
+/// smallest rectangle holding them all instead.
+fn work_area(
+    monitors: &[winsync::MonitorInfo],
+    area: Option<winsync::Rect>,
+    screen: (u16, u16),
+) -> winsync::Rect {
+    let mut r = match area {
+        Some(r) => r,
+        None => return winsync::Rect::new(0, 0, 0, 0),
+    };
+    // (every monitor whose work area is not the whole of it: one that is takes nothing off the work area)
+    for m in monitors.iter().filter(|m| m.work_area != m.rect) {
+        if !covers(r, m.work_area) {
+            r = union(r, m.work_area);
+        }
+    }
+    let (sw, sh) = (i32::from(screen.0), i32::from(screen.1));
+    let (x, y) = (r.x.clamp(0, sw), r.y.clamp(0, sh));
+    let (w, h) = ((r.x + r.w).min(sw) - x, (r.y + r.h).min(sh) - y);
+    winsync::Rect::new(x, y, w.max(0), h.max(0))
+}
+
+/// Whether `a` holds the whole of `b`.
+fn covers(a: winsync::Rect, b: winsync::Rect) -> bool {
+    a.x <= b.x && a.y <= b.y && a.x + a.w >= b.x + b.w && a.y + a.h >= b.y + b.h
+}
+
+/// The smallest rectangle holding both.
+fn union(a: winsync::Rect, b: winsync::Rect) -> winsync::Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.w).max(b.x + b.w);
+    let bottom = (a.y + a.h).max(b.y + b.h);
+    winsync::Rect::new(x, y, right - x, bottom - y)
+}
+
+/// What the layout asks of the sync.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Turn {
+    On,
+    Off,
+    AsIs,
 }
 
 /// `XWLBRIDGE_WINDOWS_EXTENSION=off` (what `xwlbridge-ctl run` exports for
@@ -732,6 +849,9 @@ fn start_sync(display: u32, tags: bool) -> Option<Sync> {
             available: false,
             on: false,
             monitors: None,
+            monitors_asked: false,
+            work_area: false,
+            work_area_value: None,
             layout_why: None,
             order_stamp: None,
             geo: winsync::Geometry::new(),
@@ -906,6 +1026,9 @@ struct State {
     sync: Option<Sync>,
     /// This thread announced itself as the engine's window manager (EWMH).
     wm_announced: bool,
+    /// `_NET_WORKAREA` and `_GTK_WORKAREAS_D0` are on the root (they
+    /// are only while the sync is on).
+    work_area: bool,
     /// The compositor time of the latest key or button press on a shown
     /// window (an activation's timestamp).
     input_time: u32,
@@ -960,6 +1083,8 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_wm_state_above: atom(b"_NET_WM_STATE_ABOVE")?,
         net_wm_state_stays_on_top: atom(b"_NET_WM_STATE_STAYS_ON_TOP")?,
         net_wm_state_demands_attention: atom(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
+        net_workarea: atom(b"_NET_WORKAREA")?,
+        gtk_workareas: atom(b"_GTK_WORKAREAS")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -1038,6 +1163,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         dropped_button_logged: false,
         sync: None,
         wm_announced: false,
+        work_area: false,
         input_time: 0,
         qh: qh.clone(),
     };
@@ -1706,7 +1832,7 @@ impl State {
                         self.screen.1
                     );
                     self.screen = (e.width, e.height);
-                    self.sync_layout();
+                    self.resized();
                 }
             }
             Event::ConfigureNotify(e) if e.event == self.root => {
@@ -2530,6 +2656,9 @@ impl State {
                 a.net_wm_state_above,
                 a.net_wm_state_demands_attention,
             ]);
+            if self.work_area {
+                v.extend([a.net_workarea, a.gtk_workareas]);
+            }
         }
         v
     }
@@ -3292,7 +3421,7 @@ impl State {
         };
         let events: Vec<winsync::Event> = sync.client.events().collect();
         for e in events {
-            self.sync_event(e);
+            self.sync_event_from(e);
         }
         let now = Instant::now();
         let due: Vec<Window> = self.sync.as_ref().map_or_else(Vec::new, |s| {
@@ -3307,11 +3436,64 @@ impl State {
         }
     }
 
+    /// One event of the extension, in the order they came.
+    ///
+    /// The layout comes first: a `MonitorsChanged` asks for the monitors
+    /// whatever the sync is doing, and the answer decides whether it can
+    /// be on (A: before, both were dropped while it was off, so a scale
+    /// back to 100 % or a monitor unplugged and plugged again never
+    /// brought it back). The rest is about the desktop's windows and has
+    /// no meaning while it is off.
+    fn sync_event_from(&mut self, e: winsync::Event) {
+        use winsync::Event as E;
+        match e {
+            E::MonitorsChanged => {
+                if let Some(sync) = self.sync.as_mut() {
+                    sync.ask_monitors();
+                }
+            }
+            E::WorkArea(_) => {
+                if let Some(sync) = self.sync.as_mut()
+                    && let E::WorkArea(r) = e
+                {
+                    sync.work_area_value = Some(r);
+                }
+                self.publish_work_area();
+            }
+            E::Monitors(list) => {
+                let turn = self
+                    .sync
+                    .as_mut()
+                    .map(|s| s.got_monitors(list, self.screen));
+                match turn {
+                    Some(Turn::On) => self.sync_turn(true),
+                    Some(Turn::Off) => self.sync_turn(false),
+                    _ => {}
+                }
+                self.publish_work_area();
+            }
+            e => self.sync_event(e),
+        }
+    }
+
     fn sync_event(&mut self, e: winsync::Event) {
         use winsync::Event as E;
         match e {
-            E::Available { .. } => self.sync_available(true),
+            E::Available { features, .. } => {
+                if let Some(sync) = self.sync.as_mut() {
+                    sync.work_area = features.iter().any(|f| f == "work-area");
+                }
+                self.sync_available(true);
+            }
             E::Unavailable => self.sync_available(false),
+            E::WorkArea(_) => {
+                if let Some(sync) = self.sync.as_mut()
+                    && let E::WorkArea(r) = e
+                {
+                    sync.work_area_value = Some(r);
+                }
+                self.publish_work_area();
+            }
             E::Monitors(list) => {
                 let Some(sync) = self.sync.as_mut() else {
                     return;
@@ -3443,16 +3625,11 @@ impl State {
                 }
                 self.restack_x();
             }
-            E::MonitorsChanged => {
-                if let Some(sync) = self.sync.as_ref() {
-                    // the layout first (its reply comes first: one worker)
-                    sync.client.send(Request::GetMonitors);
-                    sync.client.send(Request::GetState);
-                }
-            }
             E::WindowGone(xid) => {
                 crate::vlog!("-showwindows: the desktop's window of {xid:#x} is gone")
             }
+            // taken before the guard above (sync_event)
+            E::MonitorsChanged => {}
         }
     }
 
@@ -3466,10 +3643,52 @@ impl State {
         };
         sync.available = on;
         sync.monitors = None;
+        sync.monitors_asked = false;
         if on {
-            sync.client.send(Request::GetMonitors);
+            sync.ask_monitors();
         } else {
             self.sync_turn(false);
+        }
+    }
+
+    /// The X screen changed size: the desktop's monitors are asked for
+    /// again, and (with the sync off, where nothing else would) the windows
+    /// the new X screen leaves outside it are moved inside it, as a window
+    /// manager fits them on a screen change: with the pointer clamped to
+    /// the X screen, a window's far part would take its edge's clicks.
+    ///
+    /// Asking is all: the answer is what the sync follows (a layout that
+    /// does not fit it is only a reason to wait for a fitting one). Judging
+    /// the new X screen by the previous layout here would turn the sync off
+    /// and on for nothing: a MonitorChanged's `GetMonitors` may be in
+    /// flight, and the previous layout is all there is until it arrives.
+    fn resized(&mut self) {
+        if self.screen_mode() {
+            return;
+        }
+        let Some(sync) = self.sync.as_mut() else {
+            return;
+        };
+        sync.ask_monitors();
+        if sync.on {
+            // the desktop's layout is followed, and with it the windows
+            return;
+        }
+        let (sw, sh) = (i32::from(self.screen.0), i32::from(self.screen.1));
+        let fits = |s: &&Shown| (fit(s.x, s.width, sw), fit(s.y, s.height, sh)) == (s.x, s.y);
+        for (w, s) in self.windows.iter().filter(|(_, s)| !fits(s)) {
+            let (x, y) = (fit(s.x, s.width, sw), fit(s.y, s.height, sh));
+            crate::vlog!(
+                "-showwindows: {w:#x} at {}+{} is outside the {}x{} X screen: moved to {x}+{y}",
+                s.x,
+                s.y,
+                self.screen.0,
+                self.screen.1
+            );
+            let _ = self.x.configure_window(
+                *w,
+                &ConfigureWindowAux::new().x(i32::from(x)).y(i32::from(y)),
+            );
         }
     }
 
@@ -3481,24 +3700,14 @@ impl State {
         let Some(sync) = self.sync.as_mut() else {
             return;
         };
-        let Some(monitors) = sync.monitors.as_ref().filter(|_| sync.available) else {
+        let Some(monitors) = sync.monitors.as_deref().filter(|_| sync.available) else {
             return;
         };
         let fits = winsync::layout_fits(monitors, screen);
-        match &fits {
-            Ok(()) => sync.layout_why = None,
-            Err(why) => {
-                if sync.layout_why.as_ref() != Some(why) {
-                    crate::log!(
-                        "-showwindows: no window sync with the desktop ({why}): windows keep the 0.1.2 behaviour"
-                    );
-                    sync.layout_why = Some(why.clone());
-                }
-            }
-        }
-        let on = fits.is_ok();
-        if on != sync.on {
-            self.sync_turn(on);
+        match sync.follow(fits) {
+            Turn::On => self.sync_turn(true),
+            Turn::Off => self.sync_turn(false),
+            Turn::AsIs => {}
         }
     }
 
@@ -3516,6 +3725,7 @@ impl State {
             }
             sync.client.send(Request::GetState);
             self.announce_sync(true);
+            self.publish_work_area();
             let tops: Vec<Window> = self
                 .windows
                 .iter()
@@ -3537,6 +3747,7 @@ impl State {
                 return;
             }
             self.announce_sync(false);
+            self.publish_work_area();
             // back to 0.1.2: the pointer maps from X's positions
             for s in self.windows.values_mut() {
                 if matches!(s.role, Role::Toplevel(_)) {
@@ -3600,6 +3811,60 @@ impl State {
             let _ = self
                 .x
                 .delete_property(self.root, self.atoms.net_active_window);
+        }
+    }
+
+    /// `_NET_WORKAREA` (one rectangle: the desktop's work area across its
+    /// monitors) and `_GTK_WORKAREAS_D0` (one rectangle per monitor), as
+    /// mutter publishes them on its own Xwayland, while the sync is on.
+    ///
+    /// They say what the desktop reported last: on MonitorsChanged that is
+    /// the layout before the change until its answer comes, so they go with
+    /// it (and a sync that goes off deletes them). Nothing is published
+    /// before the first answer.
+    fn publish_work_area(&mut self) {
+        let screen = self.screen;
+        let areas = self.sync.as_ref().filter(|s| s.on).and_then(|s| {
+            let monitors = s.monitors.as_deref()?;
+            let area = s.work_area(screen)?;
+            let mut per_monitor = Vec::with_capacity(monitors.len() * 4);
+            for m in monitors {
+                let w = m.work_area;
+                per_monitor.extend_from_slice(&[w.x as u32, w.y as u32, w.w as u32, w.h as u32]);
+            }
+            let area = [area.x as u32, area.y as u32, area.w as u32, area.h as u32];
+            Some((area, per_monitor))
+        });
+        let (name, gtk) = (self.atoms.net_workarea, self.atoms.gtk_workareas);
+        match &areas {
+            Some((area, per_monitor)) => {
+                let set = |property, v: &[u32]| {
+                    let _ = self.x.change_property32(
+                        PropMode::REPLACE,
+                        self.root,
+                        property,
+                        AtomEnum::CARDINAL,
+                        v,
+                    );
+                };
+                set(name, area);
+                set(gtk, per_monitor);
+            }
+            None => {
+                let _ = self.x.delete_property(self.root, name);
+                let _ = self.x.delete_property(self.root, gtk);
+            }
+        }
+        if areas.is_some() != self.work_area {
+            self.work_area = areas.is_some();
+            let v = self.supported(self.synced());
+            let _ = self.x.change_property32(
+                PropMode::REPLACE,
+                self.root,
+                self.atoms.net_supported,
+                AtomEnum::ATOM,
+                &v,
+            );
         }
     }
 
@@ -5075,6 +5340,133 @@ impl Dispatch<wl_surface::WlSurface, Window> for State {
 
 #[cfg(test)]
 mod tests {
+    /// A monitor at `x` (1280x800), unscaled.
+    fn monitor(x: i32) -> winsync::MonitorInfo {
+        let r = winsync::Rect::new(x, 0, 1280, 800);
+        winsync::MonitorInfo {
+            index: x / 1024,
+            rect: r,
+            work_area: r,
+            scale: 1.0,
+            primary: x == 0,
+        }
+    }
+
+    /// The sync's layout state (`Sync::follow`, without the D-Bus client).
+    struct Layout {
+        why: Option<String>,
+        on: bool,
+    }
+
+    impl Layout {
+        fn got(&mut self, monitors: &[winsync::MonitorInfo], screen: (u16, u16)) -> Turn {
+            let fits = winsync::layout_fits(monitors, screen);
+            self.why = fits.clone().err();
+            let turn = match (fits.is_ok(), self.on) {
+                (true, false) => Turn::On,
+                (false, true) => Turn::Off,
+                _ => Turn::AsIs,
+            };
+            if let Turn::On | Turn::Off = turn {
+                self.on = fits.is_ok();
+            }
+            turn
+        }
+    }
+
+    #[test]
+    fn the_sync_comes_back_when_the_layout_fits_again() {
+        // A: the scale round trip, with the X screen in physical pixels.
+        // 100 %: the sync is on; 125 %: off, with the reason logged once;
+        // 100 % again: the answer alone brings it back (before, it was
+        // dropped while the sync was off and it never came back)
+        let screen = (2304, 800);
+        let mut l = Layout {
+            why: None,
+            on: false,
+        };
+        let mut scaled = monitor(0);
+        scaled.scale = 1.25;
+        assert_eq!(l.got(&[monitor(0)], screen), Turn::On);
+        assert_eq!(l.got(&[scaled.clone()], screen), Turn::Off);
+        assert!(l.why.as_deref().unwrap().contains("scaled 1.25"));
+        assert_eq!(l.got(&[monitor(0)], screen), Turn::On);
+        assert_eq!(l.why, None);
+        // and the same twice in a row: nothing to do
+        assert_eq!(l.got(&[monitor(0)], screen), Turn::AsIs);
+        // an answer that does not fit while it is off: still off
+        let mut l = Layout {
+            why: None,
+            on: false,
+        };
+        assert_eq!(l.got(&[scaled], screen), Turn::AsIs);
+        // two monitors, the second one scaled (a scale is per monitor)
+        let mut two = vec![monitor(0), monitor(1024)];
+        let mut second = two[1].clone();
+        second.scale = 2.0;
+        two[1] = second;
+        let mut l = Layout {
+            why: None,
+            on: true,
+        };
+        assert_eq!(l.got(&two, screen), Turn::Off);
+        two[1].scale = 1.0;
+        assert_eq!(l.got(&two, screen), Turn::On);
+        // B: the X screen shrank below the layout and grew back (no
+        // engine resize is coming: the answer alone decides)
+        let mut l = Layout {
+            why: None,
+            on: true,
+        };
+        assert_eq!(l.got(&two, (1024, 800)), Turn::Off);
+        assert_eq!(l.got(&two, screen), Turn::On);
+        // the desktop names no monitor (never seen yet): not a layout
+        let mut l = Layout {
+            why: None,
+            on: true,
+        };
+        assert_eq!(l.got(&[], screen), Turn::Off);
+    }
+
+    #[test]
+    fn the_work_area_covers_the_monitors_work_areas() {
+        // the VM's two heads: the top bar takes the top 32 pixels of the first, so a _NET_WORKAREA of the first
+        // monitor's work area alone would cut the second monitor off
+        let mut a = monitor(0);
+        a.work_area = winsync::Rect::new(0, 32, 1280, 768);
+        // (the second monitor's work area is a pixel short of its monitor: a monitor whose work area is the
+        // whole of it takes nothing off the work area)
+        let mut b = monitor(0);
+        b.index = 1;
+        b.rect = winsync::Rect::new(1280, 32, 1024, 700);
+        b.work_area = winsync::Rect::new(1280, 32, 1024, 699);
+        b.primary = false;
+        let monitors = vec![a.clone(), b];
+        // what the desktop says (GetWorkArea): as it is, cut to the X screen
+        let all = winsync::Rect::new(0, 32, 2304, 768);
+        assert_eq!(work_area(&monitors, Some(all), (2304, 800)), all);
+        assert_eq!(
+            work_area(&monitors, Some(all), (2048, 780)),
+            winsync::Rect::new(0, 32, 2048, 748)
+        );
+        // without it, the first monitor's work area grown to hold the second's
+        let primary = Some(a.work_area);
+        assert_eq!(
+            work_area(&monitors, primary, (2304, 800)),
+            winsync::Rect::new(0, 32, 2304, 768)
+        );
+        // the X screen cuts it
+        assert_eq!(
+            work_area(&monitors, primary, (1280, 800)),
+            winsync::Rect::new(0, 32, 1280, 768)
+        );
+        // no monitor yet: nothing to publish, and nothing published
+        assert_eq!(
+            work_area(&[], None, (2304, 800)),
+            winsync::Rect::new(0, 0, 0, 0)
+        );
+    }
+
     #[test]
     fn the_window_sync_is_turned_off_by_extension_off_only() {
         assert!(super::sync_turned_off(Some("off")));

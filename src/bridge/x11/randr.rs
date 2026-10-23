@@ -1002,6 +1002,26 @@ mod tests {
     }
 
     #[test]
+    fn the_desktops_primary_output_is_the_primary_monitor() {
+        // p2_fix item 1: GNOME's primary is not necessarily the first
+        // output; the RandR monitor of the output it names is the primary
+        // one, and it follows the desktop back
+        let mut s = screen();
+        assert!(s.sync_wayland_output(9, b"HEADLESS-2", 1280, 0, 1024, 768, 1024, 768, 60_000));
+        let (first, second) = (s.outputs[0].output_id, s.outputs[1].output_id);
+        let primary = |s: &Screen| {
+            let m = s.monitors();
+            assert_eq!(m.iter().filter(|m| m.primary).count(), 1);
+            m.iter().find(|m| m.primary).unwrap().output_id
+        };
+        assert_eq!(primary(&s), first);
+        assert!(s.set_primary(9));
+        assert_eq!(primary(&s), second);
+        assert!(s.set_primary(7));
+        assert_eq!(primary(&s), first);
+    }
+
+    #[test]
     fn monitors_mirror_the_active_outputs() {
         let mut s = screen();
         assert!(s.sync_wayland_output(9, b"HEADLESS-2", 1280, 0, 1024, 768, 2048, 1536, 60_000));
