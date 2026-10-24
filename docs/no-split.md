@@ -164,6 +164,12 @@ the bridge on GNOME:
   `action-double/middle/right-click-titlebar`, `titlebar-font`,
   `color-scheme` and `accent-color`; `-windowbuttons=LAYOUT` overrides the
   button layout;
+- a transient that had the keyboard and goes away gives it back to its
+  `xdg_toplevel` parent, as an X window manager does. GNOME alone leaves the
+  keyboard on the desktop when a shown transient (a Wine tooltip or menu)
+  unmaps, so the next Escape/typing went nowhere; the revert only happens
+  within 250 ms of that transient taking the keyboard, so a user who moved to
+  another window is not pulled back;
 - no heuristics for client-drawn title bars: `_GTK_FRAME_EXTENTS` (GTK CSD)
   and `_MOTIF_WM_HINTS decorations 0` mean the client keeps its own bar, and
   the bridge draws none;
@@ -179,7 +185,10 @@ coming back to. The doctor prints the setting and the values in force;
 `-verbose` logs the reason for every window's frame decision.
 
 Measured on GNOME 50.1 (headless bed, window sync on): xterm, GTK 3, GTK 4,
-Qt 5, Qt 6, Java/Swing, Tk, Motif (nedit), SDL 2, Wine and Chromium each end
+Qt 5, Qt 6, Java/Swing, Tk, Motif (nedit), SDL 2, Wine and Chromium (800x450,
+so the measured +80,+40 move and +60,+40 resize fit the work area; a 900x600
+client is 652 px tall in the 688 px work area and mutter's own edge clamp is
+correct) each end
 with exactly one title bar (the bridge's, or GTK 4's declared
 `_MOTIF_WM_HINTS decorations 0`, or the declared decorations of the toolkit),
 drag by the header, resize from the bottom-right margin and double-click

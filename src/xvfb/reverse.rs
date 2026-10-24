@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
@@ -437,6 +437,41 @@ fn on_keyboard_leave(keyboard_left: &mut bool, keyboard_on: &mut Option<Window>)
 /// none of our windows.
 fn x_focus_clears(keyboard_left: bool, keyboard_on: Option<Window>) -> bool {
     keyboard_left && keyboard_on.is_none()
+}
+
+/// How recently the keyboard may have left a window for the window's
+/// disappearance to count as "it had the keyboard when it went away".  A
+/// transient (a Wine tooltip, a menu) is unmapped and its leave arrives in the
+/// same dispatch batch; a user who moved to another window leaves it that
+/// state for as long as they stay there, so a short window keeps the focus
+/// revert below from pulling them back.
+const FOCUS_REVERT: Duration = Duration::from_millis(250);
+
+/// The window that gets the keyboard back when `closed` goes away: its
+/// transient parent, which is what an X window manager does when a focused
+/// dialog or tooltip unmaps.  Without this, GNOME leaves the keyboard on the
+/// desktop when one of our transient toplevels disappears (measured: Wine's
+/// Find dialog lost the keyboard to its tooltip, and the tooltip's unmap left
+/// no window focused, so Escape and typing went nowhere).  Only a window that
+/// had the keyboard when it was taken away, and still has no successor,
+/// reverts the focus.
+fn focus_after_close(
+    closed: Window,
+    left: Option<(Window, Instant)>,
+    keyboard_on: Option<Window>,
+    parent: Option<Window>,
+) -> Option<Window> {
+    let parent = parent.filter(|p| *p != closed)?;
+    if keyboard_on == Some(closed) {
+        // the keyboard is still on the window that is disappearing
+        return Some(parent);
+    }
+    if keyboard_on.is_some() {
+        // it went to another of our windows
+        return None;
+    }
+    let (w, at) = left?;
+    (w == closed && at.elapsed() <= FOCUS_REVERT).then_some(parent)
 }
 
 /// wl_touch.down on shown window `w`: whether the first point of a touch
@@ -1203,6 +1238,10 @@ struct State {
     /// and, by the end of the dispatch, gave it to none of them: the X
     /// focus goes too (see `after_dispatch`).
     keyboard_left: bool,
+    /// The window the keyboard last left, and when: a transient that goes
+    /// away just after it had the keyboard gives focus back to its parent
+    /// (`focus_after_close`).
+    focus_left: Option<(Window, Instant)>,
     enter_serial: u32,
     /// Where the reverse pointer was last put (root coordinates).
     last_pos: Option<(i16, i16)>,
@@ -1445,6 +1484,7 @@ fn run(
         on_screen: Vec::new(),
         x_focus: None,
         keyboard_left: false,
+        focus_left: None,
         enter_serial: 0,
         last_pos: None,
         lock: None,
@@ -3085,6 +3125,15 @@ impl State {
         let Some(s) = self.windows.remove(&w) else {
             return;
         };
+        // A transient that had the keyboard and goes away gives it back to its
+        // parent, as an X window manager does; GNOME alone leaves it nowhere
+        // (a Wine tooltip over the Find dialog did, measured).  `parent` is
+        // the xdg_toplevel's set_parent, so only our own windows are involved.
+        let parent = s.parent;
+        let revert = focus_after_close(w, self.focus_left, self.keyboard_on, parent);
+        if self.focus_left.is_some_and(|(f, _)| f == w) {
+            self.focus_left = None;
+        }
         self.popups.retain(|p| *p != w);
         self.sync_forget(w);
         self.p1_gone(w);
@@ -3123,6 +3172,18 @@ impl State {
         if self.keyboard_on == Some(w) {
             self.release_keys();
             self.keyboard_on = None;
+        }
+        if let Some(p) = revert
+            && self.synced_toplevel(p)
+            && let Some(sync) = self.sync.as_mut()
+        {
+            sync.client.send(Request::Activate {
+                xid: p,
+                timestamp: self.input_time,
+            });
+            crate::vlog!(
+                "-showwindows: {w:#x} had the keyboard and went away: focus back to its parent {p:#x}"
+            );
         }
         for c in children {
             self.consider(c, qh);
@@ -6867,7 +6928,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 let Some((w, _)) = state.surface_point(&surface, 0.0, 0.0) else {
                     return;
                 };
+                crate::vlog!("-showwindows: keyboard entered {w:#x}");
                 on_keyboard_enter(&mut state.keyboard_left, &mut state.keyboard_on, w);
+                state.focus_left = None;
                 state.set_active(Some(w));
                 state.sync_focused(w);
                 if w == state.root {
@@ -6881,6 +6944,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Leave { .. } => {
                 state.release_keys();
                 let had = state.keyboard_on;
+                state.focus_left = had.map(|w| (w, Instant::now()));
                 on_keyboard_leave(&mut state.keyboard_left, &mut state.keyboard_on);
                 // its client's earlier input no longer vouches for a raise
                 if let Some(w) = had {
@@ -7859,6 +7923,57 @@ mod tests {
                 assert_eq!(p2_axis(at, len.into(), 1280), Some(back));
             }
         }
+    }
+
+    #[test]
+    fn a_focused_transient_gives_the_keyboard_back_to_its_parent() {
+        let (parent, child) = (0x1a00003, 0x1a00006);
+        // the leave and the unmap both happened: a Wine tooltip over a dialog
+        assert_eq!(
+            focus_after_close(child, Some((child, Instant::now())), None, Some(parent)),
+            Some(parent)
+        );
+        // the keyboard is still on the window that is going away
+        assert_eq!(
+            focus_after_close(child, None, Some(child), Some(parent)),
+            Some(parent)
+        );
+    }
+
+    #[test]
+    fn only_the_transient_that_had_the_keyboard_reverts_it() {
+        let (parent, child, other) = (0x1a00003, 0x1a00006, 0x1a00007);
+        let recent = Instant::now();
+        // the keyboard went to another of our windows
+        assert_eq!(
+            focus_after_close(child, Some((child, recent)), Some(other), Some(parent)),
+            None
+        );
+        // a different window went away
+        assert_eq!(
+            focus_after_close(child, Some((other, recent)), None, Some(parent)),
+            None
+        );
+        // the user moved away long before the window went
+        assert_eq!(
+            focus_after_close(
+                child,
+                Some((child, recent - Duration::from_secs(1))),
+                None,
+                Some(parent)
+            ),
+            None
+        );
+        // nothing to go back to (not a transient, or the window itself)
+        assert_eq!(
+            focus_after_close(child, Some((child, recent)), None, None),
+            None
+        );
+        assert_eq!(
+            focus_after_close(child, Some((child, recent)), None, Some(child)),
+            None
+        );
+        assert_eq!(focus_after_close(child, None, None, Some(parent)), None);
     }
 
     #[test]
