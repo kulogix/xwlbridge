@@ -60,9 +60,10 @@ pub fn tag_window(s: &str, display: u32) -> Option<Xid> {
     parse_tag(s).filter(|t| t.0 == display).map(|t| t.1)
 }
 
-/// A window rectangle in the shared coordinate space (X root == the
-/// desktop's logical layout): the X window's geometry, which is the
-/// toplevel's xdg window geometry.
+/// A window rectangle. Two coordinate spaces are in play: the desktop's
+/// logical layout (what the GNOME Shell extension reports) and the X screen,
+/// which is logical x S ([`Space`]). Rectangles from the extension are
+/// logical; rectangles from X are X pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: i32,
@@ -75,6 +76,69 @@ impl Rect {
     pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Rect {
         Rect { x, y, w, h }
     }
+}
+
+/// The X space's scale: X pixels = logical pixels x `scale` (Xwayland's
+/// native-scaling model, design section 4). S = the largest monitor scale,
+/// rounded up; 1 without HiDPI.
+///
+/// This is the **one** place the extension/window sync converts between the
+/// two spaces. Every rectangle that crosses the bridge is converted here
+/// exactly once; geometry state keeps X rectangles and the extension keeps
+/// logical ones (or the other way round, per API), never a mix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub scale: u32,
+}
+
+impl Default for Space {
+    fn default() -> Self {
+        Space { scale: 1 }
+    }
+}
+
+impl Space {
+    pub fn new(scale: u32) -> Space {
+        Space {
+            scale: scale.max(1),
+        }
+    }
+
+    /// The X-space rectangle of a desktop (logical) rectangle.
+    pub fn to_x(self, r: Rect) -> Rect {
+        let s = self.scale as i32;
+        Rect::new(
+            r.x.saturating_mul(s),
+            r.y.saturating_mul(s),
+            r.w.saturating_mul(s),
+            r.h.saturating_mul(s),
+        )
+    }
+
+    /// The desktop (logical) rectangle of an X-space rectangle, rounding once.
+    pub fn to_desk(self, r: Rect) -> Rect {
+        let s = self.scale as f64;
+        let round = |v: i32| (f64::from(v) / s).round() as i32;
+        Rect::new(round(r.x), round(r.y), round(r.w), round(r.h))
+    }
+
+    /// The X size of an xdg-toplevel configure size. The protocol's
+    /// `width`/`height` are surface-local, i.e. logical pixels; 0 means "no
+    /// preference" and stays 0.
+    pub fn configure_size(self, w: i32, h: i32) -> (i32, i32) {
+        let s = self.scale as i32;
+        (w.max(0).saturating_mul(s), h.max(0).saturating_mul(s))
+    }
+}
+
+/// S from the desktop's monitors: the largest scale, rounded up (at least 1).
+pub fn hidpi_scale(monitors: &[MonitorInfo]) -> u32 {
+    monitors
+        .iter()
+        .map(|m| m.scale.max(1.0).ceil() as u32)
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// `MoveResize` flags.
@@ -196,6 +260,8 @@ struct Win {
 #[derive(Debug, Default)]
 pub struct Geometry {
     wins: HashMap<Xid, Win>,
+    /// The X <-> logical conversion (section 4).
+    space: Space,
 }
 
 /// Whether a report stamped `stamp` is newer than what `w` has (no stamp:
@@ -219,6 +285,31 @@ fn at_desk(desk: Rect, x: Rect) -> Rect {
 impl Geometry {
     pub fn new() -> Geometry {
         Geometry::default()
+    }
+
+    /// The X <-> logical conversion in force.
+    pub fn space(&self) -> Space {
+        self.space
+    }
+
+    /// A new S (a monitor was scaled, added or removed): the screen is
+    /// reconfigured, so the desktop's rectangles are unknown until the next
+    /// resync and X's own rectangles are re-expressed in the new space.
+    pub fn set_scale(&mut self, scale: u32) {
+        let space = Space::new(scale);
+        if space == self.space {
+            return;
+        }
+        self.space = space;
+        for w in self.wins.values_mut() {
+            w.x = w.desk.map_or(w.x, |d| space.to_x(d));
+            w.pending = None;
+            w.in_flight = None;
+            w.late = None;
+            w.x_echo = None;
+            w.desk = None;
+            w.serial = None;
+        }
     }
 
     /// A toplevel is shown, at X rectangle `x`.
@@ -281,6 +372,7 @@ impl Geometry {
     /// A ConfigureNotify for the X window (`seq`: the sequence number it
     /// came with, as x11rb's `poll_for_event_with_sequence` gives it).
     pub fn x_configured(&mut self, xid: Xid, rect: Rect, seq: u64, now: Instant) -> Option<Rect> {
+        let space = self.space;
         let w = self.wins.get_mut(&xid)?;
         if let Some((sent, ours)) = w.x_echo {
             if seq < sent {
@@ -295,7 +387,7 @@ impl Geometry {
             return None; // no geometry change (a restack, a border width)
         }
         w.x = rect;
-        if w.in_flight.is_none() && w.desk == Some(rect) {
+        if w.in_flight.is_none() && w.desk.map(|d| space.to_x(d)) == Some(rect) {
             w.pending = None; // the desktop is there already
             return None;
         }
@@ -309,7 +401,7 @@ impl Geometry {
             // desktop report at most
             w.pending = None;
             w.pending_flags = 0;
-            let desk = w.desk?;
+            let desk = space.to_x(w.desk?);
             if (desk.x, desk.y) == (rect.x, rect.y) {
                 return None;
             }
@@ -331,6 +423,7 @@ impl Geometry {
     /// Whether a button is held on the window (any button of the desktop's
     /// pointer, touch or tablet on its surface).
     pub fn button(&mut self, xid: Xid, held: bool) -> Option<Rect> {
+        let space = self.space;
         let w = self.wins.get_mut(&xid)?;
         let was = std::mem::replace(&mut w.held, held);
         if held || !was || w.pending.is_some() || w.in_flight.is_some() {
@@ -338,19 +431,21 @@ impl Geometry {
         }
         // released with X's last move landed: the desktop is authoritative
         // again, and a change it made meanwhile stands
-        w.desk.filter(|d| *d != w.x)
+        w.desk.map(|d| space.to_x(d)).filter(|d| *d != w.x)
     }
 
     /// The window's frame callback: the coalesced X -> desktop move to send
     /// now, if any (then it is in flight until `applied` or `failed`).
     pub fn frame(&mut self, xid: Xid) -> Option<MoveResize> {
+        let space = self.space;
         let w = self.wins.get_mut(&xid)?;
         if w.in_flight.is_some() {
             return None;
         }
         let rect = w.pending.take()?;
         let extra = std::mem::take(&mut w.pending_flags);
-        if w.desk == Some(rect) {
+        let desk = space.to_desk(rect);
+        if w.desk == Some(desk) {
             return None;
         }
         w.in_flight = Some(rect);
@@ -360,7 +455,7 @@ impl Geometry {
         // the work area of the monitor it goes to
         let flags = if w.held { mr::USER } else { mr::CLAMP };
         Some(MoveResize {
-            rect,
+            rect: desk,
             flags: flags | extra,
         })
     }
@@ -377,8 +472,9 @@ impl Geometry {
         applied: Rect,
         stamp: Option<u32>,
     ) -> Option<Rect> {
+        let space = self.space;
         let w = self.wins.get_mut(&xid)?;
-        if w.in_flight != Some(requested) {
+        if w.in_flight != Some(space.to_x(requested)) {
             return None; // not the request in flight (a reset dropped it)
         }
         w.in_flight = None;
@@ -390,7 +486,7 @@ impl Geometry {
             if w.pending.is_some() || w.held {
                 return None;
             }
-            let desk = at_desk(w.desk?, w.x);
+            let desk = at_desk(space.to_x(w.desk?), w.x);
             return (desk != w.x).then_some(desk);
         }
         if stamp.is_some() {
@@ -411,7 +507,8 @@ impl Geometry {
             return None; // X moved on: the next request settles it
         }
         // clamped at an edge or a size limit: X goes back, as under an X WM
-        (applied != requested && applied != w.x).then_some(applied)
+        let applied_x = space.to_x(applied);
+        (applied != requested && applied_x != w.x).then_some(applied_x)
     }
 
     /// The window's MoveResize failed. `answered`: the desktop answered
@@ -442,6 +539,7 @@ impl Geometry {
         serial: u32,
         now: Instant,
     ) -> Option<Rect> {
+        let space = self.space;
         let w = self.wins.get_mut(&xid)?;
         if !fresh(w, Some(serial)) {
             return None; // stale, or a duplicate
@@ -466,7 +564,7 @@ impl Geometry {
         if w.in_flight.is_some() {
             return None; // ours landing, or overtaken by it: the reply settles it
         }
-        if w.late == Some(rect) {
+        if w.late.map(|r| space.to_x(r)) == Some(space.to_x(rect)) {
             // a request of ours that timed out, carried out late
             w.late = None;
             if w.pending.is_some() {
@@ -478,7 +576,8 @@ impl Geometry {
             // move of ours): X's own move goes next
             return None;
         }
-        if rect == w.x {
+        let rect_x = space.to_x(rect);
+        if rect_x == w.x {
             w.pending = None;
             return None;
         }
@@ -486,7 +585,7 @@ impl Geometry {
         // constraints, unmaximise, untile): the desktop is authoritative
         w.pending = None;
         w.pending_flags = 0;
-        Some(rect)
+        Some(rect_x)
     }
 
     /// A full resync from `GetState` (the extension came or came back, or
@@ -494,6 +593,7 @@ impl Geometry {
     /// stamp for the window. A window reported newer since is left alone,
     /// and a request in flight is settled by its reply.
     pub fn resync(&mut self, xid: Xid, rect: Rect, flags: u32, serial: u32) -> Option<Rect> {
+        let space = self.space;
         let w = self.wins.get_mut(&xid)?;
         if !fresh(w, Some(serial)) {
             return None; // a newer report came in first
@@ -505,7 +605,7 @@ impl Geometry {
         w.late = None;
         if w.held {
             // X rules while held: push X's rectangle instead
-            if rect != w.x {
+            if space.to_x(rect) != w.x {
                 w.pending = Some(w.x);
             }
             return None;
@@ -515,7 +615,8 @@ impl Geometry {
         }
         w.pending = None;
         w.pending_flags = 0;
-        (rect != w.x).then_some(rect)
+        let rect_x = space.to_x(rect);
+        (rect_x != w.x).then_some(rect_x)
     }
 
     /// The extension went away: nothing is in flight any more, and the
@@ -633,17 +734,23 @@ pub fn inner_size(w: i32, h: i32, border: u16) -> (u32, u32) {
 }
 
 /// What the X window should be told of the desktop's rectangle `desk`: its
-/// position, with X's own size `x`. A shown window's size on the desktop is
-/// the size of the buffer the bridge committed last, so a desktop report can
-/// only lag X's size, never lead it: the desktop's own resizes (the user's,
-/// tiling, maximise) come as the toplevel's configure, which resizes the X
-/// window, and a clamped size comes back in the MoveResize reply. Taking the
-/// reported size would shrink a window that just grew itself back to the
-/// size of its last frame.
-pub fn desktop_position(desk: Rect, x: Rect) -> Rect {
+/// position, with X's own size `x` **in the desktop's space**. A shown
+/// window's size on the desktop is the size of the buffer the bridge
+/// committed last, so a desktop report can only lag X's size, never lead it:
+/// the desktop's own resizes (the user's, tiling, maximise) come as the
+/// toplevel's configure, which resizes the X window, and a clamped size comes
+/// back in the MoveResize reply. Taking the reported size would shrink a
+/// window that just grew itself back to the size of its last frame.
+///
+/// `desk` is logical and `x` is X pixels: the size is converted through
+/// `space` here, once, or a desktop report at S != 1 would make the X window
+/// S times too big (the size was already X pixels, and `Geometry` multiplies
+/// the whole rectangle by S again).
+pub fn desktop_position(desk: Rect, x: Rect, space: Space) -> Rect {
+    let xd = space.to_desk(x);
     Rect {
-        w: x.w,
-        h: x.h,
+        w: xd.w,
+        h: xd.h,
         ..desk
     }
 }
@@ -892,29 +999,67 @@ impl Layers {
 }
 
 /// Whether the desktop's monitors fit the X screen of size `screen` one to
-/// one, which the window sync needs (it puts X windows where the desktop
-/// has them, and pointer input reaches only the X screen): every monitor
-/// unscaled (the X screen is in physical pixels, the desktop's layout in
-/// logical ones) and inside the X screen. Otherwise why not.
-pub fn layout_fits(monitors: &[MonitorInfo], screen: (u16, u16)) -> Result<(), String> {
+/// one **in X space**: every monitor's logical rectangle times `scale` lies
+/// on the X screen and the screen is exactly their bounds, which the window
+/// sync needs (it puts X windows where the desktop has them, and pointer
+/// input reaches only the X screen). `scale` is S from [`hidpi_scale`]; 1
+/// is the old behaviour (a scaled monitor keeps the sync off, because X and
+/// the desktop would be in different spaces). Otherwise why not.
+pub fn layout_fits(monitors: &[MonitorInfo], screen: (u16, u16), scale: u32) -> Result<(), String> {
+    let scale = scale.max(1);
     if monitors.is_empty() {
         return Err("the desktop reports no monitors".into());
     }
     let (sw, sh) = (i32::from(screen.0), i32::from(screen.1));
-    for m in monitors {
-        if (m.scale - 1.0).abs() > 1e-6 {
-            return Err(format!(
-                "monitor {} is scaled {}x: the sync needs unscaled monitors for now",
-                m.index, m.scale
-            ));
+    if scale == 1 {
+        // HiDPI off: the old rule, unchanged - an unscaled layout inside a
+        // larger fixed-size X screen (Xvfb) still syncs; a scaled monitor
+        // cannot, because X and the desktop would be in different spaces.
+        for m in monitors {
+            if (m.scale - 1.0).abs() > 1e-6 {
+                return Err(format!(
+                    "monitor {} is scaled {}x: the sync needs unscaled monitors with HiDPI off",
+                    m.index, m.scale
+                ));
+            }
+            let r = m.rect;
+            if r.x < 0 || r.y < 0 || r.x + r.w > sw || r.y + r.h > sh {
+                return Err(format!(
+                    "monitor {} at {}x{}+{}+{} lies outside the {sw}x{sh} X screen",
+                    m.index, r.w, r.h, r.x, r.y
+                ));
+            }
         }
-        let r = m.rect;
+        return Ok(());
+    }
+    let space = Space::new(scale);
+    let mut bounds: Option<Rect> = None;
+    for m in monitors {
+        let r = space.to_x(m.rect);
         if r.x < 0 || r.y < 0 || r.x + r.w > sw || r.y + r.h > sh {
             return Err(format!(
-                "monitor {} at {}x{}+{}+{} lies outside the {sw}x{sh} X screen",
+                "monitor {} at {}x{}+{}+{} lies outside the {sw}x{sh} X screen (S = {scale})",
                 m.index, r.w, r.h, r.x, r.y
             ));
         }
+        bounds = Some(match bounds {
+            None => r,
+            Some(b) => {
+                let x = b.x.min(r.x);
+                let y = b.y.min(r.y);
+                let right = (b.x + b.w).max(r.x + r.w);
+                let bottom = (b.y + b.h).max(r.y + r.h);
+                Rect::new(x, y, right - x, bottom - y)
+            }
+        });
+    }
+    if let Some(b) = bounds
+        && (b.x, b.y, b.w, b.h) != (0, 0, sw, sh)
+    {
+        return Err(format!(
+            "the scaled layout is {}x{}+{}+{} but the X screen is {sw}x{sh} (S = {scale})",
+            b.w, b.h, b.x, b.y
+        ));
     }
     Ok(())
 }
@@ -2483,36 +2628,146 @@ mod tests {
         assert_eq!(g.frame(XID).map(|m| m.rect), Some(r(100, 300)));
     }
 
-    #[test]
-    fn the_layout_must_be_unscaled_and_on_the_x_screen() {
-        let m = |index, rect, scale| MonitorInfo {
+    fn monitor(index: i32, rect: Rect, scale: f64) -> MonitorInfo {
+        MonitorInfo {
             index,
             rect,
             work_area: rect,
             scale,
             primary: index == 0,
-        };
-        let one = m(0, Rect::new(0, 0, 1280, 720), 1.0);
-        assert_eq!(layout_fits(std::slice::from_ref(&one), (1280, 720)), Ok(()));
+        }
+    }
+
+    #[test]
+    fn the_layout_must_fit_the_x_screen_in_x_space() {
+        let one = monitor(0, Rect::new(0, 0, 1280, 720), 1.0);
+        assert_eq!(
+            layout_fits(std::slice::from_ref(&one), (1280, 720), 1),
+            Ok(())
+        );
         assert_eq!(
             layout_fits(
-                &[one.clone(), m(1, Rect::new(1280, 0, 1280, 720), 1.0)],
-                (2560, 720)
+                &[one.clone(), monitor(1, Rect::new(1280, 0, 1280, 720), 1.0)],
+                (2560, 720),
+                1
             ),
             Ok(())
         );
         // a monitor added and the X screen could not grow (Xvfb)
         assert!(
             layout_fits(
-                &[one.clone(), m(1, Rect::new(1280, 0, 1280, 720), 1.0)],
-                (1280, 720)
+                &[one.clone(), monitor(1, Rect::new(1280, 0, 1280, 720), 1.0)],
+                (1280, 720),
+                1
             )
             .is_err()
         );
-        // scaled: the X screen is physical, the layout logical
-        assert!(layout_fits(&[m(0, Rect::new(0, 0, 1280, 720), 2.0)], (2560, 1440)).is_err());
-        assert!(layout_fits(&[m(0, Rect::new(0, 0, 1280, 720), 1.25)], (1600, 900)).is_err());
-        assert!(layout_fits(&[], (1280, 720)).is_err());
+        // scaled with HiDPI off: X and the desktop are in different spaces
+        assert!(
+            layout_fits(
+                &[monitor(0, Rect::new(0, 0, 1280, 720), 2.0)],
+                (2560, 1440),
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            layout_fits(
+                &[monitor(0, Rect::new(0, 0, 1280, 720), 1.25)],
+                (1600, 900),
+                1
+            )
+            .is_err()
+        );
+        assert!(layout_fits(&[], (1280, 720), 1).is_err());
+    }
+
+    #[test]
+    fn hidpi_scales_the_x_screen_by_the_largest_monitor_scale_rounded_up() {
+        let m = |rect, scale| monitor(0, rect, scale);
+        // 1x: identity
+        assert_eq!(hidpi_scale(&[m(Rect::new(0, 0, 1280, 720), 1.0)]), 1);
+        // 2x: 2, and the X screen is twice the logical layout
+        let two = m(Rect::new(0, 0, 1280, 720), 2.0);
+        assert_eq!(hidpi_scale(std::slice::from_ref(&two)), 2);
+        assert_eq!(
+            layout_fits(std::slice::from_ref(&two), (2560, 1440), 2),
+            Ok(())
+        );
+        assert!(layout_fits(std::slice::from_ref(&two), (1280, 720), 2).is_err());
+        // 1.25x rounds up to 2 (Xwayland's model: integer S, downscaled to logical)
+        let frac = m(Rect::new(0, 0, 1536, 864), 1.25);
+        assert_eq!(hidpi_scale(std::slice::from_ref(&frac)), 2);
+        assert_eq!(
+            layout_fits(std::slice::from_ref(&frac), (3072, 1728), 2),
+            Ok(())
+        );
+        // mixed 1x + 2x: one S for the whole X screen
+        let mixed = [
+            monitor(0, Rect::new(0, 0, 1280, 720), 1.0),
+            monitor(1, Rect::new(1280, 0, 1280, 720), 2.0),
+        ];
+        assert_eq!(hidpi_scale(&mixed), 2);
+        assert_eq!(layout_fits(&mixed, (5120, 1440), 2), Ok(()));
+        // 3x
+        assert_eq!(hidpi_scale(&[m(Rect::new(0, 0, 640, 360), 3.0)]), 3);
+    }
+
+    #[test]
+    fn a_configure_size_is_logical() {
+        // xdg_toplevel's width/height are logical (surface-local): X is
+        // logical x S, or a configure of the window's current size would
+        // shrink an X window by S every time the compositor sent one
+        assert_eq!(Space::new(1).configure_size(300, 200), (300, 200));
+        assert_eq!(Space::new(2).configure_size(300, 200), (600, 400));
+        assert_eq!(Space::new(2).configure_size(0, 0), (0, 0));
+        // 1.25x still runs at S = 2, and an odd logical size rounds once
+        assert_eq!(Space::new(2).configure_size(1537, 865), (3074, 1730));
+    }
+
+    #[test]
+    fn space_converts_between_logical_and_x_pixels() {
+        let r = Rect::new(10, 20, 300, 200);
+        assert_eq!(Space::new(1).to_x(r), r);
+        assert_eq!(Space::new(1).to_desk(r), r);
+        assert_eq!(Space::new(2).to_x(r), Rect::new(20, 40, 600, 400));
+        assert_eq!(Space::new(2).to_desk(Rect::new(20, 40, 600, 400)), r);
+        // 1.25x runs at S = 2: destination is the logical rectangle
+        assert_eq!(
+            Space::new(2).to_x(Rect::new(0, 0, 1536, 864)),
+            Rect::new(0, 0, 3072, 1728)
+        );
+        assert_eq!(
+            Space::new(2).to_desk(Rect::new(0, 0, 3072, 1728)),
+            Rect::new(0, 0, 1536, 864)
+        );
+        // rounding happens once, at the boundary
+        assert_eq!(
+            Space::new(2).to_desk(Rect::new(1, 3, 5, 7)),
+            Rect::new(1, 2, 3, 4)
+        );
+    }
+
+    #[test]
+    fn an_s_change_reespresses_x_rectangles_and_forgets_the_desktop() {
+        let mut g = Geometry::new();
+        g.set_scale(2);
+        g.track(XID, Rect::new(200, 100, 400, 300));
+        assert_eq!(
+            g.resync(XID, Rect::new(100, 50, 200, 150), 0, 1),
+            None,
+            "X is already there in the new space"
+        );
+        // the desktop's logical rectangles are unchanged; X moves to the new space
+        g.set_scale(1);
+        assert_eq!(
+            g.desk(XID),
+            None,
+            "the screen was reconfigured: wait for a resync"
+        );
+        assert_eq!(g.space(), Space::new(1));
+        g.track(XID, Rect::new(100, 50, 200, 150));
+        assert_eq!(g.resync(XID, Rect::new(100, 50, 200, 150), 0, 2), None);
     }
 
     #[test]
@@ -2685,7 +2940,10 @@ mod tests {
         // frame (400x300) at a new position: X keeps its size
         let x = Rect::new(100, 100, 500, 400);
         let desk = Rect::new(150, 120, 400, 300);
-        assert_eq!(desktop_position(desk, x), Rect::new(150, 120, 500, 400));
+        assert_eq!(
+            desktop_position(desk, x, Space::new(1)),
+            Rect::new(150, 120, 500, 400)
+        );
         // fed to Geometry, the stale size does not shrink X back
         let mut g = synced(Rect::new(100, 100, 400, 300));
         let t = t0();
@@ -2697,7 +2955,7 @@ mod tests {
         assert_eq!(
             g.changed(
                 XID,
-                desktop_position(stale, g.x_rect(XID).unwrap()),
+                desktop_position(stale, g.x_rect(XID).unwrap(), Space::new(1)),
                 0,
                 11,
                 t
@@ -2706,6 +2964,28 @@ mod tests {
             "the frame before the new buffer is no desktop resize"
         );
         assert_eq!(g.x_rect(XID), Some(x));
+    }
+
+    #[test]
+    fn desktop_reports_carry_the_logical_size_at_s() {
+        // a 600x400 X window at S = 2 is 300x200 on the desktop: a reported
+        // logical 300x200 must stay 600x400 X, not become 1200x800
+        let x = Rect::new(0, 0, 600, 400);
+        let desk = Rect::new(363, 216, 300, 200);
+        assert_eq!(
+            desktop_position(desk, x, Space::new(2)),
+            Rect::new(363, 216, 300, 200)
+        );
+        // a stale logical frame (250x150) does not shrink the X size either
+        assert_eq!(
+            desktop_position(Rect::new(363, 216, 250, 150), x, Space::new(2)),
+            Rect::new(363, 216, 300, 200)
+        );
+        // rounding once: an odd X size
+        assert_eq!(
+            desktop_position(desk, Rect::new(0, 0, 601, 401), Space::new(2)),
+            Rect::new(363, 216, 301, 201)
+        );
     }
 
     #[test]

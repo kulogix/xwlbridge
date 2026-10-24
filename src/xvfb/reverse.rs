@@ -55,6 +55,9 @@ use wayland_client::{Connection as WlConnection, Dispatch, EventQueue, Proxy, Qu
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
 };
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
 };
@@ -89,6 +92,7 @@ use super::decor;
 #[cfg(feature = "gnome")]
 use super::decor_settings;
 use super::selfdrag;
+use super::settings;
 use super::winsync::{self, Due, Raise, Rect, Request};
 use super::{AnyError, Auth};
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
@@ -332,6 +336,29 @@ fn frame_bytes(w: u16, h: u16) -> Option<usize> {
     }
     let frame = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
     (frame.checked_mul(2)? <= MAX_POOL).then_some(frame)
+}
+
+/// `FrameGeom`'s header and margin are logical CSS pixels (decor.rs).  This
+/// is the one conversion to X pixels, used for the X-sized buffers, the X
+/// window/EWMH properties and the X-side frame maths.  Pointer, winsync and
+/// window-geometry paths stay logical.
+fn frame_x(frame: decor::FrameGeom, scale: u32) -> decor::FrameGeom {
+    let s = scale.max(1) as i32;
+    decor::FrameGeom {
+        header: frame.header.max(0).saturating_mul(s),
+        margin: frame.margin.max(0).saturating_mul(s),
+    }
+}
+
+/// The surface box (content + frame) in X pixels.
+fn surface_x(frame: decor::FrameGeom, content: (u16, u16), scale: u32) -> (u16, u16) {
+    frame_x(frame, scale).surface_size(content)
+}
+
+/// The logical size of an X-pixel length under S (rounded once, at least 1).
+fn logical_x(w: i32, h: i32, scale: u32) -> (i32, i32) {
+    let s = scale.max(1) as i32;
+    (((w + s / 2) / s).max(1), ((h + s / 2) / s).max(1))
 }
 
 /// An anchor rectangle inside a parent of `pw`x`ph` for a popup at `(dx, dy)`
@@ -735,6 +762,7 @@ pub fn spawn_once(
     screen: bool,
     decorations: bool,
     windowbuttons: Option<String>,
+    hidpi: bool,
 ) {
     if SPAWNED.swap(true, Ordering::SeqCst) {
         return;
@@ -742,7 +770,15 @@ pub fn spawn_once(
     let _ = std::thread::Builder::new()
         .name("xvfb-reverse".into())
         .spawn(move || {
-            if let Err(e) = run(display, devs, &auth, screen, decorations, windowbuttons) {
+            if let Err(e) = run(
+                display,
+                devs,
+                &auth,
+                screen,
+                decorations,
+                windowbuttons,
+                hidpi,
+            ) {
                 crate::warning!("-showwindows: stopped: {e}");
             }
             // our X connection is gone (or never was): its slot is anyone's
@@ -770,6 +806,14 @@ struct Atoms {
     net_wm_moveresize: u32,
     net_supported: u32,
     net_supporting_wm_check: u32,
+    /// The compositing-manager selection: the bridge is the engine display's
+    /// compositor (it redirects and composites every toplevel), so toolkits
+    /// may use RGBA visuals and their client-side shadows.
+    net_wm_cm_s0: u32,
+    /// `_GTK_FRAME_EXTENTS` in `_NET_SUPPORTED`: without it GTK on a
+    /// composited X server drops its CSD shadow margins (a window is 50 px
+    /// smaller in each direction than on Xwayland).
+    gtk_frame_extents: u32,
     net_active_window: u32,
     net_wm_state_above: u32,
     net_wm_state_stays_on_top: u32,
@@ -784,7 +828,6 @@ struct Atoms {
     emulated_mode: u32,
     net_frame_extents: u32,
     net_request_frame_extents: u32,
-    gtk_frame_extents: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -883,6 +926,9 @@ impl Drop for HeaderBuffers {
 struct Chrome {
     surface: wl_surface::WlSurface,
     subsurface: wl_subsurface::WlSubsurface,
+    /// The header's buffer is in X pixels (painted at S); the destination is
+    /// the logical header size (header logical px wide, the surface / S).
+    viewport: Option<wp_viewport::WpViewport>,
     shadow_surface: wl_surface::WlSurface,
     shadow_subsurface: wl_subsurface::WlSubsurface,
     state: decor::HeaderState,
@@ -920,7 +966,7 @@ impl Chrome {
         }
     }
 
-    fn destroy(self) {
+    fn destroy(mut self) {
         if let Some(b) = self.buffers {
             for buf in &b.buffers {
                 buf.destroy();
@@ -935,6 +981,9 @@ impl Chrome {
         }
         self.subsurface.destroy();
         self.shadow_subsurface.destroy();
+        if let Some(v) = self.viewport.take() {
+            v.destroy();
+        }
         self.surface.destroy();
         self.shadow_surface.destroy();
     }
@@ -1085,6 +1134,15 @@ struct Shown {
     pixmap: Option<u32>,
     surface: wl_surface::WlSurface,
     xdg_surface: xdg_surface::XdgSurface,
+    /// `wp_viewporter`: the destination is the logical size (X size / S),
+    /// while the buffer is in X pixels (design section 4).
+    viewport: Option<wp_viewport::WpViewport>,
+    /// `wp_fractional_scale_v1` where the compositor offers it (fractional
+    /// monitors); the buffer stays at S, the viewport does the scaling.
+    /// Kept alive for the surface's lifetime; the preferred-scale event is
+    /// informational (S already covers it).
+    #[allow(dead_code)]
+    fractional: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     role: Role,
     configured: bool,
     buffers: Option<Buffers>,
@@ -1195,6 +1253,9 @@ struct Sync {
     on: bool,
     /// The desktop's monitors as last reported (None: not yet).
     monitors: Option<Vec<winsync::MonitorInfo>>,
+    /// S: X pixels = logical pixels x this (design section 4). 1 with HiDPI
+    /// off or an unscaled desktop.
+    scale: u32,
     /// The desktop's monitors were asked for (`GetMonitors` sent) and
     /// have not answered yet.
     monitors_asked: bool,
@@ -1223,11 +1284,40 @@ struct Sync {
 
 impl Sync {
     /// The desktop's monitors: the sync follows the layout, on or off (A).
-    fn got_monitors(&mut self, list: Vec<winsync::MonitorInfo>, screen: (u16, u16)) -> Turn {
-        let fits = winsync::layout_fits(&list, screen);
+    fn got_monitors(
+        &mut self,
+        list: Vec<winsync::MonitorInfo>,
+        screen: (u16, u16),
+        hidpi: bool,
+    ) -> Turn {
+        let scale = if !hidpi {
+            1
+        } else {
+            winsync::hidpi_scale(&list)
+        };
+        let scale_changed = scale != self.scale;
+        if scale_changed {
+            crate::log!(
+                "-showwindows: HiDPI: X space = logical x {scale} (was {})",
+                self.scale
+            );
+            self.scale = scale;
+            self.geo.set_scale(scale);
+            // an S change is a screen reconfiguration: even if the sync was
+            // on, go through a full turn so every window is resynced
+            self.on = false;
+        }
+        let fits = winsync::layout_fits(&list, screen, scale);
         self.monitors = Some(list);
         self.monitors_asked = false;
-        self.follow(fits)
+        let turn = self.follow(fits);
+        if scale_changed && turn == Turn::AsIs {
+            // the new layout does not fit yet (the X screen is still being
+            // resized): tell the caller to turn the sync off cleanly
+            Turn::Off
+        } else {
+            turn
+        }
     }
 
     /// Asks for the desktop's monitors (one request at a time: the answer
@@ -1252,7 +1342,18 @@ impl Sync {
             (true, Some(r)) => r,
             _ => monitors.iter().find(|m| m.primary)?.work_area,
         };
-        Some(work_area(monitors, Some(area), screen))
+        // the layout is logical (the extension's space); the X screen is logical x S
+        let logical = self.geo.space().to_desk(winsync::Rect::new(
+            0,
+            0,
+            i32::from(screen.0),
+            i32::from(screen.1),
+        ));
+        Some(work_area(
+            monitors,
+            Some(area),
+            (logical.w as u16, logical.h as u16),
+        ))
     }
 
     /// The layout the desktop's monitors make on the X screen: the sync
@@ -1356,6 +1457,7 @@ fn start_sync(display: u32, tags: bool) -> Option<Sync> {
             available: false,
             on: false,
             monitors: None,
+            scale: 1,
             monitors_asked: false,
             work_area: false,
             work_area_value: None,
@@ -1410,6 +1512,8 @@ struct State {
     x: RustConnection,
     root: Window,
     screen: (u16, u16),
+    /// HiDPI (S from the desktop's monitors) is enabled (`-nohidpi` / `hidpi=off` turns it off).
+    hidpi: bool,
     devs: Devices,
     atoms: Atoms,
     resource_mask: u32,
@@ -1432,6 +1536,8 @@ struct State {
     presentation: Option<wp_presentation::WpPresentation>,
     present_stats: bool,
     present_latency: HashMap<Window, Vec<u64>>,
+    /// `wp_fractional_scale_manager_v1` (the compositor may not offer it).
+    fractional_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     dialogs: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     /// xdg_toplevel_tag_v1: every shown toplevel is tagged
     /// `xwlbridge:<display>:<xid>` (`winsync::tag`), the name the desktop
@@ -1562,6 +1668,9 @@ struct State {
     dropped_button_logged: bool,
     /// The window sync with the desktop (per-window mode only).
     sync: Option<Sync>,
+    /// The bridge's XSETTINGS manager and Xft.dpi (M3); None when another
+    /// manager owns `_XSETTINGS_S0` or it could not be installed.
+    settings: Option<settings::Settings>,
     /// This thread announced itself as the engine's window manager (EWMH).
     wm_announced: bool,
     /// `_NET_WORKAREA` and `_GTK_WORKAREAS_D0` are on the root (they
@@ -1608,6 +1717,7 @@ fn run(
     screen_mode: bool,
     decorations: bool,
     windowbuttons: Option<String>,
+    hidpi: bool,
 ) -> Result<(), AnyError> {
     let (x, screen) = super::connect(display, auth)?;
     CONNECTION_BASE.store(x.setup().resource_id_base, Ordering::Relaxed);
@@ -1659,6 +1769,8 @@ fn run(
         net_wm_moveresize: atom(b"_NET_WM_MOVERESIZE")?,
         net_supported: atom(b"_NET_SUPPORTED")?,
         net_supporting_wm_check: atom(b"_NET_SUPPORTING_WM_CHECK")?,
+        net_wm_cm_s0: atom(b"_NET_WM_CM_S0")?,
+        gtk_frame_extents: atom(b"_GTK_FRAME_EXTENTS")?,
         net_active_window: atom(b"_NET_ACTIVE_WINDOW")?,
         net_wm_state_above: atom(b"_NET_WM_STATE_ABOVE")?,
         net_wm_state_stays_on_top: atom(b"_NET_WM_STATE_STAYS_ON_TOP")?,
@@ -1670,7 +1782,6 @@ fn run(
         emulated_mode: atom(b"_XWLBRIDGE_EMULATED_MODE")?,
         net_frame_extents: atom(b"_NET_FRAME_EXTENTS")?,
         net_request_frame_extents: atom(b"_NET_REQUEST_FRAME_EXTENTS")?,
-        gtk_frame_extents: atom(b"_GTK_FRAME_EXTENTS")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -1683,6 +1794,7 @@ fn run(
         x,
         root,
         screen: (sw, sh),
+        hidpi,
         devs,
         atoms,
         resource_mask,
@@ -1701,6 +1813,7 @@ fn run(
         presentation: None,
         present_stats: std::env::var_os("XWLBRIDGE_PRESENT_STATS").is_some_and(|v| !v.is_empty()),
         present_latency: HashMap::new(),
+        fractional_manager: None,
         dialogs: None,
         tags: None,
         display,
@@ -1763,6 +1876,7 @@ fn run(
         tool_presses: Vec::new(),
         dropped_button_logged: false,
         sync: None,
+        settings: None,
         wm_announced: false,
         work_area: false,
         input_time: 0,
@@ -1790,7 +1904,7 @@ fn run(
         );
     }
     crate::log!(
-        "-showwindows: showing the engine display's {} on the desktop (reverse master {:?}; pointer lock {}, viewporter {}, toplevel tags {})",
+        "-showwindows: showing the engine display's {} on the desktop (reverse master {:?}; pointer lock {}, viewporter {}, fractional scale {}, toplevel tags {})",
         if screen_mode {
             "screen as one window"
         } else {
@@ -1807,8 +1921,24 @@ fn run(
         } else {
             "no"
         },
+        if state.fractional_manager.is_some() {
+            "yes"
+        } else {
+            "no"
+        },
         if state.tags.is_some() { "yes" } else { "no" },
     );
+    match settings::Settings::install(&state.x, state.root) {
+        Ok(s) => {
+            if s.scale != 0 {
+                crate::log!(
+                    "-showwindows: HiDPI settings published on the engine display (XSETTINGS + Xft.dpi)"
+                );
+            }
+            state.settings = Some(s);
+        }
+        Err(e) => crate::warning!("-showwindows: can't publish HiDPI settings: {e}"),
+    }
     if let Some(c) = state.compositor.as_ref() {
         let surface = c.create_surface(&qh, 0);
         state.cursor = Some(CursorImage {
@@ -1870,6 +2000,10 @@ fn run(
             );
         }
         state.sync = start_sync(display, state.tags.is_some());
+        let scale = state.scale();
+        if let Some(p) = state.decor.as_mut() {
+            p.set_scale(f64::from(scale));
+        }
     }
     // what is already up
     let tree = state.x.query_tree(root)?.reply()?;
@@ -1890,6 +2024,7 @@ fn run(
         if state.sync.is_some() {
             state.sync_poll();
         }
+        state.update_settings();
         queue.dispatch_pending(&mut state)?;
         state.after_dispatch(&qh);
         // anything the dispatch did may have queued X events (replies we
@@ -2028,14 +2163,26 @@ impl State {
         // a new sub-surface is already at the top of the stack (above the
         // parent); `place_above(parent)` is not portable across mutter
         // versions and put it under the parent on GNOME 50.1
-        // the header is outside the xdg window geometry (content only); say
+        // The header is outside the xdg window geometry (content only); say
         // explicitly that the whole header band takes input, or the
-        // compositor clips it to the window geometry
-        let (sw, _) = frame.surface_size(content);
+        // compositor clips it to the window geometry.  wl_region is in the
+        // parent surface's logical coordinates (frame is logical, the X
+        // surface is content + frame / S).
+        let (sw, _) = surface_x(frame, content, self.scale());
+        let lw = self.logical_size(i32::from(sw), 1).0;
         let region = compositor.create_region(qh, ());
-        region.add(0, 0, i32::from(sw), frame.header.max(0));
+        region.add(0, 0, lw, frame.header.max(0));
         surface.set_input_region(Some(&region));
         region.destroy();
+        // the header is painted into an X-pixel buffer at buffer scale S
+        // (sharp at 2x); its viewport destination is the logical header size
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, qh, ()));
+        if let Some(v) = viewport.as_ref() {
+            v.set_destination(lw, frame.header.max(1));
+        }
         // The drop shadow is its own surface *below* the parent: it extends
         // SHADOW_PAD px outside the window geometry, which is visual only
         // (empty input region), exactly where GNOME clips pointer input.  It
@@ -2051,6 +2198,7 @@ impl State {
         Some(Chrome {
             surface,
             subsurface,
+            viewport,
             shadow_surface,
             shadow_subsurface,
             state: decor::HeaderState {
@@ -2078,7 +2226,8 @@ impl State {
             return;
         };
         if s.frame.is_framed() && !s.maximized && !s.fullscreen {
-            let extents = [0, 0, s.frame.header.max(0) as u32, 0];
+            // EWMH frame extents are X pixels (the client's coordinate space)
+            let extents = [0, 0, self.frame_x(s.frame).header as u32, 0];
             let _ = self.x.change_property32(
                 PropMode::REPLACE,
                 w,
@@ -2099,7 +2248,7 @@ impl State {
         }
         let decision = self.frame_decision(w, self.takes_no_input(w));
         if decision.framed {
-            let h = decor::FrameGeom::ADWAITA.header.max(0) as u32;
+            let h = self.frame_x(decor::FrameGeom::ADWAITA).header as u32;
             let _ = self.x.change_property32(
                 PropMode::REPLACE,
                 w,
@@ -2132,15 +2281,18 @@ impl State {
             self.paint_shadow(w);
             return;
         }
+        let scale = self.scale();
         let Some(s) = self.windows.get_mut(&w) else {
             return;
         };
         let Some(c) = s.chrome.as_mut() else {
             return;
         };
-        let (ox, _) = c.frame.content_origin();
+        // HeaderBuffers are X pixels, painted at buffer scale S; the
+        // content origin and header are converted from logical once here.
+        let (ox, _) = frame_x(c.frame, scale).content_origin();
         let width = (i32::from(s.width) + 2 * ox).max(1) as u16;
-        let height = c.frame.header.max(1) as u16;
+        let height = frame_x(c.frame, scale).header.max(1) as u16;
         let realloc = c
             .buffers
             .as_ref()
@@ -2169,6 +2321,11 @@ impl State {
         // SAFETY: `map` is the mmap of `len` bytes made by `header_buffers`.
         let pixels = unsafe { std::slice::from_raw_parts_mut(b.map, b.len) };
         painter.paint(pixels, width, height, b.stride, &c.state);
+        if let Some(v) = c.viewport.as_ref() {
+            // destination: the logical header size (width / S, header px)
+            let lw = logical_x(i32::from(width), 1, scale).0;
+            v.set_destination(lw, c.frame.header.max(1));
+        }
         c.surface.attach(Some(&b.buffers[i]), 0, 0);
         c.surface
             .damage_buffer(0, 0, i32::from(width), i32::from(height));
@@ -2196,14 +2353,22 @@ impl State {
         let shm = self.shm.clone().expect("checked at start");
         let qh = self.qh.clone();
         let radius = self.decor_metrics().radius;
+        let scale = self.scale();
         let Some(s) = self.windows.get_mut(&w) else {
             return;
         };
         if s.maximized || s.fullscreen || s.tiled || !s.frame.is_framed() {
             return;
         }
-        let (sw, sh) = s.frame.surface_size((s.width, s.height));
-        let (width, height) = decor::shadow_size((sw, sh));
+        // The shadow surface's buffer is logical: convert the X surface box
+        // once, then add the logical SHADOW_PAD (the subsurface sits at
+        // -SHADOW_PAD logical).
+        let (sw, sh) = surface_x(s.frame, (s.width, s.height), scale);
+        let (lw, lh) = logical_x(i32::from(sw), i32::from(sh), scale);
+        let (width, height) = decor::shadow_size((
+            u16::try_from(lw).unwrap_or(u16::MAX),
+            u16::try_from(lh).unwrap_or(u16::MAX),
+        ));
         let Some(c) = s.chrome.as_mut() else {
             return;
         };
@@ -2250,6 +2415,7 @@ impl State {
     /// Shows or hides the header with the compositor's maximised/fullscreen
     /// state (the design removes it there; the geometry stays content).
     fn update_header(&mut self, w: Window) {
+        let scale = self.scale();
         let Some(s) = self.windows.get_mut(&w) else {
             return;
         };
@@ -2293,10 +2459,12 @@ impl State {
         // header is drawn, content (origin 0,0) while maximised/fullscreen,
         // because `s.frame` is NONE there and the buffer is content-sized.
         let geom = if want && s.frame.is_framed() {
-            let (sw, sh) = s.frame.surface_size((s.width, s.height));
-            (0, 0, i32::from(sw), i32::from(sh))
+            let (sw, sh) = surface_x(s.frame, (s.width, s.height), scale);
+            let (lw, lh) = logical_x(i32::from(sw), i32::from(sh), scale);
+            (0, 0, lw, lh)
         } else {
-            (0, 0, i32::from(s.width), i32::from(s.height))
+            let (lw, lh) = logical_x(i32::from(s.width), i32::from(s.height), scale);
+            (0, 0, lw, lh)
         };
         if s.window_geometry != geom {
             s.xdg_surface
@@ -2855,7 +3023,7 @@ impl State {
             decor::FrameGeom::NONE
         };
         if frame.is_framed() {
-            let (sx, sy) = frame.surface_size((width, height));
+            let (sx, sy) = self.surface_x(frame, (width, height));
             if u32::from(sx) > u32::from(MAX_SIDE) || u32::from(sy) > u32::from(MAX_SIDE) {
                 crate::warning!(
                     "-showwindows: {w:#x} with a frame would be {sx}x{sy}, too big to show: not framed"
@@ -2868,6 +3036,19 @@ impl State {
         let surface = compositor.create_surface(qh, w);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, w);
         let toplevel = xdg_surface.get_toplevel(qh, w);
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, qh, ()));
+        let fractional = self
+            .fractional_manager
+            .as_ref()
+            .map(|m| m.get_fractional_scale(&surface, qh, ()));
+        if let Some(v) = viewport.as_ref() {
+            let (sx, sy) = self.surface_x(frame, (width, height));
+            let (lw, lh) = self.logical_size(i32::from(sx), i32::from(sy));
+            v.set_destination(lw.max(1), lh.max(1));
+        }
         self.tag(&toplevel, w);
         let title = self.title(w);
         toplevel.set_title(title.clone());
@@ -2919,10 +3100,12 @@ impl State {
             && let Some(sync) = self.sync.as_ref()
         {
             let (ox, oy) = frame.content_origin();
+            let space = sync.geo.space();
+            let desk = space.to_desk(Rect::new(ix, iy, 1, 1));
             sync.client.send(Request::SetInitialPosition {
                 xid: w,
-                x: ix - ox,
-                y: iy - oy,
+                x: desk.x - ox,
+                y: desk.y - oy,
             });
             crate::log!(
                 "-showwindows: {w:#x} asks to open at {ix},{iy}: the desktop places it there"
@@ -2934,10 +3117,14 @@ impl State {
             // there too
             if let Some(sync) = self.sync.as_ref() {
                 let (ox, oy) = frame.content_origin();
+                let desk = sync
+                    .geo
+                    .space()
+                    .to_desk(Rect::new(i32::from(x), i32::from(y), 1, 1));
                 sync.client.send(Request::SetInitialPosition {
                     xid: w,
-                    x: i32::from(x) - ox,
-                    y: i32::from(y) - oy,
+                    x: desk.x - ox,
+                    y: desk.y - oy,
                 });
             }
         }
@@ -2951,9 +3138,11 @@ impl State {
             // the window geometry is the whole surface while framed: mutter
             // clips pointer input (the header and the resize margins) to it,
             // so the chrome must be inside. winsync still works in content
-            // coordinates; the conversion is at its boundary.
-            let (sw, sh) = frame.surface_size((width, height));
-            xdg_surface.set_window_geometry(0, 0, i32::from(sw), i32::from(sh));
+            // coordinates; the conversion is at its boundary.  The protocol
+            // geometry is logical: the X surface / S.
+            let (sw, sh) = self.surface_x(frame, (width, height));
+            let (lw, lh) = self.logical_size(i32::from(sw), i32::from(sh));
+            xdg_surface.set_window_geometry(0, 0, lw, lh);
         }
         surface.commit();
         if chrome.is_none() {
@@ -2976,8 +3165,11 @@ impl State {
             },
             if frame.is_framed() {
                 format!(
-                    ", framed (header {} px, margin {} px)",
-                    frame.header, frame.margin
+                    ", framed (header {} logical px, margin {} logical px; {}x{} X)",
+                    frame.header,
+                    frame.margin,
+                    self.frame_x(frame).header,
+                    self.frame_x(frame).margin
                 )
             } else if self.decorations && !decision.framed {
                 format!(", not framed ({})", decision.why.as_str())
@@ -2999,6 +3191,8 @@ impl State {
             pixmap: None,
             surface,
             xdg_surface,
+            viewport,
+            fractional,
             role: Role::Toplevel(toplevel),
             configured: false,
             buffers: None,
@@ -3021,10 +3215,12 @@ impl State {
             decision,
             chrome,
             window_geometry: if frame.is_framed() {
-                let (sw, sh) = frame.surface_size((width, height));
-                (0, 0, i32::from(sw), i32::from(sh))
+                let (sw, sh) = self.surface_x(frame, (width, height));
+                let (lw, lh) = self.logical_size(i32::from(sw), i32::from(sh));
+                (0, 0, lw, lh)
             } else {
-                (0, 0, i32::from(width), i32::from(height))
+                let (lw, lh) = self.logical_size(i32::from(width), i32::from(height));
+                (0, 0, lw, lh)
             },
         };
         if let Some(sync) = self.sync.as_mut() {
@@ -3245,19 +3441,33 @@ impl State {
         let (x, y, width, height, depth, dmg, border) = self.watch(w)?;
         let origin = self.shown_origin(parent)?;
         let p = self.windows.get(&parent).expect("found above");
-        let (dx, dy) = (i32::from(x) - origin.0, i32::from(y) - origin.1);
-        let ((ax, ay), (ox, oy)) = popup_anchor(dx, dy, p.width, p.height);
+        let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
+        let (dx, dy) = (
+            (i32::from(x) - origin.0) / scale,
+            (i32::from(y) - origin.1) / scale,
+        );
+        let ((ax, ay), (ox, oy)) = popup_anchor(
+            dx,
+            dy,
+            p.width.div_euclid(scale as u16),
+            p.height.div_euclid(scale as u16),
+        );
         // xdg_positioner's anchor rectangle is relative to the parent's
-        // *window geometry* (xdg-shell set_anchor_rect).  A normally framed
-        // window's geometry is the whole surface, so the content origin is
-        // added; a maximised/fullscreen window's geometry is the content at
-        // `(fx,fy)` in the surface, so the geometry origin is subtracted
+        // *logical window geometry* (xdg-shell set_anchor_rect).  A normally
+        // framed window's geometry is the whole surface, so the (logical)
+        // content origin is added; a maximised/fullscreen window's geometry
+        // is the content at `(fx,fy)`, so the geometry origin is subtracted
         // again (measured: LibreOffice, maximised, menus were 6 px off).
+        // Both frame and window_geometry are logical; only the X popup
+        // coordinates above needed Space.
         let (fx, fy) = p.frame.content_origin();
         let (gx, gy) = (p.window_geometry.0, p.window_geometry.1);
         let wm_base = self.wm_base.as_ref().expect("checked at start");
         let positioner = wm_base.create_positioner(qh, ());
-        positioner.set_size(i32::from(width), i32::from(height));
+        positioner.set_size(
+            i32::from(width).div_euclid(scale).max(1),
+            i32::from(height).div_euclid(scale).max(1),
+        );
         positioner.set_anchor_rect(ax + fx - gx, ay + fy - gy, 1, 1);
         positioner.set_offset(ox, oy);
         positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
@@ -3281,6 +3491,18 @@ impl State {
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, w);
         let popup = xdg_surface.get_popup(Some(&p.xdg_surface), &positioner, qh, w);
         positioner.destroy();
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .map(|v| v.get_viewport(&surface, qh, ()));
+        let fractional = self
+            .fractional_manager
+            .as_ref()
+            .map(|m| m.get_fractional_scale(&surface, qh, ()));
+        if let Some(v) = viewport.as_ref() {
+            let (lw, lh) = self.logical_size(i32::from(width), i32::from(height));
+            v.set_destination(lw.max(1), lh.max(1));
+        }
         if kind == "tooltip" || kind == "notification" {
             let region = compositor.create_region(qh, ());
             surface.set_input_region(Some(&region));
@@ -3308,6 +3530,8 @@ impl State {
                 pixmap: None,
                 surface,
                 xdg_surface,
+                viewport,
+                fractional,
                 role: Role::Popup { popup, parent },
                 configured: false,
                 buffers: None,
@@ -3561,7 +3785,10 @@ impl State {
                 if toplevel {
                     self.on_screen.push(e.window);
                 }
-                let desk = self.sync.as_ref().and_then(|sync| sync.geo.desk(e.window));
+                let desk = self
+                    .sync
+                    .as_ref()
+                    .and_then(|sync| sync.geo.desk(e.window).map(|d| sync.geo.space().to_x(d)));
                 let mut restacked = false;
                 if let Some(s) = self.windows.get_mut(&e.window) {
                     // a restack (or nothing): the same geometry, or a new
@@ -3920,13 +4147,18 @@ impl State {
         {
             let p = self.windows.get(&parent);
             let frame = p.map_or(decor::FrameGeom::NONE, |s| s.frame);
-            // xdg_popup's configure is relative to the parent's window
-            // geometry, the X window to its content: subtract the content
-            // origin's offset *from the geometry origin* (zero for a normally
-            // framed window, `(fx,fy)` while maximised/fullscreen).
+            // xdg_popup.configure is relative to the parent's *logical*
+            // window geometry, the X window to its content: convert the
+            // configure point to X once through Space, then subtract the
+            // content origin's offset *from the geometry origin* (zero for a
+            // normally framed window, `(fx,fy)` while maximised/fullscreen).
+            let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
             let (fx, fy) = frame.content_origin();
-            let (ox, oy) = (fx - s.window_geometry.0, fy - s.window_geometry.1);
-            let (nx, ny) = popup_position(origin, (px - ox, py - oy));
+            let (ox, oy) = (
+                (fx - s.window_geometry.0) * scale,
+                (fy - s.window_geometry.1) * scale,
+            );
+            let (nx, ny) = popup_position(origin, (px * scale - ox, py * scale - oy));
             if (nx, ny) != (i32::from(s.x), i32::from(s.y)) {
                 crate::vlog!(
                     "-showwindows: popup {w:#x} placed at {nx},{ny}, not {},{}",
@@ -3941,6 +4173,22 @@ impl State {
                 }
             }
         }
+    }
+
+    /// The frame's header/margin in X pixels (see [`frame_x`]).
+    fn frame_x(&self, frame: decor::FrameGeom) -> decor::FrameGeom {
+        frame_x(frame, self.scale())
+    }
+
+    /// The framed surface box in X pixels (see [`surface_x`]).
+    fn surface_x(&self, frame: decor::FrameGeom, content: (u16, u16)) -> (u16, u16) {
+        surface_x(frame, content, self.scale())
+    }
+
+    /// The logical (desktop) size of an X-pixel surface under S: what the
+    /// viewport destination is set to.
+    fn logical_size(&self, w: i32, h: i32) -> (i32, i32) {
+        logical_x(w, h, self.scale())
     }
 
     /// Copies the window's current contents into a free buffer and commits
@@ -3965,7 +4213,7 @@ impl State {
             return Ok(());
         }
         let realloc = self.windows.get(&w).is_some_and(|s| {
-            let (sw, sh) = s.frame.surface_size((s.width, s.height));
+            let (sw, sh) = self.surface_x(s.frame, (s.width, s.height));
             s.configured
                 && s.dirty
                 && s.buffers
@@ -3974,6 +4222,7 @@ impl State {
         });
         if realloc {
             // (re)allocate for the current surface size (content + frame)
+            let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
             let s = self.windows.get_mut(&w).expect("checked");
             if let Some(b) = s.buffers.take() {
                 let _ = shm::detach(&self.x, b.seg);
@@ -3983,7 +4232,7 @@ impl State {
                 b.pool.destroy();
             }
             let (cw, ch) = (s.width, s.height);
-            let (width, height) = s.frame.surface_size((cw, ch));
+            let (width, height) = surface_x(s.frame, (cw, ch), scale as u32);
             let frame = frame_bytes(width, height).ok_or("too big")?;
             let fd = memfd(frame * 2)?;
             // SAFETY: the fd is `frame * 2` bytes; mapped shared for the
@@ -4036,6 +4285,14 @@ impl State {
                 map: map.cast::<u8>(),
                 len: frame * 2,
             });
+            if s.viewport.is_some() {
+                let (lw, lh) = (
+                    (i32::from(width) + scale / 2) / scale,
+                    (i32::from(height) + scale / 2) / scale,
+                );
+                s.xdg_surface
+                    .set_window_geometry(0, 0, lw.max(1), lh.max(1));
+            }
         }
         let Some(s) = self.windows.get(&w) else {
             return Ok(());
@@ -4063,6 +4320,7 @@ impl State {
                 }
             }
         };
+        let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
         let s = self.windows.get_mut(&w).expect("checked");
         let b = s.buffers.as_mut().expect("checked");
         s.dirty = false;
@@ -4095,6 +4353,9 @@ impl State {
         let (bw, bh) = (b.width, b.height);
         // The game's frame goes either through the CPU composition (the
         // measured fallback) or to the compositor on a scaled subsurface.
+        // HiDPI: the emulated mode and its letterbox are X pixels; the
+        // Wayland destinations are logical (X / S), converted once here.
+        let logical = |v: i32| ((v + scale / 2) / scale).max(1);
         let mut commit_child = false;
         let mut commit_parent = false;
         if let Some(p) = s.present.as_mut() {
@@ -4102,6 +4363,10 @@ impl State {
             let (dw0, dh0) = letterbox((sw, sh), p.monitor);
             p.dest = (dw0, dh0);
             p.offset = ((p.monitor.0 - dw0) / 2, (p.monitor.1 - dh0) / 2);
+            if let Some(v) = s.viewport.as_ref() {
+                // the parent is the whole monitor, in X pixels
+                v.set_destination(logical(p.monitor.0), logical(p.monitor.1));
+            }
             if !p.painted {
                 p.painted = true;
                 crate::log!(
@@ -4182,10 +4447,12 @@ impl State {
                     ..
                 } => {
                     if let Some(v) = viewport {
+                        // the child's buffer is the game in X pixels; its
+                        // destination and position are surface-local logical
                         v.set_source(0.0, 0.0, f64::from(b.width), f64::from(b.height));
-                        v.set_destination(p.dest.0, p.dest.1);
+                        v.set_destination(logical(p.dest.0), logical(p.dest.1));
                     }
-                    subsurface.set_position(p.offset.0, p.offset.1);
+                    subsurface.set_position(p.offset.0 / scale, p.offset.1 / scale);
                     child.attach(Some(&b.buffers[i]), 0, 0);
                     child.damage_buffer(0, 0, i32::from(b.width), i32::from(b.height));
                     commit_child = true;
@@ -4193,7 +4460,12 @@ impl State {
                 }
             }
         } else if s.frame.is_framed() {
-            let radius = self.decor.as_ref().map_or(12.0, |p| p.metrics().radius);
+            // `FrameGeom` is logical (decor.rs): its margin and radius become
+            // X pixels once here, for the X-sized buffer.
+            let (mx, mh) = (s.frame.margin.max(0), s.frame.header.max(0));
+            let (mx, mh) = (mx * scale, mh * scale);
+            let radius =
+                self.decor.as_ref().map_or(12.0, |p| p.metrics().radius) * f64::from(scale);
             // SAFETY: `map` is the mmap of `len` bytes made above.
             let pixels = unsafe { std::slice::from_raw_parts_mut(b.map, b.len) };
             decor::arrange_content(
@@ -4201,27 +4473,39 @@ impl State {
                 base,
                 b.width,
                 (cw, ch),
-                s.frame.margin.max(0) as u16,
+                mx as u16,
                 s.depth != 32,
                 radius,
             );
             // normal: the whole surface (chrome takes input there);
-            // maximised/fullscreen: the content, because the header is gone
-            let (sw, sh) = s.frame.surface_size((cw, ch));
+            // maximised/fullscreen: the content, because the header is gone.
+            // The protocol geometry is logical (X / S).
+            let (sw, sh) = (i32::from(cw) + 2 * mx, i32::from(ch) + mh + mx);
             let geom = if s.maximized || s.fullscreen {
-                (ox, oy, i32::from(cw), i32::from(ch))
+                (
+                    s.frame.margin,
+                    s.frame.header,
+                    logical(i32::from(cw)),
+                    logical(i32::from(ch)),
+                )
             } else {
-                (0, 0, i32::from(sw), i32::from(sh))
+                (0, 0, logical(sw), logical(sh))
             };
             if s.window_geometry != geom {
                 s.xdg_surface
                     .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
                 s.window_geometry = geom;
             }
+            if let Some(v) = s.viewport.as_ref() {
+                v.set_destination(logical(sw), logical(sh));
+            }
             s.surface.attach(Some(&b.buffers[i]), 0, 0);
             s.surface
                 .damage_buffer(ox, oy, i32::from(cw), i32::from(ch));
         } else {
+            if let Some(v) = s.viewport.as_ref() {
+                v.set_destination(logical(i32::from(b.width)), logical(i32::from(b.height)));
+            }
             s.surface.attach(Some(&b.buffers[i]), 0, 0);
             s.surface
                 .damage_buffer(0, 0, i32::from(b.width), i32::from(b.height));
@@ -4252,7 +4536,15 @@ impl State {
         s.frames += 1;
         let framed = s.frame.is_framed();
         if s.frames == 1 {
-            crate::log!("-showwindows: first frame of {w:#x} on the desktop");
+            let (lw, lh) = (
+                (i32::from(b.width) + scale / 2) / scale,
+                (i32::from(b.height) + scale / 2) / scale,
+            );
+            crate::log!(
+                "-showwindows: first frame of {w:#x} on the desktop (buffer {}x{} X pixels, viewport destination {lw}x{lh} logical, S = {scale})",
+                b.width,
+                b.height
+            );
             if s.iconic
                 && let Role::Toplevel(t) = &s.role
             {
@@ -4381,6 +4673,10 @@ impl State {
         if mw <= 0 || mh <= 0 {
             return;
         }
+        // the emulated mode and the monitor are X pixels; wl_output's
+        // positions and all Wayland destinations are logical (X / S)
+        let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
+        let (lw, lh) = logical_x(mw, mh, scale as u32);
         let monitor = (mw, mh);
         let (sw, sh) = self
             .windows
@@ -4420,7 +4716,7 @@ impl State {
             Role::Toplevel(t) => Some(t.clone()),
             _ => None,
         };
-        let output = self.output_at(mx, my).cloned();
+        let output = self.output_at(mx / scale, my / scale).cloned();
         // On a real gnome-shell with the window-sync extension (the VM), a
         // fullscreen game keeps the content size it had when it went
         // fullscreen: measured on two heads, the 1024x768 game sat at its old
@@ -4450,17 +4746,22 @@ impl State {
             } else {
                 subsurface.set_desync();
             }
-            subsurface.set_position(offset.0, offset.1);
+            subsurface.set_position(offset.0 / scale, offset.1 / scale);
             let viewport = self
                 .viewporter
                 .as_ref()
                 .map(|v| v.get_viewport(&child, qh, ()));
             if let Some(v) = &viewport {
+                let (ldw, ldh) = logical_x(dw, dh, scale as u32);
                 v.set_source(0.0, 0.0, f64::from(sw), f64::from(sh));
-                v.set_destination(dw, dh);
+                v.set_destination(ldw, ldh);
             }
             // the parent is the monitor: one black frame, then the child
-            // carries every game frame
+            // carries every game frame; the parent's viewport destination is
+            // the logical monitor size.
+            if let Some(v) = s.viewport.as_ref() {
+                v.set_destination(lw, lh);
+            }
             parent.attach(Some(&buffers[0]), 0, 0);
             parent.damage_buffer(0, 0, mw, mh);
             parent.commit();
@@ -4475,6 +4776,9 @@ impl State {
                 sync,
             }
         } else {
+            if let Some(v) = s.viewport.as_ref() {
+                v.set_destination(lw, lh);
+            }
             parent.attach(Some(&buffers[0]), 0, 0);
             parent.damage_buffer(0, 0, mw, mh);
             parent.commit();
@@ -4510,6 +4814,14 @@ impl State {
             }
         );
         if let Some(s) = self.windows.get_mut(&w) {
+            // the fullscreen parent's window geometry is the logical monitor;
+            // the viewport destination above carries the X-pixel buffer.
+            let geom = (0, 0, lw, lh);
+            if s.window_geometry != geom {
+                s.xdg_surface
+                    .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
+                s.window_geometry = geom;
+            }
             s.present = Some(Present {
                 monitor,
                 dest: (dw, dh),
@@ -4607,17 +4919,29 @@ impl State {
             return Some((sx / scale, sy / scale));
         }
         let s = self.windows.get(&w)?;
+        let scale = f64::from(self.scale());
         // an emulated mode: pointer coordinates are in the scaled (viewport
-        // destination) surface, the game's window is the source buffer
+        // destination) surface, the game's window is the source buffer in X
+        // pixels.  The letterbox's position and size are X pixels too, so
+        // the destination is converted to X once here; the result is the
+        // game's content position in logical pixels (root_position scales it
+        // back to X).
         if let Some(p) = s.present.as_ref().filter(|p| p.dest.0 > 0 && p.dest.1 > 0) {
             // the presentation is the whole monitor: the game's window origin
             // (where the desktop may have put it) is not part of this mapping
             return Some((
-                (sx - f64::from(p.offset.0)) * f64::from(s.width) / f64::from(p.dest.0),
-                (sy - f64::from(p.offset.1)) * f64::from(s.height) / f64::from(p.dest.1),
+                (sx - f64::from(p.offset.0) / scale) * f64::from(s.width) / f64::from(p.dest.0),
+                (sy - f64::from(p.offset.1) / scale) * f64::from(s.height) / f64::from(p.dest.1),
             ));
         }
-        Some((f64::from(s.x) + sx, f64::from(s.y) + sy))
+        // with a viewport the buffer is in X pixels and its destination in
+        // logical ones, so wl_pointer's surface-local position is logical;
+        // without one the surface is its buffer (X pixels)
+        if s.viewport.is_some() {
+            Some((f64::from(s.x) / scale + sx, f64::from(s.y) / scale + sy))
+        } else {
+            Some(((f64::from(s.x) + sx) / scale, (f64::from(s.y) + sy) / scale))
+        }
     }
 
     /// Moves the reverse pointer to surface-local `(sx, sy)` of `w` (an event
@@ -4636,7 +4960,7 @@ impl State {
         let Some(pos) = self.to_desk(w, sx, sy) else {
             return;
         };
-        let (x, y) = selfdrag::root_position(pos, self.screen);
+        let (x, y) = selfdrag::root_position(pos, self.screen, f64::from(self.scale()));
         // mouse-look: a client that hid the cursor and moved the pointer
         // itself (a warp to the centre, typically) wants relative motion
         if self.lock.is_none()
@@ -4685,7 +5009,7 @@ impl State {
             return;
         };
         self.track.update(pos, f.time);
-        let (x, y) = selfdrag::root_position(pos, self.screen);
+        let (x, y) = selfdrag::root_position(pos, self.screen, f64::from(self.scale()));
         if self.last_pos == Some((x, y)) {
             return;
         }
@@ -4881,11 +5205,32 @@ impl State {
             AtomEnum::WINDOW,
             &[check],
         )?;
+        // We composite every toplevel (XComposite manual redirection in
+        // xvfb::mod), so own the compositing-manager selection like mutter's
+        // Xwayland does. GTK then uses an RGBA visual and its CSD shadows;
+        // with _GTK_FRAME_EXTENTS advertised it keeps those shadow margins,
+        // so an X window is the same size as on Xwayland.
+        let current = self.x.get_selection_owner(a.net_wm_cm_s0)?.reply()?.owner;
+        if current == x11rb::NONE {
+            self.x
+                .set_selection_owner(check, a.net_wm_cm_s0, x11rb::CURRENT_TIME)?;
+            self.x.sync()?;
+            let owner = self.x.get_selection_owner(a.net_wm_cm_s0)?.reply()?.owner;
+            if owner == check {
+                crate::log!(
+                    "-showwindows: announced the engine display's compositing manager (_NET_WM_CM_S0); GTK CSD shadows and RGBA visuals are on"
+                );
+            }
+        } else {
+            crate::log!(
+                "-showwindows: a compositing manager already runs on the engine display (0x{current:x}); not taking _NET_WM_CM_S0"
+            );
+        }
         self.wm_announced = true;
         crate::log!(
-            "-showwindows: announced _NET_WM_MOVERESIZE, _NET_WM_STATE (maximise, fullscreen){} to clients",
+            "-showwindows: announced _NET_WM_MOVERESIZE, _NET_WM_STATE (maximise, fullscreen), _GTK_FRAME_EXTENTS{} to clients",
             if self.decorations {
-                " and _NET_FRAME_EXTENTS (decorations)"
+                " and _NET_FRAME_EXTENTS/_NET_REQUEST_FRAME_EXTENTS (decorations)"
             } else {
                 ""
             }
@@ -4900,6 +5245,7 @@ impl State {
         let mut v = vec![
             a.net_supported,
             a.net_supporting_wm_check,
+            a.gtk_frame_extents,
             a.net_wm_name,
             a.net_wm_moveresize,
             a.net_wm_state,
@@ -4918,7 +5264,9 @@ impl State {
                 a.net_wm_state_demands_attention,
             ]);
             if self.work_area {
-                v.extend([a.net_workarea, a.gtk_workareas]);
+                // p2/int publishes the per-monitor D0 variant; keep the old
+                // name advertised too (both are work-area atoms).
+                v.extend([a.net_workarea, a.gtk_workareas, a.gtk_workareas_d0]);
             }
         }
         v
@@ -4956,15 +5304,29 @@ impl State {
     fn apply_size_hints(&self, w: Window, t: &xdg_toplevel::XdgToplevel, f: decor::FrameGeom) {
         let v = self.normal_hints(w);
         let ((minw, minh), (maxw, maxh)) = size_limits(&v);
-        // the toplevel's size limits are window-geometry sizes: add the frame
-        let add = |v: i32, d: i32| {
+        // the toplevel's size limits are window-geometry sizes: the X
+        // client's hint plus the frame.  FrameGeom is logical, so convert it
+        // to X once, add it there, then convert the sum to the compositor's
+        // logical pixels once (Space).
+        let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
+        let round = |v: i32| {
             if v > 0 {
-                (v + d).min(i32::from(MAX_SIDE))
+                ((v + scale / 2) / scale).max(1)
             } else {
                 0
             }
         };
-        let (dminw, dminh) = (2 * f.margin.max(0), f.header.max(0) + f.margin.max(0));
+        let add = |v: i32, d: i32| {
+            if v > 0 {
+                round(v.saturating_add(d).min(i32::from(MAX_SIDE)))
+            } else {
+                0
+            }
+        };
+        let (dminw, dminh) = (
+            2 * f.margin.max(0) * scale,
+            (f.header.max(0) + f.margin.max(0)) * scale,
+        );
         t.set_min_size(add(minw, dminw), add(minh, dminh));
         t.set_max_size(add(maxw, dminw), add(maxh, dminh));
         if (minw, minh, maxw, maxh) != (0, 0, 0, 0) {
@@ -5163,7 +5525,12 @@ impl State {
                 let scale = self.canvas.as_ref().map_or(1.0, |c| c.scale);
                 (f64::from(x) * scale, f64::from(y) * scale)
             } else {
-                (f64::from(x - s.x), f64::from(y - s.y))
+                let scale = f64::from(self.scale());
+                if s.viewport.is_some() {
+                    (f64::from(x - s.x) / scale, f64::from(y - s.y) / scale)
+                } else {
+                    (f64::from(x - s.x), f64::from(y - s.y))
+                }
             };
             l.locked.set_cursor_position_hint(sx, sy);
             s.surface.commit();
@@ -5181,13 +5548,16 @@ impl State {
         if self.lock_ended(blank) {
             self.unlock();
         }
+        // relative motion is in the compositor's logical units; the X
+        // pointer is in X pixels
+        let scale = f64::from(self.scale());
         let Some(l) = self.lock.as_mut() else {
             return;
         };
         if !l.active {
             return;
         }
-        let (rx, ry) = (l.rest.0 + dx, l.rest.1 + dy);
+        let (rx, ry) = (l.rest.0 + dx * scale, l.rest.1 + dy * scale);
         let (ix, iy) = (rx.trunc(), ry.trunc());
         l.rest = (rx - ix, ry - iy);
         if ix == 0.0 && iy == 0.0 {
@@ -5471,6 +5841,46 @@ impl State {
 
     // ---- the window sync with the desktop (winsync) ----
 
+    /// S: X pixels = logical pixels x this, as the desktop's monitors made
+    /// it (1 without the window sync or with HiDPI off).
+    fn scale(&self) -> u32 {
+        self.sync.as_ref().map_or(1, |s| s.scale)
+    }
+
+    /// Publishes S through XSETTINGS/Xft.dpi and mirrors GNOME's live
+    /// settings (theme, fonts, cursor, ...) as they change (M3/M4).
+    fn update_settings(&mut self) {
+        let scale = self.scale();
+        // the tray's Activate/Scroll points and the extension's pointer are
+        // logical; the icon and its XTest click are X pixels
+        super::tray::set_scale(scale);
+        // the header painter draws in logical pixels into an X-pixel buffer:
+        // keep its cairo transform at S, and repaint the headers when S moves
+        let mut scale_changed = false;
+        if let Some(p) = self.decor.as_mut() {
+            let want = f64::from(scale);
+            if (p.scale() - want).abs() > 1e-6 {
+                p.set_scale(want);
+                scale_changed = true;
+            }
+        }
+        if scale_changed {
+            for sh in self.windows.values_mut() {
+                if let Some(c) = sh.chrome.as_mut() {
+                    c.drop_buffers();
+                    c.dirty = true;
+                    c.shadow_dirty = true;
+                }
+            }
+        }
+        let Some(settings) = self.settings.as_mut() else {
+            return;
+        };
+        if let Err(e) = settings.update(&self.x, scale) {
+            crate::warning!("-showwindows: can't update the desktop settings: {e}");
+        }
+    }
+
     /// The window sync is on: the extension is there and compatible, and
     /// the X screen holds the desktop's layout (`Sync::on`).
     fn synced(&self) -> bool {
@@ -5659,7 +6069,10 @@ impl State {
     /// The pointer on `w` maps from where the desktop has it
     /// (`winsync::pointer_origin`).
     fn set_origin(&mut self, w: Window) {
-        let desk = self.sync.as_ref().and_then(|s| s.geo.desk(w));
+        let desk = self
+            .sync
+            .as_ref()
+            .and_then(|s| s.geo.desk(w).map(|d| s.geo.space().to_x(d)));
         if let Some(s) = self.windows.get_mut(&w)
             && matches!(s.role, Role::Toplevel(_))
         {
@@ -5818,7 +6231,7 @@ impl State {
                 let turn = self
                     .sync
                     .as_mut()
-                    .map(|s| s.got_monitors(list, self.screen));
+                    .map(|s| s.got_monitors(list, self.screen, self.hidpi));
                 match turn {
                     Some(Turn::On) => self.sync_turn(true),
                     Some(Turn::Off) => self.sync_turn(false),
@@ -5938,6 +6351,9 @@ impl State {
                         t.elapsed().as_millis()
                     );
                 }
+                // winsync is content coordinates (logical); the frame is
+                // logical too, so the content rectangle stays logical and
+                // only the desktop position is converted through Space.
                 let (cx, cy, cw, ch) = f.content_rect(rect.x, rect.y, rect.w, rect.h);
                 crate::vlog!(
                     "-showwindows: sync changed {xid:#x} {f:?}: desk {}x{}+{}+{} -> content {}x{}+{}+{} (x {}x{}+{}+{})",
@@ -5954,7 +6370,8 @@ impl State {
                     x.x,
                     x.y
                 );
-                let rect = winsync::desktop_position(Rect::new(cx, cy, cw, ch), x);
+                let rect =
+                    winsync::desktop_position(Rect::new(cx, cy, cw, ch), x, sync.geo.space());
                 let back = sync.geo.changed(xid, rect, flags, wire, Instant::now());
                 // the user's Always on Top on the desktop is the window's
                 // keep-above (_NET_WM_STATE_ABOVE), so a retell repeats it
@@ -5986,9 +6403,12 @@ impl State {
                     let Some(x) = sync.geo.x_rect(ws.xid) else {
                         continue;
                     };
+                    // winsync is content coordinates (logical); the frame is
+                    // logical too, so only the desktop position converts.
                     let (cx, cy, cw, ch) =
                         f.content_rect(ws.rect.x, ws.rect.y, ws.rect.w, ws.rect.h);
-                    let rect = winsync::desktop_position(Rect::new(cx, cy, cw, ch), x);
+                    let rect =
+                        winsync::desktop_position(Rect::new(cx, cy, cw, ch), x, sync.geo.space());
                     let back = sync.geo.resync(ws.xid, rect, ws.flags, wire);
                     self.set_origin(ws.xid);
                     if let Some(r) = back {
@@ -6096,7 +6516,7 @@ impl State {
         let Some(monitors) = sync.monitors.as_deref().filter(|_| sync.available) else {
             return;
         };
-        let fits = winsync::layout_fits(monitors, screen);
+        let fits = winsync::layout_fits(monitors, screen, sync.scale);
         match sync.follow(fits) {
             Turn::On => self.sync_turn(true),
             Turn::Off => self.sync_turn(false),
@@ -6221,10 +6641,12 @@ impl State {
             let monitors = s.monitors.as_deref()?;
             let area = s.work_area(screen)?;
             let mut per_monitor = Vec::with_capacity(monitors.len() * 4);
+            let space = s.geo.space();
             for m in monitors {
-                let w = m.work_area;
+                let w = space.to_x(m.work_area);
                 per_monitor.extend_from_slice(&[w.x as u32, w.y as u32, w.w as u32, w.h as u32]);
             }
+            let area = space.to_x(area);
             let area = [area.x as u32, area.y as u32, area.w as u32, area.h as u32];
             Some((area, per_monitor))
         });
@@ -6598,6 +7020,8 @@ impl State {
                 pixmap: None,
                 surface,
                 xdg_surface,
+                viewport: None,
+                fractional: None,
                 role: Role::Screen { toplevel, viewport },
                 configured: false,
                 buffers: None,
@@ -7073,6 +7497,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.cursor_shape = state.pointer.as_ref().map(|p| m.get_pointer(p, qh, ()));
                     state.cursor_shape_manager = Some(m);
                 }
+                "wp_fractional_scale_manager_v1" => {
+                    state.fractional_manager = Some(registry.bind(name, 1, qh, ()))
+                }
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
                 "xdg_toplevel_tag_manager_v1" => state.tags = Some(registry.bind(name, 1, qh, ())),
                 "zwp_tablet_manager_v2" => {
@@ -7247,6 +7674,12 @@ impl Dispatch<xdg_toplevel::XdgToplevel, Window> for State {
                 height,
                 states,
             } => {
+                // surface-local (logical) pixels; X is logical x S. The
+                // compositor repeats the current logical size on every
+                // configure (including a move), so converting here is what
+                // keeps an X window from shrinking by S each time.
+                let (width, height) =
+                    winsync::Space::new(state.scale()).configure_size(width, height);
                 state.resize.push((*w, width, height));
                 if *w != state.root {
                     let (m, f, t) = toplevel_states(&states);
@@ -7873,6 +8306,8 @@ wayland_client::delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 wayland_client::delegate_noop!(State: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
 wayland_client::delegate_noop!(State: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
 wayland_client::delegate_noop!(State: ignore wp_viewport::WpViewport);
+wayland_client::delegate_noop!(State: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+wayland_client::delegate_noop!(State: ignore wp_fractional_scale_v1::WpFractionalScaleV1);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_manager_v2::ZwpTabletManagerV2);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2);
@@ -8104,11 +8539,12 @@ mod tests {
     struct Layout {
         why: Option<String>,
         on: bool,
+        scale: u32,
     }
 
     impl Layout {
         fn got(&mut self, monitors: &[winsync::MonitorInfo], screen: (u16, u16)) -> Turn {
-            let fits = winsync::layout_fits(monitors, screen);
+            let fits = winsync::layout_fits(monitors, screen, self.scale);
             self.why = fits.clone().err();
             let turn = match (fits.is_ok(), self.on) {
                 (true, false) => Turn::On,
@@ -8132,12 +8568,13 @@ mod tests {
         let mut l = Layout {
             why: None,
             on: false,
+            scale: 1,
         };
         let mut scaled = monitor(0);
         scaled.scale = 1.25;
         assert_eq!(l.got(&[monitor(0)], screen), Turn::On);
         assert_eq!(l.got(&[scaled.clone()], screen), Turn::Off);
-        assert!(l.why.as_deref().unwrap().contains("scaled 1.25"));
+        assert!(l.why.as_deref().unwrap().contains("HiDPI off"));
         assert_eq!(l.got(&[monitor(0)], screen), Turn::On);
         assert_eq!(l.why, None);
         // and the same twice in a row: nothing to do
@@ -8146,6 +8583,7 @@ mod tests {
         let mut l = Layout {
             why: None,
             on: false,
+            scale: 1,
         };
         assert_eq!(l.got(&[scaled], screen), Turn::AsIs);
         // two monitors, the second one scaled (a scale is per monitor)
@@ -8156,6 +8594,7 @@ mod tests {
         let mut l = Layout {
             why: None,
             on: true,
+            scale: 1,
         };
         assert_eq!(l.got(&two, screen), Turn::Off);
         two[1].scale = 1.0;
@@ -8165,6 +8604,7 @@ mod tests {
         let mut l = Layout {
             why: None,
             on: true,
+            scale: 1,
         };
         assert_eq!(l.got(&two, (1024, 800)), Turn::Off);
         assert_eq!(l.got(&two, screen), Turn::On);
@@ -8172,6 +8612,7 @@ mod tests {
         let mut l = Layout {
             why: None,
             on: true,
+            scale: 1,
         };
         assert_eq!(l.got(&[], screen), Turn::Off);
     }

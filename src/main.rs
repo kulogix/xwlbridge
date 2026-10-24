@@ -402,6 +402,16 @@ fn main() {
         Ordering::Relaxed,
     );
     CLIP_TRACE.store(config.cliptrace, Ordering::Relaxed);
+    if config.showwindows {
+        crate::log!(
+            "-showwindows: HiDPI scaling is {} (S = the largest monitor scale, rounded up)",
+            if config.hidpi() {
+                "on"
+            } else {
+                "off (-nohidpi / hidpi=off)"
+            }
+        );
+    }
     // Take the command out before `config` moves into the Server (which doesn't
     // need it). Without `-nowrap` a command is required.
     let command = std::mem::take(&mut config.command);

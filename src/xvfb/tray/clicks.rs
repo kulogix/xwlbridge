@@ -132,7 +132,13 @@ pub enum Origin {
 /// How a click at desktop `(gx, gy)` is made on an icon with the click at `target` inside it: the
 /// container is moved so that the click's X point is the desktop's point (design §2: the desktop shows
 /// every X window at its own position), or, where no window goes, the click goes to the desktop's point.
-pub fn origin(gx: i32, gy: i32, target: (i16, i16)) -> Origin {
+///
+/// `(gx, gy)` is the desktop's (logical) position --- a StatusNotifierItem's `Activate(x, y)`, or the
+/// extension's pointer --- and the container, the XTest click and `target` are X pixels, so the point is
+/// converted with S here (the one conversion between the two spaces).
+pub fn origin(gx: i32, gy: i32, target: (i16, i16), scale: u32) -> Origin {
+    let s = scale.max(1) as i32;
+    let (gx, gy) = (gx.saturating_mul(s), gy.saturating_mul(s));
     let (tx, ty) = (i32::from(target.0), i32::from(target.1));
     if gx >= 0 && gy >= 0 {
         Origin::Container(gx - tx, gy - ty)
@@ -205,12 +211,16 @@ mod tests {
     fn the_click_point_is_where_the_desktop_was_clicked() {
         // the click 9,4 inside the icon, at 1600,12 on the desktop: the icon's X point 9,4 is the
         // desktop's 1600,12
-        assert_eq!(origin(1600, 12, (9, 4)), Origin::Container(1591, 8));
-        assert_eq!(origin(0, 0, (0, 0)), Origin::Container(0, 0));
+        assert_eq!(origin(1600, 12, (9, 4), 1), Origin::Container(1591, 8));
+        assert_eq!(origin(0, 0, (0, 0), 1), Origin::Container(0, 0));
         // under the top bar no window goes: the click is made where it is and the app's menu is asked to
         // open there
-        assert_eq!(origin(1200, -11, (9, 4)), Origin::Asked(1200, -11));
-        assert_eq!(origin(-3, 5, (1, 1)), Origin::Asked(-3, 5));
+        assert_eq!(origin(1200, -11, (9, 4), 1), Origin::Asked(1200, -11));
+        assert_eq!(origin(-3, 5, (1, 1), 1), Origin::Asked(-3, 5));
+        // at 2x the desktop's logical point is the X point: the icon's
+        // container and the XTest click move with S too
+        assert_eq!(origin(800, 12, (9, 4), 2), Origin::Container(1591, 20));
+        assert_eq!(origin(1200, -11, (9, 4), 2), Origin::Asked(2400, -22));
     }
 
     #[test]

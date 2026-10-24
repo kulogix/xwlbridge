@@ -95,6 +95,8 @@ mod record;
 mod reverse;
 // Xvnc's RFB SetDesktopSize: one RandR output per desktop monitor (rfb.rs)
 mod rfb;
+// the HiDPI XSETTINGS manager and Xft resources (settings.rs)
+mod settings;
 // -showwindows' pointer during a held self-drag of a synced window (reverse.rs)
 mod selfdrag;
 // the -showwindows X tray (gnome and xvfb only; see tray::enabled for the setting)
@@ -213,6 +215,9 @@ struct Monitor {
     y: i16,
     width: u16,
     height: u16,
+    /// X pixels = logical x this (S): the mm sizes are the logical ones so
+    /// RandR reports 96*S dpi.
+    scale: u32,
     primary: bool,
 }
 
@@ -1145,6 +1150,7 @@ fn supervise(server: Arc<Server>, display: u32, auth: Auth) {
                     server.config.showscreen,
                     !server.config.nodecorations,
                     server.config.windowbuttons.clone(),
+                    server.config.hidpi() && !server.config.showscreen,
                 );
             }
             if restart {
@@ -2646,6 +2652,7 @@ impl Agent {
                     y: o.y,
                     width: o.width,
                     height: o.height,
+                    scale: s.x_scale,
                     // only an attached output can be the primary monitor's
                     primary: o.connected && o.mode != 0 && o.output_id == primary,
                 })
@@ -3340,8 +3347,13 @@ impl Agent {
                 y,
                 width: w,
                 height: h,
+                scale,
                 ..
             } = m;
+            let (mw, mh) = (
+                u16::try_from((u32::from(*w) + *scale / 2) / (*scale).max(1)).unwrap_or(*w),
+                u16::try_from((u32::from(*h) + *scale / 2) / (*scale).max(1)).unwrap_or(*h),
+            );
             let atom = self.conn.intern_atom(false, name)?.reply()?.atom;
             let outputs = monitor_outputs
                 .get(i)
@@ -3360,8 +3372,9 @@ impl Agent {
                     y: *y,
                     width: *w,
                     height: *h,
-                    width_in_millimeters: mm(*w),
-                    height_in_millimeters: mm(*h),
+                    // RandR mm is the logical size at 96 dpi (HiDPI: 96*S)
+                    width_in_millimeters: mm(mw),
+                    height_in_millimeters: mm(mh),
                     outputs,
                 },
             )?;
@@ -4126,6 +4139,7 @@ mod tests {
                 y: 0,
                 width: 1280,
                 height: 800,
+                scale: 1,
                 primary: id == primary,
             })
             .collect()

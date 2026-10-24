@@ -544,6 +544,10 @@ const PANGO_SCALE: c_int = 1024;
 pub struct Painter {
     metrics: Metrics,
     dark: bool,
+    /// Buffer scale: the buffer is `scale` times the logical header size
+    /// (sharp at 2x); painting is done in logical pixels through a cairo
+    /// transform.  1.0 = the 0.2.0 behaviour.
+    scale: f64,
     cairo: libloading::Library,
     pango: libloading::Library,
     gobject: libloading::Library,
@@ -569,6 +573,7 @@ pub struct Painter {
     stroke: unsafe extern "C" fn(Cairo),
     set_line_width: unsafe extern "C" fn(Cairo, f64),
     set_antialias: unsafe extern "C" fn(Cairo, c_int),
+    scale_ctx: unsafe extern "C" fn(Cairo, f64, f64),
     save: unsafe extern "C" fn(Cairo),
     restore: unsafe extern "C" fn(Cairo),
     pango_create_layout: unsafe extern "C" fn(Cairo) -> PangoLayout,
@@ -610,6 +615,7 @@ impl Painter {
             Ok(Painter {
                 metrics: Metrics::adwaita(50, dark),
                 dark,
+                scale: 1.0,
                 image_surface_create_for_data: symbol(
                     &cairo,
                     "cairo_image_surface_create_for_data",
@@ -634,6 +640,7 @@ impl Painter {
                 stroke: symbol(&cairo, "cairo_stroke")?,
                 set_line_width: symbol(&cairo, "cairo_set_line_width")?,
                 set_antialias: symbol(&cairo, "cairo_set_antialias")?,
+                scale_ctx: symbol(&cairo, "cairo_scale")?,
                 save: symbol(&cairo, "cairo_save")?,
                 restore: symbol(&cairo, "cairo_restore")?,
                 pango_create_layout: symbol(&pango, "pango_cairo_create_layout")?,
@@ -658,6 +665,15 @@ impl Painter {
         self.metrics
     }
 
+    /// Sets the buffer scale (X pixels per logical pixel) used by [`Self::paint`].
+    pub fn set_scale(&mut self, scale: f64) {
+        self.scale = scale.max(1.0);
+    }
+
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
     #[allow(dead_code)] // settings/look changes (M3)
     pub fn set_metrics(&mut self, m: Metrics) {
         self.metrics = m;
@@ -674,7 +690,10 @@ impl Painter {
         stride: usize,
         st: &HeaderState,
     ) {
-        let (w, h) = (f64::from(width), f64::from(height));
+        let scale = self.scale.max(1.0);
+        // `width`/`height` are the buffer's physical (X) pixels; all drawing
+        // below is in logical pixels, scaled up by the cairo transform.
+        let (w, h) = (f64::from(width) / scale, f64::from(height) / scale);
         if w <= 0.0 || h <= 0.0 || stride < width as usize * 4 {
             return;
         }
@@ -703,6 +722,7 @@ impl Painter {
                 (self.surface_destroy)(surface);
                 return;
             }
+            (self.scale_ctx)(cr, scale, scale);
             (self.set_antialias)(cr, 6); // CAIRO_ANTIALIAS_BEST
 
             // Rounded top corners, square bottom (the header joins the
@@ -1478,6 +1498,37 @@ mod tests {
             px[23 * stride + 719 * 4 + 3],
             0xff,
             "right edge at mid height"
+        );
+    }
+
+    #[test]
+    fn scaled_header_is_painted_at_buffer_scale_and_centres_its_title() {
+        let Ok(mut p) = Painter::load(false) else {
+            return; // no cairo/pango on this machine; the VM covers it
+        };
+        p.set_scale(2.0);
+        let (w, h, stride) = (1440u16, 92u16, 1440usize * 4);
+        let mut px = vec![0u8; stride * usize::from(h)];
+        let st = HeaderState {
+            title: "xterm".into(),
+            ..HeaderState::default()
+        };
+        p.paint(&mut px, w, h, stride, &st);
+        // the physical buffer is filled to its right/bottom edge
+        assert_eq!(px[46 * stride + 1439 * 4 + 3], 0xff);
+        assert_eq!(px[91 * stride + 719 * 4 + 3], 0xff);
+        // the rounded top-right corner is in the physical buffer
+        assert_eq!(px[1439 * 4 + 3], 0);
+        // the title ink is in the centre band, as at 1x, not at the top
+        let dark: Vec<usize> = (0..92)
+            .filter(|y| (600..840).any(|x| px[y * stride + x * 4] < 150))
+            .collect();
+        assert!(!dark.is_empty(), "no title ink");
+        assert!(dark[0] > 15, "title starts at row {}", dark[0]);
+        assert!(
+            *dark.last().unwrap() < 78,
+            "title ends at row {}",
+            dark.last().unwrap()
         );
     }
 

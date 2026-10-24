@@ -808,10 +808,12 @@ fn log_sum(terms: &[f64]) -> f64 {
     top + terms.iter().map(|t| (t - top).exp()).sum::<f64>().ln()
 }
 
-/// The X root position of desktop position `pos`, on the X screen.
-pub fn root_position(pos: Pos, screen: (u16, u16)) -> (i16, i16) {
+/// The X root position of desktop position `pos`, on the X screen: X pixels
+/// are logical x `scale` (S; 1 without HiDPI).
+pub fn root_position(pos: Pos, screen: (u16, u16), scale: f64) -> (i16, i16) {
     let clamp = |v: f64, size: u16| {
         let max = i32::from(size).max(1) - 1;
+        let v = v * scale;
         (v.floor().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32).clamp(0, max) as i16
     };
     (clamp(pos.0, screen.0), clamp(pos.1, screen.1))
@@ -1251,10 +1253,10 @@ mod tests {
     #[test]
     fn root_positions_are_on_the_x_screen() {
         let s = (1280, 720);
-        assert_eq!(root_position((130.75, 89.999), s), (130, 89));
-        assert_eq!(root_position((-0.5, 700.0), s), (0, 700));
-        assert_eq!(root_position((5000.0, 1e12), s), (1279, 719));
-        assert_eq!(root_position((f64::NAN, -1e12), s), (0, 0));
+        assert_eq!(root_position((130.75, 89.999), s, 1.0), (130, 89));
+        assert_eq!(root_position((-0.5, 700.0), s, 1.0), (0, 700));
+        assert_eq!(root_position((5000.0, 1e12), s, 1.0), (1279, 719));
+        assert_eq!(root_position((f64::NAN, -1e12), s, 1.0), (0, 0));
     }
 }
 
