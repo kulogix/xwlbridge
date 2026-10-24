@@ -151,6 +151,7 @@ the effective values). Change with `xwlbridge-ctl config set KEY VALUE`, then
 | `bridge` | `auto` | the `xwlbridge` binary; auto = next to `xwlbridge-ctl`, else on PATH |
 | `display` | `auto` | `xwlbridge.service` only: the display number (e.g. `20`); auto = the bridge picks one |
 | `extension` | `auto` | the window extension `xwlbridge-windows@xwlbridge`: `auto` = `install.sh` installs and enables it and the bridge uses it while GNOME runs it; `off` = `install.sh` leaves it out (removing its own copy) and the bridge does not use it ([docs/extension.md](../docs/extension.md)) |
+| `tray` | `on` | X tray icons (XEmbed) on GNOME's top bar with `-showwindows`; `off` = the bridge runs with `-notray` (0.2.0's behaviour). GNOME needs the AppIndicator extension ([docs/tray.md](../docs/tray.md)) |
 
 RealVNC's own settings (authentication, encryption, permissions, ...) stay in
 RealVNC's files and its Options dialog (status window > menu > Options), e.g. a

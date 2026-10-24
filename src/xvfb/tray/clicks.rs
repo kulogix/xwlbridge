@@ -83,7 +83,8 @@ pub fn buttons(button: u8) -> &'static [u8] {
     }
 }
 
-/// The steps of one click of `button` with the pointer at `(x, y)`.
+/// The steps of one click of `button` with the pointer at `(x, y)` of the container (which is where the
+/// click's X position is: see [`Origin`]).
 pub fn click(x: i16, y: i16, button: u8) -> Vec<Step> {
     let mut steps = vec![Step::Move(x, y)];
     for b in buttons(button) {
@@ -111,10 +112,44 @@ pub fn scroll(x: i16, y: i16, delta: i32, horizontal: bool) -> Vec<Step> {
     steps
 }
 
-/// Where the container goes for a click at `(gx, gy)` of the desktop with the pointer at `(px, py)` inside
-/// the icon: the icon's top left corner.
-pub fn origin(gx: i32, gy: i32, px: i32, py: i32) -> (i32, i32) {
-    (gx - px, gy - py)
+/// The click's X point, inside the container: the middle of the icon.
+pub fn target(size: (u16, u16)) -> (i16, i16) {
+    ((size.0 / 2) as i16, (size.1 / 2) as i16)
+}
+
+/// Where the icon goes for a click at desktop `(gx, gy)` with the click at `target` inside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The container at this root position (the desktop shows it there): the click's X point is the
+    /// desktop's point.
+    Container(i32, i32),
+    /// No window goes to the click's point (under the top bar: the desktop's top left corner is below it):
+    /// the container stays at [`crate::xvfb::tray::dock::PARK`] and the reverse path opens the menu the app
+    /// pops up at the point it was asked to (`winsync::initial_position`).
+    Asked(i16, i16),
+}
+
+/// How a click at desktop `(gx, gy)` is made on an icon with the click at `target` inside it: the
+/// container is moved so that the click's X point is the desktop's point (design §2: the desktop shows
+/// every X window at its own position), or, where no window goes, the click goes to the desktop's point.
+pub fn origin(gx: i32, gy: i32, target: (i16, i16)) -> Origin {
+    let (tx, ty) = (i32::from(target.0), i32::from(target.1));
+    if gx >= 0 && gy >= 0 {
+        Origin::Container(gx - tx, gy - ty)
+    } else {
+        let clamp = |v: i32| v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+        Origin::Asked(clamp(gx), clamp(gy))
+    }
+}
+
+/// A move of an X client that puts the icon under a desktop position, and its undo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restore {
+    /// The core pointer (with XTest): to this root position, with `window` (a parked icon) as the pointer's
+    /// window for the length of the motion.
+    Pointer(i16, i16, u32),
+    /// A window: back to this root position.
+    Window(u32, i16, i16),
 }
 
 /// Where a click with no position (a menu entry of ours) goes: the top right of the primary monitor's work
@@ -167,10 +202,15 @@ mod tests {
     }
 
     #[test]
-    fn the_click_point_is_where_the_pointer_was() {
-        // the icon at 1200,5 on the desktop, the pointer 10,10 inside it
-        assert_eq!(origin(1200, 5, 10, 10), (1190, -5));
-        assert_eq!(origin(0, 0, 0, 0), (0, 0));
+    fn the_click_point_is_where_the_desktop_was_clicked() {
+        // the click 9,4 inside the icon, at 1600,12 on the desktop: the icon's X point 9,4 is the
+        // desktop's 1600,12
+        assert_eq!(origin(1600, 12, (9, 4)), Origin::Container(1591, 8));
+        assert_eq!(origin(0, 0, (0, 0)), Origin::Container(0, 0));
+        // under the top bar no window goes: the click is made where it is and the app's menu is asked to
+        // open there
+        assert_eq!(origin(1200, -11, (9, 4)), Origin::Asked(1200, -11));
+        assert_eq!(origin(-3, 5, (1, 1)), Origin::Asked(-3, 5));
     }
 
     #[test]

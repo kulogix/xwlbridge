@@ -275,6 +275,31 @@ mod tests {
         }
     }
 
+    /// The tray clicks icons with XTest on the agent's own connection, so its
+    /// motion and buttons are classified `Class::Agent` (the process's pid): they
+    /// must stay on the display, whatever they bind to, while every other
+    /// client's input keeps its own verdict.
+    #[test]
+    fn the_trays_clicks_stay_on_the_display() {
+        let tray = who(std::process::id(), Class::Agent);
+        for (type_, detail) in [
+            (crate::bridge::input::MOTION_NOTIFY, 0),
+            (BUTTON_PRESS, 1),
+            (BUTTON_PRESS, 3),
+            (crate::bridge::input::BUTTON_RELEASE, 1),
+        ] {
+            for (x, y) in [(0, 0), (1600, 12), (-200, -200)] {
+                assert!(
+                    fake(&tray, type_, detail, x, y, 100).stays_here(),
+                    "{type_}/{detail} at {x},{y}"
+                );
+            }
+        }
+        // another client's clicks (the desktop's own window manager) are not the agent's input
+        let wm = who(2, Class::Other);
+        assert!(!fake(&wm, BUTTON_PRESS, 1, 10, 10, 100).stays_here());
+    }
+
     #[test]
     fn events_claim_their_own_requests_in_order() {
         let (a, b) = (who(1, Class::Driver), who(2, Class::Helper));

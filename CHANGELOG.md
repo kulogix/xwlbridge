@@ -2,6 +2,12 @@
 
 All notable changes to xwlbridge are listed here. The format follows Keep a Changelog.
 
+## Unreleased
+
+### Added
+
+- `-showwindows`: an XEmbed system tray. The bridge owns `_NET_SYSTEM_TRAY_S0` on its display and shows each X tray icon (Java, Wine, GTK, Qt, ...) on GNOME's top bar as a StatusNotifierItem, with the application's own menu (*Open*, *Menu*, *Middle click*) and its balloon messages as notifications; clicking the icon in the top bar clicks the icon on the X display. Needs GNOME's AppIndicator extension ([docs/tray.md](docs/tray.md)); `-notray` (setting `tray`) restores 0.2.0's behaviour, and `xwlbridge-ctl doctor` reports whether a status icon can be shown.
+
 ## 0.2.0 (2026-10-19)
 
 ### Added

@@ -109,7 +109,7 @@ Ubuntu 26.04 VM: `-showwindows` with xcalc and a GTK 3 app passed 6/6. Both GNOM
 - AT-SPI screen coordinates are engine coordinates. Accerciser and Orca flat-review click are off by the window's offset.
 - Settings (high contrast and so on) reach engine apps only with the proxy's `--settings-only` mirror (3/3 with it, 0/3 without).
 - Input devices: the mouse (buttons 1-10, so back and forward work; buttons 11 and up are not delivered), the keyboard, a touch screen (the first point drives the pointer, Xwayland-style, until the lift; no multi-touch, so pinch and rotate gestures are not forwarded) and a pen or eraser (the tip is the left button, its side buttons are middle, right and 8; pressure and tilt are not delivered) reach shown windows. Smooth (touchpad) scrolling is delivered as wheel clicks, one per 10 surface pixels of scroll; there are no smooth scroll axes.
-- XEmbed tray icons are not shown.
+- XEmbed tray icons are shown on GNOME's top bar (one item per icon; menu: *Open*, *Menu*, *Middle click*), which needs the AppIndicator extension; `-notray` turns this off ([tray.md](tray.md)).
 - It needs a stock engine (xvnc, xvfb or xwayland).
 - It is experimental, as is `-showscreen`.
 

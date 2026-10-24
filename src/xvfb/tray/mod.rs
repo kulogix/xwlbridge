@@ -40,13 +40,9 @@ use crate::xvfb::Auth;
 ///
 /// `devs` is the reverse direction's master device once `-showwindows` has it: the pointer the icons are
 /// clicked with (so that a click stays on the display, see [`clicks`]).
-pub fn start(
-    display: u32,
-    auth: Auth,
-    devs: Option<crate::xvfb::reverse::Devices>,
-) -> Option<manager::Running> {
+pub fn start(display: u32, auth: Auth) -> Option<manager::Running> {
     let screen = 0;
-    match manager::spawn(display, auth, screen, devs, None) {
+    match manager::spawn(display, auth, screen, None) {
         Ok(running) => {
             crate::log!(
                 "-showwindows: system tray: _NET_SYSTEM_TRAY_S{screen} taken, X tray icons are shown on the desktop"

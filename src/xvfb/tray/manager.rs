@@ -6,8 +6,10 @@
 //! the bus thread as an [`Event`]; what the desktop does to an icon comes back as a [`clicks::Command`],
 //! which this thread turns into XTest on the icon ([`clicks`]).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -15,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::damage;
-use x11rb::protocol::xinput::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
     EventMask, ImageFormat, MapState, PropMode, StackMode, WindowClass,
@@ -30,8 +31,10 @@ use super::dock::{CONTAINER, Icon, PARK};
 use super::pixels::Image;
 use super::{ICON_SIZE, Look, MAX_ICON_UPDATES, selection_name};
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, MOTION_NOTIFY};
-use crate::xvfb::reverse::Devices;
 use crate::xvfb::{self, AnyError, Auth};
+
+/// How long to wait before connecting to the X server again (the tray lost its connection).
+const RETRY: Duration = Duration::from_secs(2);
 
 /// How often an icon's name and pixels are checked without a DAMAGE (a rename sends none).
 const POLL: Duration = Duration::from_secs(1);
@@ -66,7 +69,6 @@ pub fn spawn(
     display: u32,
     auth: Auth,
     screen: u32,
-    devs: Option<Devices>,
     bus: Option<String>,
 ) -> std::io::Result<Running> {
     let (tx, commands) = channel();
@@ -77,25 +79,57 @@ pub fn spawn(
         std::thread::Builder::new()
             .name("tray".into())
             .spawn(move || {
-                let mut manager = match Manager::connect(display, &auth, screen, devs) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let _ = ready.send(Err(format!("{e}")));
+                // the one thread that talks to the X server: every request of the tray is made here
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    let here = format!("{:?}", std::thread::current().id());
+                    crate::warning!("-showwindows: tray: panicked in {here}: {info}");
+                    previous(info);
+                }));
+                // The tray's own connection to the X server. Should its thread ever end (it does not on a
+                // lost connection: it reconnects, see `run`), another connection takes the selection back.
+                let mut first = true;
+                while !stop.load(Ordering::SeqCst) {
+                    if !first {
+                        crate::log!(
+                            "-showwindows: tray: connecting again in {} s",
+                            RETRY.as_secs()
+                        );
+                        let until = Instant::now() + RETRY;
+                        while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(200));
+                        }
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                    }
+                    let manager = match Manager::connect(display, &auth, screen)
+                        .and_then(|mut m| m.take_selection().map(|()| m))
+                    {
+                        Ok(m) => Rc::new(RefCell::new(m)),
+                        Err(e) if !first => {
+                            crate::vlog!("-showwindows: tray: {e}");
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = ready.send(Err(format!("{e}")));
+                            return;
+                        }
+                    };
+                    let events = manager.borrow_mut().start_bus();
+                    let _bus = super::session::start(events, bus.clone(), tx.clone());
+                    if first && ready.send(Ok(())).is_err() {
+                        manager.borrow_mut().release();
                         return;
                     }
-                };
-                if let Err(e) = manager.take_selection() {
-                    let _ = ready.send(Err(format!("{e}")));
-                    return;
+                    first = false;
+                    Manager::run(manager.clone(), &commands, &stop);
+                    manager.borrow_mut().release();
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    crate::log!("-showwindows: tray: lost the X connection; the tray reconnects");
                 }
-                let bus = super::session::start(manager.start_bus(), bus, tx);
-                if let Err(e) = ready.send(Ok(())) {
-                    let _ = e;
-                    manager.release();
-                    return;
-                }
-                manager.run(&commands, &stop);
-                drop(bus);
             })?
     };
     match started.recv() {
@@ -188,17 +222,10 @@ struct Manager {
     /// The 32-bit ARGB visual, and the screen's default one.
     argb: Option<u32>,
     default_visual: u32,
-    /// The screen's size, for the clicks' positions.
-    screen: (u16, u16),
 }
 
 impl Manager {
-    fn connect(
-        display: u32,
-        auth: &Auth,
-        screen: u32,
-        devs: Option<Devices>,
-    ) -> Result<Manager, AnyError> {
+    fn connect(display: u32, auth: &Auth, screen: u32) -> Result<Manager, AnyError> {
         let (conn, screen_num) = xvfb::connect(display, auth)?;
         let root = conn.setup().roots[screen_num].root;
         let atoms = Atoms::new(&conn, screen)?;
@@ -212,23 +239,9 @@ impl Manager {
                 .map(|v| v.visual_id);
             (root.root_visual, argb)
         };
-        // the desktop's pointer is not ours to move: clicks are made with the reverse direction's device,
-        // as every X client of the display gets it (and with our own XTest only without one)
-        if let Some(devs) = &devs
-            && let Err(e) = conn.xinput_xi_set_client_pointer(x11rb::NONE, devs.pointer)
-        {
-            crate::vlog!(
-                "-showwindows: tray: no reverse pointer ({e}), clicking with the core pointer"
-            );
-        }
-        let geometry = conn
-            .get_geometry(root)?
-            .reply()
-            .map(|g| (g.width, g.height))
-            .unwrap_or((0, 0));
-        let screen_size = geometry;
+        // (the connection's ClientPointer is left alone: its XTest goes to the core pointer, which is the
+        // only pointer of the display, and no input device of the desktop is touched)
         Ok(Manager {
-            screen: screen_size,
             conn,
             root,
             window: 0,
@@ -347,16 +360,20 @@ impl Manager {
     // ------------------------------------------------------------------ the loop
 
     /// Runs until stopped.
-    fn run(&mut self, commands: &Receiver<Command>, stop: &AtomicBool) {
-        let fd = self.conn.stream().as_raw_fd();
+    ///
+    /// Every request of the tray is made from here (the thread that owns the connection): the bus thread
+    /// only queues its commands, so nothing it does can hold up the X server's replies to the tray.
+    fn run(manager: Rc<RefCell<Manager>>, commands: &Receiver<Command>, stop: &AtomicBool) {
         while !stop.load(Ordering::SeqCst) {
-            if let Err(e) = self.pump(commands) {
-                crate::vlog!("-showwindows: tray: {e}");
+            let fd = manager.borrow().conn.stream().as_raw_fd();
+            if let Err(e) = manager.borrow_mut().pump(commands) {
+                // the X connection is gone (the engine restarted): a new one takes the selection back
+                crate::log!("-showwindows: tray: lost the X connection ({e})");
                 break;
             }
             wait(fd, Duration::from_millis(100));
         }
-        self.release();
+        manager.borrow_mut().release();
     }
 
     /// Handles what is there, and the commands.
@@ -433,7 +450,10 @@ impl Manager {
     }
 
     fn client_message(&mut self, e: &ClientMessageEvent) -> Result<(), AnyError> {
-        let data = e.data.as_data32();
+        self.client_message2(e.data.as_data32())
+    }
+
+    fn client_message2(&mut self, data: [u32; 5]) -> Result<(), AnyError> {
         let (kind, icon) = (data[1], data[2]);
         match kind {
             REQUEST_DOCK => self.dock(icon)?,
@@ -544,6 +564,13 @@ impl Manager {
         }
         self.conn.flush()?;
         let look = self.look(w);
+        crate::log!(
+            "-showwindows: tray icon {w:#x} docked ({}x{} {}, id {:?})",
+            look.image.as_ref().map_or(0, |i| i.width),
+            look.image.as_ref().map_or(0, |i| i.height),
+            if depth == 32 { "ARGB" } else { "opaque" },
+            look.id(w)
+        );
         self.told.insert(container, look.clone());
         self.send(Event::Docked { container, look });
         Ok(())
@@ -747,74 +774,141 @@ impl Manager {
         let Some(icon) = self.icons.values().find(|i| i.container == container) else {
             return Ok(());
         };
-        let (w, (width, height)) = (icon.window, icon.size);
-        let (px, py) = (i32::from(width) / 2, i32::from(height) / 2);
-        let (px, py) = (px as i16, py as i16);
-        let (steps, at) = match command {
+        let (w, size) = (icon.window, icon.size);
+        let target = clicks::target(size);
+        #[allow(clippy::type_complexity)]
+        let (steps, at, restore): (Vec<Step>, (i32, i32), Option<clicks::Restore>) = match command {
             Command::Click {
                 button,
                 x: Some(x),
                 y: Some(y),
                 ..
-            } => {
-                let at = self.place(x, y, px, py);
-                (clicks::click(px, py, button), at)
-            }
+            } => match clicks::origin(x, y, target) {
+                // the click's X point is the desktop's point: the container moves under it
+                clicks::Origin::Container(ox, oy) => (
+                    clicks::click(target.0, target.1, button),
+                    (ox, oy),
+                    Some(clicks::Restore::Window(container, PARK.0, PARK.1)),
+                ),
+                // under the top bar: the icon stays parked, the click goes to the point itself
+                clicks::Origin::Asked(x, y) => (
+                    clicks::click(target.0, target.1, button),
+                    (PARK.0.into(), PARK.1.into()),
+                    Some(clicks::Restore::Pointer(x, y, w)),
+                ),
+            },
             Command::Scroll {
                 steps,
                 horizontal,
                 x: Some(x),
                 y: Some(y),
                 ..
-            } => {
-                let at = self.place(x, y, px, py);
-                (clicks::scroll(px, py, steps, horizontal), at)
-            }
-            // no position in the call: the desktop's pointer, where the menu was
-            Command::Click { button, .. } => {
-                let at = self.pointer();
-                (clicks::click(px, py, button), at)
-            }
+            } => match clicks::origin(x, y, target) {
+                clicks::Origin::Container(ox, oy) => (
+                    clicks::scroll(target.0, target.1, steps, horizontal),
+                    (ox, oy),
+                    Some(clicks::Restore::Window(container, PARK.0, PARK.1)),
+                ),
+                clicks::Origin::Asked(x, y) => (
+                    clicks::scroll(target.0, target.1, steps, horizontal),
+                    (PARK.0.into(), PARK.1.into()),
+                    Some(clicks::Restore::Pointer(x, y, w)),
+                ),
+            },
+            // no position in the call: the icon is in front of the pointer, where the desktop's pointer is
+            Command::Click { button, .. } => (
+                clicks::click(target.0, target.1, button),
+                self.pointer(),
+                None,
+            ),
             Command::Scroll {
                 steps, horizontal, ..
-            } => {
-                let at = self.pointer();
-                (clicks::scroll(px, py, steps, horizontal), at)
-            }
+            } => (
+                clicks::scroll(target.0, target.1, steps, horizontal),
+                self.pointer(),
+                None,
+            ),
         };
-        {
-            let _ = w;
-            self.conn.configure_window(
-                container,
-                &ConfigureWindowAux::new()
-                    .x(at.0)
-                    .y(at.1)
-                    .stack_mode(StackMode::ABOVE),
-            )?;
-            self.conn.flush()?;
-            let result = self.play(&steps);
-            // the container goes back out of the way, below the agent's window
-            let _ = self.conn.configure_window(
-                container,
-                &ConfigureWindowAux::new()
-                    .x(i32::from(PARK.0))
-                    .y(i32::from(PARK.1))
-                    .stack_mode(StackMode::BELOW),
-            );
-            self.conn.flush()?;
-            result
+        let _ = w;
+        self.conn.configure_window(
+            container,
+            &ConfigureWindowAux::new()
+                .x(at.0)
+                .y(at.1)
+                .stack_mode(StackMode::ABOVE),
+        )?;
+        self.conn.flush()?;
+        let result = self.play(&steps);
+        // the icon goes back out of the way (and so does the pointer)
+        if let Some(restore) = restore {
+            match restore {
+                clicks::Restore::Window(w, x, y) => {
+                    self.conn.configure_window(
+                        w,
+                        &ConfigureWindowAux::new()
+                            .x(i32::from(x))
+                            .y(i32::from(y))
+                            .stack_mode(StackMode::BELOW),
+                    )?;
+                    self.conn.flush()?;
+                }
+                clicks::Restore::Pointer(x, y, icon) => {
+                    // the pointer cannot be put back where no window is: a 1x1 click-through window
+                    // on the point for the length of the motion
+                    if let Err(e) = self.point_at(icon, x, y) {
+                        crate::vlog!(
+                            "-showwindows: tray: the pointer stays where it was clicked: {e}"
+                        );
+                    }
+                }
+            }
         }
+        result
     }
 
-    /// Where a click at desktop `(x, y)`, `(px, py)` inside the icon, finds its icon: the icon's top left
-    /// corner, on the screen (the click's position under the top bar is not a place for a window).
-    fn place(&self, x: i32, y: i32, px: i16, py: i16) -> (i32, i32) {
-        let (mut ox, mut oy) = clicks::origin(x, y, px.into(), py.into());
-        let (sw, sh) = (i32::from(self.screen.0), i32::from(self.screen.1));
-        // under the top bar (a negative position): the corner is as close as a window goes
-        ox = ox.clamp(0, (sw - i32::from(px) * 2 - 1).max(0));
-        oy = oy.clamp(0, (sh - i32::from(py) * 2 - 1).max(0));
-        (ox, oy)
+    /// Puts the X pointer at root `(x, y)`, under the top bar included: a 1x1 window over the point takes
+    /// the motion (XTest's absolute motion is confined to the windows there are: a point no window covers,
+    /// such as the desktop's top bar, takes none) and is gone again before the button goes down.
+    fn point_at(&self, icon: u32, x: i16, y: i16) -> Result<(), AnyError> {
+        let point = self.conn.generate_id()?;
+        self.conn.create_window(
+            x11rb::COPY_FROM_PARENT as u8,
+            point,
+            self.root,
+            x,
+            y,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .event_mask(EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE),
+        )?;
+        self.conn.map_window(point)?;
+        self.conn.flush()?;
+        for _ in 0..50 {
+            if self.conn.query_pointer(self.root)?.reply()?.child == point {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let _ = icon;
+        let result = xtest::fake_input(
+            &self.conn,
+            MOTION_NOTIFY,
+            0,
+            x11rb::CURRENT_TIME,
+            self.root,
+            x,
+            y,
+            0,
+        );
+        self.conn.destroy_window(point)?;
+        self.conn.flush()?;
+        result?;
+        Ok(())
     }
 
     /// The desktop's pointer, where the session shows it, or the top right corner of the primary monitor

@@ -1026,7 +1026,7 @@ fn supervise(server: Arc<Server>, display: u32, auth: Auth) {
             let mut agent = Agent::new(server.clone(), display, auth.clone())?;
             // the X tray, shown on the desktop (kept for as long as this agent runs)
             let _tray = (server.config.showwindows && server.config.tray()).then(|| {
-                let tray = tray::start(display, auth.clone(), None);
+                let tray = tray::start(display, auth.clone());
                 if tray.is_some() {
                     crate::log!("-showwindows: the X system tray is shown on the desktop");
                 }
