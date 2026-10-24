@@ -176,6 +176,35 @@ fn fit(p: i16, len: u16, max: i32) -> i16 {
     }
 }
 
+/// P1: the names of the `_NET_WM_WINDOW_TYPE`s of the windows that belong to a
+/// main window (an X window manager keeps them above it and hides them with
+/// it), in `Atoms::group_types`' order.
+const GROUP_TYPES: [&str; 4] = ["UTILITY", "TOOLBAR", "DIALOG", "MENU"];
+
+/// P1: whether a window whose `_NET_WM_WINDOW_TYPE`s are `types` and that
+/// `asks` to be modal (`_NET_WM_STATE_MODAL`) belongs to a main window: it is
+/// a panel, toolbar, dialog or menu, or it is modal. An untyped window does
+/// not (it may be the main window).
+fn p1_groups(types: &[u32], group_types: &[u32; GROUP_TYPES.len()], asks: bool) -> bool {
+    asks || types.iter().any(|t| group_types.contains(t))
+}
+
+/// P1: the main window among a client's toplevels that may be one,
+/// `(window, painted, takes the input, area)` each: the one with the input,
+/// else the one painted last (the lower in the stack: a dialog is above the
+/// window it was opened from), else the largest. Ties go to the lowest id, so
+/// the choice is stable.
+fn p1_main(candidates: &[(Window, bool, bool, u64)]) -> Option<Window> {
+    let key = |c: &&(Window, bool, bool, u64)| (std::cmp::Reverse(c.3), c.0);
+    if let Some(c) = candidates.iter().filter(|c| c.2).min_by_key(key) {
+        return Some(c.0);
+    }
+    if let Some(c) = candidates.iter().filter(|c| c.1).min_by_key(key) {
+        return Some(c.0);
+    }
+    candidates.iter().min_by_key(key).map(|c| c.0)
+}
+
 /// The bytes of one frame of `w`x`h` pixels, if a window that size may be
 /// shown at all.
 fn frame_bytes(w: u16, h: u16) -> Option<usize> {
@@ -533,6 +562,8 @@ struct Atoms {
     wm_take_focus: u32,
     net_wm_name: u32,
     net_wm_window_type: u32,
+    group_types: [u32; GROUP_TYPES.len()],
+    group_normal: u32,
     utf8_string: u32,
     net_wm_state: u32,
     net_wm_state_modal: u32,
@@ -619,6 +650,10 @@ struct Shown {
     /// The compositor's last maximised / fullscreen state, as told to X.
     maximized: bool,
     fullscreen: bool,
+    /// P1: a panel, toolbar, dialog or menu (or a modal window) that belongs
+    /// to its client's main window, and waits for one to be shown.
+    p1_grouped: bool,
+    p1_waiting: bool,
 }
 
 /// `-showscreen`: a window of the X screen, composited onto the canvas.
@@ -1067,6 +1102,13 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         wm_take_focus: atom(b"WM_TAKE_FOCUS")?,
         net_wm_name: atom(b"_NET_WM_NAME")?,
         net_wm_window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
+        group_types: [
+            atom(b"_NET_WM_WINDOW_TYPE_UTILITY")?,
+            atom(b"_NET_WM_WINDOW_TYPE_TOOLBAR")?,
+            atom(b"_NET_WM_WINDOW_TYPE_DIALOG")?,
+            atom(b"_NET_WM_WINDOW_TYPE_MENU")?,
+        ],
+        group_normal: atom(b"_NET_WM_WINDOW_TYPE_NORMAL")?,
         utf8_string: atom(b"UTF8_STRING")?,
         net_wm_state: atom(b"_NET_WM_STATE")?,
         net_wm_state_modal: atom(b"_NET_WM_STATE_MODAL")?,
@@ -1481,12 +1523,26 @@ impl State {
             toplevel.set_parent(Some(pt));
             parent = Some(p);
         }
+        // P1: a panel, toolbar, menu or dialog (or a modal window) with no
+        // WM_TRANSIENT_FOR is its client's main window's child on the
+        // desktop, as an X window manager keeps it: above it, and hidden
+        // with it
+        let (mut grouped, mut waiting) = (false, false);
+        if parent.is_none() && self.p1_groups(w) {
+            grouped = true;
+            match self.p1_pick(w) {
+                Some(main) => parent = self.p1_parent(w, main, &toplevel),
+                None => waiting = true,
+            }
+        }
         // WM_NORMAL_HINTS' min/max size, as a window manager honours them
         self.apply_size_hints(w, &toplevel);
         // a modal dialog (_NET_WM_STATE_MODAL, or Motif's modal input mode)
-        // with a parent: GNOME attaches it to the parent, as it does on X
+        // with a parent: GNOME attaches it to the parent, as it does on X -
+        // but not one P1 chose (P1.md F7: GNOME then centres it on that
+        // parent, which pulls it off its place, and no cell covers it yet)
         let dialog = match (&parent, self.dialogs.as_ref()) {
-            (Some(_), Some(d)) if self.is_modal(w) => {
+            (Some(_), Some(d)) if self.is_modal(w) && !grouped => {
                 let x = d.get_xdg_dialog(&toplevel, qh, ());
                 x.set_modal();
                 crate::log!("-showwindows: {w:#x} is a modal dialog of its parent");
@@ -1510,6 +1566,18 @@ impl State {
             crate::log!(
                 "-showwindows: {w:#x} asks to open at {ix},{iy}: the desktop places it there"
             );
+        } else if grouped {
+            // P1: GNOME centres a window on its parent without regard for
+            // the screen's edge (place.c); the X window went where the
+            // screen's rules put it (show's fit), so the desktop opens it
+            // there too
+            if let Some(sync) = self.sync.as_ref() {
+                sync.client.send(Request::SetInitialPosition {
+                    xid: w,
+                    x: i32::from(x),
+                    y: i32::from(y),
+                });
+            }
         }
         surface.commit();
         crate::log!(
@@ -1529,36 +1597,35 @@ impl State {
             },
         );
         let client = self.client_of(w);
-        self.windows.insert(
-            w,
-            Shown {
-                x,
-                y,
-                width,
-                height,
-                at: (x, y),
-                border,
-                above: None,
-                depth,
-                damage: dmg,
-                pixmap: None,
-                surface,
-                xdg_surface,
-                role: Role::Toplevel(toplevel),
-                configured: false,
-                buffers: None,
-                dirty: true,
-                frames: 0,
-                frame_pending: false,
-                committed_at: None,
-                client,
-                iconic,
-                parent,
-                dialog,
-                maximized: false,
-                fullscreen: false,
-            },
-        );
+        let shown = Shown {
+            x,
+            y,
+            width,
+            height,
+            at: (x, y),
+            border,
+            above: None,
+            depth,
+            damage: dmg,
+            pixmap: None,
+            surface,
+            xdg_surface,
+            role: Role::Toplevel(toplevel),
+            configured: false,
+            buffers: None,
+            dirty: true,
+            frames: 0,
+            frame_pending: false,
+            committed_at: None,
+            client,
+            iconic,
+            parent,
+            dialog,
+            maximized: false,
+            fullscreen: false,
+            p1_grouped: grouped,
+            p1_waiting: waiting,
+        };
         if let Some(sync) = self.sync.as_mut() {
             let r = Rect::new(
                 i32::from(x),
@@ -1568,8 +1635,149 @@ impl State {
             );
             sync.geo.track(w, r);
         }
+        self.windows.insert(w, shown);
+        if grouped && waiting {
+            crate::log!(
+                "-showwindows: {w:#x} belongs to a main window: none of its client's is shown yet"
+            );
+        }
+        self.p1_shown(w);
         self.sync_flags(w);
         Ok(())
+    }
+
+    /// P1: whether `w` is a panel, toolbar, dialog or menu, or asks to be
+    /// modal: a window that belongs to a main window (`p1_groups`).
+    fn p1_groups(&self, w: Window) -> bool {
+        p1_groups(
+            &self.window_types(w),
+            &self.atoms.group_types,
+            self.is_modal(w),
+        )
+    }
+
+    /// P1: the `_NET_WM_WINDOW_TYPE`s of `w`.
+    fn window_types(&self, w: Window) -> Vec<u32> {
+        self.x
+            .get_property(
+                false,
+                w,
+                self.atoms.net_wm_window_type,
+                AtomEnum::ATOM,
+                0,
+                32,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default()
+    }
+
+    /// P1: whether `w` may be a main window: NORMAL or untyped, with no
+    /// parent of its own, painted, not minimised.
+    fn p1_may_be_main(&self, w: Window, s: &Shown) -> bool {
+        if s.iconic || s.frames == 0 || !matches!(s.role, Role::Toplevel(_)) {
+            return false;
+        }
+        if self.transient_for(w).is_some() {
+            return false;
+        }
+        match self.window_types(w).first() {
+            None => true,
+            Some(t) => *t == self.atoms.group_normal,
+        }
+    }
+
+    /// P1: the main window among `w`'s client's shown toplevels (see
+    /// `p1_main`).
+    fn p1_pick(&self, w: Window) -> Option<Window> {
+        let client = self.client_of(w);
+        let mut candidates = Vec::new();
+        for (o, s) in &self.windows {
+            if *o == w || s.client != client || !self.p1_may_be_main(*o, s) {
+                continue;
+            }
+            let input = self.keyboard_on == Some(*o) || self.pointer_on == Some(*o);
+            let area = u64::from(s.width) * u64::from(s.height);
+            candidates.push((*o, s.committed_at.is_some(), input, area));
+        }
+        p1_main(&candidates)
+    }
+
+    /// P1: gives shown window `w` its client's main window `main` as parent,
+    /// if `main` is one.
+    fn p1_parent(
+        &mut self,
+        w: Window,
+        main: Window,
+        toplevel: &xdg_toplevel::XdgToplevel,
+    ) -> Option<Window> {
+        let Some(Role::Toplevel(main_toplevel)) = self.windows.get(&main).map(|s| &s.role) else {
+            return None;
+        };
+        toplevel.set_parent(Some(main_toplevel));
+        crate::log!("-showwindows: {w:#x} belongs to {main:#x}, its client's main window");
+        Some(main)
+    }
+
+    /// P1: `w` is shown (`self.windows` has it): the panels of its client
+    /// that waited for their first main window take `w` if it is one, and a
+    /// panel without a main window waits for one.
+    fn p1_shown(&mut self, w: Window) {
+        let mut took: Vec<Window> = Vec::new();
+        let Some(s) = self.windows.get(&w) else {
+            return;
+        };
+        if s.frames > 0 && self.p1_may_be_main(w, s) {
+            let client = s.client;
+            for (o, s) in self.windows.iter_mut() {
+                if *o != w && s.client == client && s.p1_waiting && s.parent.is_none() {
+                    s.parent = Some(w);
+                    s.p1_waiting = false;
+                    took.push(*o);
+                }
+            }
+        }
+        let Some(Role::Toplevel(t)) = self.windows.get(&w).map(|s| &s.role) else {
+            return;
+        };
+        if took.is_empty() {
+            return;
+        }
+        let t = t.clone();
+        for o in took {
+            if let Some(Role::Toplevel(c)) = self.windows.get(&o).map(|s| &s.role) {
+                c.set_parent(Some(&t));
+            }
+            crate::log!("-showwindows: {o:#x} belongs to {w:#x}, its client's main window");
+        }
+    }
+
+    /// P1: shown window `w` went away: the panels that belonged to it look
+    /// for a main window again.
+    fn p1_gone(&mut self, w: Window) {
+        let children: Vec<Window> = self
+            .windows
+            .iter()
+            .filter(|(_, s)| s.parent == Some(w) && s.p1_grouped)
+            .map(|(o, _)| *o)
+            .collect();
+        for c in children {
+            // another main window of the client, if it has one
+            let main = self.p1_pick(c);
+            let Some(s) = self.windows.get_mut(&c) else {
+                continue;
+            };
+            let Role::Toplevel(t) = &s.role else {
+                continue;
+            };
+            t.set_parent(None);
+            s.parent = None;
+            s.p1_waiting = main.is_none();
+            if main.is_none() {
+                crate::log!("-showwindows: {c:#x} waits for its client's main window");
+            }
+        }
     }
 
     /// An override-redirect window (menu, tooltip, combo list) as an
@@ -1701,6 +1909,8 @@ impl State {
                 dialog: None,
                 maximized: false,
                 fullscreen: false,
+                p1_grouped: false,
+                p1_waiting: false,
             },
         );
         self.popups.push(w);
@@ -1759,6 +1969,7 @@ impl State {
         };
         self.popups.retain(|p| *p != w);
         self.sync_forget(w);
+        self.p1_gone(w);
         crate::log!("-showwindows: {w:#x} went away after {} frame(s)", s.frames);
         // the window may be gone already: errors are expected and harmless
         let _ = damage::destroy(&self.x, s.damage);
@@ -4218,6 +4429,8 @@ impl State {
                 dialog: None,
                 maximized: false,
                 fullscreen: false,
+                p1_grouped: false,
+                p1_waiting: false,
             },
         );
         Ok(())
@@ -5870,5 +6083,58 @@ mod tests {
         // not locked: nothing to end
         assert!(!relative_mode_ends(false, true, true, false));
         assert!(!relative_mode_ends(false, false, false, false));
+    }
+
+    #[test]
+    fn p1_panels_toolbars_dialogs_and_menus_belong_to_a_main_window() {
+        let t = |v: &[u32], modal| p1_groups(v, &[8, 9, 10, 11], modal);
+        assert!(t(&[8], false));
+        assert!(t(&[9], false));
+        assert!(t(&[10], false));
+        assert!(t(&[11], false));
+        // modal, whatever its type
+        assert!(t(&[], true));
+        assert!(t(&[1], true));
+        // a main window, or one with no type at all, belongs to none
+        assert!(!t(&[1], false));
+        assert!(!t(&[], false));
+        // any of its types, not just the first
+        assert!(!t(&[1, 2, 3], false));
+        assert!(t(&[1, 10], false));
+    }
+
+    #[test]
+    fn p1_the_window_with_the_input_is_the_main_one() {
+        // (window, painted, input, area)
+        assert_eq!(p1_main(&[]), None);
+        // the largest, when nothing has the input
+        assert_eq!(
+            p1_main(&[(3, true, false, 100), (4, true, false, 900)]),
+            Some(4)
+        );
+        // the one with the input, however small
+        assert_eq!(
+            p1_main(&[(3, true, false, 900), (4, true, true, 100)]),
+            Some(4)
+        );
+        // ties: the lowest id, whatever the order
+        assert_eq!(
+            p1_main(&[(9, true, false, 100), (7, true, false, 100)]),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn p1_only_a_painted_window_is_a_main_window() {
+        // the largest painted one wins
+        assert_eq!(
+            p1_main(&[(0x20, false, false, 50), (0x10, true, false, 500)]),
+            Some(0x10)
+        );
+        // none painted (an application starting): the largest of them
+        assert_eq!(
+            p1_main(&[(0x20, false, false, 500), (0x10, false, false, 50)]),
+            Some(0x20)
+        );
     }
 }
