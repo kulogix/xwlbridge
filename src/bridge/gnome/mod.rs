@@ -1722,7 +1722,9 @@ impl Backend {
             .iter()
             .map(|m| (m.connector.as_str(), m.primary))
             .collect();
-        let mut src = ShellPrimary(&self.conn);
+        let rects: Vec<(i32, i32, i32, i32)> =
+            monitors.iter().map(|m| (m.lx, m.ly, m.lw, m.lh)).collect();
+        let mut src = ShellPrimary(&self.conn, &rects);
         let primary = self.primary.update(&flags, &mut src);
         for (i, m) in monitors.iter_mut().enumerate() {
             m.primary = primary == Some(i);
@@ -1928,11 +1930,14 @@ impl Backend {
 }
 
 /// GNOME Shell's own view of the monitors, for [`primary::PrimaryModel`].
-struct ShellPrimary<'a>(&'a Connection);
+/// GNOME Shell's view of the primary, for the monitors just read (their
+/// logical rectangles, in the same order).
+struct ShellPrimary<'a>(&'a Connection, &'a [(i32, i32, i32, i32)]);
 
 impl primary::PrimarySource for ShellPrimary<'_> {
     fn shell_primary(&mut self) -> Option<usize> {
-        dbus::shell_primary(self.0)
+        let rect = dbus::shell_primary(self.0)?;
+        self.1.iter().position(|r| *r == rect)
     }
 
     fn log(&mut self, msg: &str) {
