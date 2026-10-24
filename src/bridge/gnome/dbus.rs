@@ -134,22 +134,25 @@ const WINDOWS_BUS_NAME: &str = "org.xwlbridge.Windows";
 const WINDOWS_PATH: &str = "/org/xwlbridge/Windows";
 const WINDOWS_IFACE: &str = "org.xwlbridge.Windows1";
 
-/// One monitor of `GetMonitors`: its index and GNOME Shell's `primary` flag.
-type ShellMonitor = (i32, ((i32, i32, i32, i32), (i32, i32, i32, i32), f64, bool));
+/// One monitor of `GetMonitors` (`a(i(iiii)(iiii)db)`): GNOME Shell's index,
+/// the logical rectangle, the work area, the scale and the `primary` flag.
+type ShellMonitor = (i32, (i32, i32, i32, i32), (i32, i32, i32, i32), f64, bool);
 
-/// The primary monitor according to GNOME Shell itself (the
+/// The logical rectangle of the primary monitor according to GNOME Shell itself (the
 /// `xwlbridge-windows` extension), or `None` if the extension is not there
 /// or does not answer: it tells apart what mutter's stale primary flags
 /// cannot (see [`super::primary`]).
-pub fn shell_primary(conn: &Connection) -> Option<usize> {
+pub fn shell_primary(conn: &Connection) -> Option<(i32, i32, i32, i32)> {
     let p = Proxy::new(conn, WINDOWS_BUS_NAME, WINDOWS_PATH, WINDOWS_IFACE).ok()?;
     let monitors: Vec<ShellMonitor> = p
         .call("GetMonitors", &())
         .map_err(|e| crate::vlog!("gnome: GetMonitors: {e}"))
         .ok()?;
-    let mut primaries = monitors.iter().filter(|(_, m)| m.3).map(|(i, _)| *i);
+    // GNOME Shell numbers its monitors its own way: the caller matches the
+    // primary by its logical rectangle
+    let mut primaries = monitors.iter().filter(|m| m.4).map(|m| m.1);
     match (primaries.next(), primaries.next()) {
-        (Some(one), None) => usize::try_from(one).ok(),
+        (Some(one), None) => Some(one),
         _ => None,
     }
 }
@@ -667,5 +670,19 @@ mod tests {
         ] {
             assert!(connection_lost(&io(k)), "{k:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod shell_monitor_tests {
+    /// The extension's GetMonitors reply is `a(i(iiii)(iiii)db)`: a type
+    /// that nests differently makes every call fail to decode, and the bridge
+    /// silently loses GNOME Shell's view of the primary monitor.
+    #[test]
+    fn the_shell_monitor_type_is_the_extensions_signature() {
+        assert_eq!(
+            <super::ShellMonitor as zbus::zvariant::Type>::SIGNATURE.to_string(),
+            "(i(iiii)(iiii)db)"
+        );
     }
 }

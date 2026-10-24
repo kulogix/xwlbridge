@@ -47,13 +47,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region,
+    wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
+    wl_touch,
 };
 use wayland_client::{Connection as WlConnection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
@@ -377,6 +379,37 @@ impl Drag {
     fn of_pointer(&self, on: Option<Window>) -> bool {
         self.wl_pointer && on == Some(self.window)
     }
+}
+
+/// CLOCK_MONOTONIC in nanoseconds (for wp_presentation's timestamps).
+fn monotonic_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the timespec it is given.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return None;
+    }
+    Some((ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+/// Asks wp_presentation for the commit-to-presentation time of `w`'s next
+/// commit of `surface` (only with XWLBRIDGE_PRESENT_STATS).
+fn request_feedback(
+    presentation: Option<&wp_presentation::WpPresentation>,
+    enabled: bool,
+    qh: &QueueHandle<State>,
+    w: Window,
+    surface: &wl_surface::WlSurface,
+) {
+    if !enabled {
+        return;
+    }
+    let (Some(presentation), Some(at_ns)) = (presentation, monotonic_ns()) else {
+        return;
+    };
+    presentation.feedback(surface, qh, FeedbackMark { window: w, at_ns });
 }
 
 /// CLOCK_MONOTONIC in milliseconds, wrapping: the clock of the compositor's
@@ -730,27 +763,108 @@ enum Role {
 }
 
 /// A fullscreen game window's emulated mode presentation: the parent surface
-/// is the monitor (a black buffer), and the game's pixels go on a subsurface
-/// scaled by wp_viewporter to the largest aspect-correct rectangle, centered
-/// (the letterbox).
+/// is the monitor (black), and the game's pixels go on a subsurface scaled by
+/// wp_viewporter to the largest aspect-correct rectangle, centered (the
+/// letterbox).
 struct Present {
-    /// The monitor-sized buffer, composed on the CPU: the game scaled into
-    /// the letterbox, black bars around it.
-    fd: OwnedFd,
-    pool: wl_shm_pool::WlShmPool,
-    buffers: [wl_buffer::WlBuffer; 2],
-    busy: [bool; 2],
     monitor: (i32, i32),
     /// Where the game buffer is drawn in the parent (letterbox).
     dest: (i32, i32),
     offset: (i32, i32),
-    /// The composed pixels (one frame), reused every paint.
-    out: Vec<u8>,
-    /// Bytes per monitor frame (for the pwrite offset).
-    frame: usize,
-    /// A black frame has been written once (the bars never change).
-    bars_done: bool,
     painted: bool,
+    /// When the presentation was created (CLOCK_MONOTONIC, ns), to report
+    /// the mode-to-first-frame latency.
+    enter_ns: u64,
+    /// CPU composition time and frames (for the measured fallback).
+    cpu_ns: u64,
+    comp_frames: u64,
+    kind: PresentKind,
+}
+
+/// A wl_output the compositor offered: its logical position and (v4) name.
+/// The emulated mode's fullscreen goes to the output at its monitor's origin,
+/// so GNOME fullscreens the game on the monitor the X CRTC is on.
+#[derive(Default)]
+struct Output {
+    proxy: Option<wl_output::WlOutput>,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    name: String,
+}
+
+/// One wp_presentation feedback request: the window and the commit time it
+/// belongs to (CLOCK_MONOTONIC, ns).
+struct FeedbackMark {
+    window: Window,
+    at_ns: u64,
+}
+
+/// How the game's frame reaches the monitor. The GPU path lets the compositor
+/// scale a desktop-sized destination from the game's own buffer (a subsurface
+/// with wp_viewporter); the CPU path copies/scales the frame into a
+/// monitor-sized shm buffer. The GPU path is preferred when the compositor
+/// offers wl_subcompositor and wp_viewporter (measured on real gnome-shell);
+/// `XWLBRIDGE_GAME_PRESENT=cpu` forces the fallback.
+enum PresentKind {
+    /// The monitor-sized buffers, composed on the CPU: the game scaled into
+    /// the letterbox, black bars around it.
+    Cpu {
+        fd: OwnedFd,
+        pool: wl_shm_pool::WlShmPool,
+        buffers: [wl_buffer::WlBuffer; 2],
+        busy: [bool; 2],
+        /// The composed pixels (one frame), reused every paint.
+        out: Vec<u8>,
+        /// Bytes per monitor frame (for the pwrite offset).
+        frame: usize,
+    },
+    /// The game's own buffer on a subsurface, the compositor scaling it.
+    Gpu {
+        /// The black monitor-sized parent buffer (held so the mapping lives
+        /// as long as the buffer; not read after creation).
+        #[allow(dead_code)]
+        fd: OwnedFd,
+        pool: wl_shm_pool::WlShmPool,
+        buffers: [wl_buffer::WlBuffer; 2],
+        child: wl_surface::WlSurface,
+        subsurface: wl_subsurface::WlSubsurface,
+        viewport: Option<wp_viewport::WpViewport>,
+        /// Parent and child commit together each frame (sync);
+        /// otherwise the child commits on its own (desync).
+        sync: bool,
+    },
+}
+
+/// Releases an emulated-mode presentation's Wayland objects.
+fn destroy_present(p: Present) {
+    match p.kind {
+        PresentKind::Cpu { pool, buffers, .. } => {
+            for b in &buffers {
+                b.destroy();
+            }
+            pool.destroy();
+        }
+        PresentKind::Gpu {
+            pool,
+            buffers,
+            child,
+            subsurface,
+            viewport,
+            ..
+        } => {
+            if let Some(v) = viewport {
+                v.destroy();
+            }
+            subsurface.destroy();
+            child.destroy();
+            for b in &buffers {
+                b.destroy();
+            }
+            pool.destroy();
+        }
+    }
 }
 
 struct Shown {
@@ -1101,6 +1215,13 @@ struct State {
     constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
     relative_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     viewporter: Option<wp_viewporter::WpViewporter>,
+    /// The compositor's outputs, for fullscreening on a specific monitor.
+    outputs: Vec<Output>,
+    /// wp_presentation, when the compositor offers it: commit-to-presentation
+    /// latency of the emulated-mode frames (`XWLBRIDGE_PRESENT_STATS=1`).
+    presentation: Option<wp_presentation::WpPresentation>,
+    present_stats: bool,
+    present_latency: HashMap<Window, Vec<u64>>,
     dialogs: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     /// xdg_toplevel_tag_v1: every shown toplevel is tagged
     /// `xwlbridge:<display>:<xid>` (`winsync::tag`), the name the desktop
@@ -1308,6 +1429,10 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         constraints: None,
         relative_manager: None,
         viewporter: None,
+        outputs: Vec::new(),
+        presentation: None,
+        present_stats: std::env::var_os("XWLBRIDGE_PRESENT_STATS").is_some_and(|v| !v.is_empty()),
+        present_latency: HashMap::new(),
         dialogs: None,
         tags: None,
         display,
@@ -2166,10 +2291,7 @@ impl State {
             return;
         };
         if let Some(p) = s.present.take() {
-            for b in &p.buffers {
-                b.destroy();
-            }
-            p.pool.destroy();
+            destroy_present(p);
         }
         self.popups.retain(|p| *p != w);
         self.sync_forget(w);
@@ -2450,8 +2572,12 @@ impl State {
                 if let Some(b) = self.windows.get_mut(&w).and_then(|s| s.buffers.as_mut()) {
                     b.busy[i] = false;
                 }
-            } else if let Some(p) = self.windows.get_mut(&w).and_then(|s| s.present.as_mut())
-                && let Some(b) = p.busy.get_mut(i - 2)
+            } else if let Some(PresentKind::Cpu { busy, .. }) = self
+                .windows
+                .get_mut(&w)
+                .and_then(|s| s.present.as_mut())
+                .map(|p| &mut p.kind)
+                && let Some(b) = busy.get_mut(i - 2)
             {
                 *b = false;
             }
@@ -2594,6 +2720,8 @@ impl State {
 
     fn try_paint(&mut self, w: Window) -> Result<(), AnyError> {
         let shm_global = self.shm.clone().expect("checked at start");
+        let feedback = self.presentation.clone();
+        let feedback_stats = self.present_stats;
         // a transient child's first frame waits for its parent's, so the
         // compositor can place it on the parent (review F4)
         if let Some(s) = self.windows.get(&w)
@@ -2708,69 +2836,133 @@ impl State {
             return Err(e.into());
         }
         let (bw, bh) = (b.width, b.height);
+        // The game's frame goes either through the CPU composition (the
+        // measured fallback) or to the compositor on a scaled subsurface.
+        let mut commit_child = false;
+        let mut commit_parent = false;
         if let Some(p) = s.present.as_mut() {
-            let game = match pread_all(&b.fd, b.frame * i, b.frame) {
-                Ok(v) => v,
-                Err(e) => {
-                    s.dirty = true;
-                    return Err(e.into());
-                }
-            };
-            let (sw, sh) = (usize::from(b.width), usize::from(b.height));
-            let (dw0, dh0) = letterbox((i32::from(b.width), i32::from(b.height)), p.monitor);
+            let (sw, sh) = (i32::from(b.width), i32::from(b.height));
+            let (dw0, dh0) = letterbox((sw, sh), p.monitor);
             p.dest = (dw0, dh0);
             p.offset = ((p.monitor.0 - dw0) / 2, (p.monitor.1 - dh0) / 2);
-            let (mw, mh) = (p.monitor.0 as usize, p.monitor.1 as usize);
-            let (dw, dh) = (p.dest.0 as usize, p.dest.1 as usize);
-            let (ox, oy) = (p.offset.0.max(0) as usize, p.offset.1.max(0) as usize);
-            // the bars are black every frame: an earlier, larger game frame
-            // must not leave its pixels there after the game resized
-            p.out.fill(0);
-            p.bars_done = true;
-            if sw > 0 && sh > 0 && dw > 0 && dh > 0 && mw > 0 && mh > 0 {
-                for dy in 0..dh.min(mh.saturating_sub(oy)) {
-                    let sy = dy * sh / dh;
-                    let src = sy * sw * 4;
-                    let dst = ((oy + dy) * mw + ox) * 4;
-                    for dx in 0..dw.min(mw.saturating_sub(ox)) {
-                        let sx = dx * sw / dw;
-                        let si = src + sx * 4;
-                        let di = dst + dx * 4;
-                        p.out[di..di + 4].copy_from_slice(&game[si..si + 4]);
-                    }
-                }
-            }
-            let Some(j) = (0..2).find(|&j| !p.busy[j]) else {
-                return Ok(()); // the compositor holds both; repaint on release
-            };
-            if let Err(e) = pwrite_all(&p.fd, p.frame * j, &p.out) {
-                s.dirty = true;
-                return Err(e.into());
-            }
-            p.busy[j] = true;
-            s.surface.attach(Some(&p.buffers[j]), 0, 0);
-            s.surface.damage_buffer(0, 0, p.monitor.0, p.monitor.1);
             if !p.painted {
                 p.painted = true;
                 crate::log!(
-                    "-showwindows: {w:#x}'s first emulated-mode frame {bw}x{bh} -> {}x{} at {},{}",
+                    "-showwindows: {w:#x}'s first emulated-mode frame {bw}x{bh} -> {}x{} at {},{} ({:.1} ms after the mode)",
                     p.dest.0,
                     p.dest.1,
                     p.offset.0,
-                    p.offset.1
+                    p.offset.1,
+                    monotonic_ns().map_or(0.0, |n| n.saturating_sub(p.enter_ns) as f64 / 1e6)
                 );
+            }
+            match &mut p.kind {
+                PresentKind::Cpu {
+                    fd,
+                    pool: _,
+                    buffers,
+                    busy,
+                    out,
+                    frame,
+                } => {
+                    let started = Instant::now();
+                    let game = match pread_all(&b.fd, b.frame * i, b.frame) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            s.dirty = true;
+                            return Err(e.into());
+                        }
+                    };
+                    let (mw, mh) = (p.monitor.0 as usize, p.monitor.1 as usize);
+                    let (dw, dh) = (p.dest.0 as usize, p.dest.1 as usize);
+                    let (ox, oy) = (p.offset.0.max(0) as usize, p.offset.1.max(0) as usize);
+                    // the bars are black every frame: an earlier, larger game
+                    // frame must not leave its pixels there after a resize
+                    out.fill(0);
+                    if sw > 0 && sh > 0 && dw > 0 && dh > 0 && mw > 0 && mh > 0 {
+                        let (usw, ush) = (sw as usize, sh as usize);
+                        for dy in 0..dh.min(mh.saturating_sub(oy)) {
+                            let sy = dy * ush / dh;
+                            let src = sy * usw * 4;
+                            let dst = ((oy + dy) * mw + ox) * 4;
+                            for dx in 0..dw.min(mw.saturating_sub(ox)) {
+                                let sx = dx * usw / dw;
+                                let si = src + sx * 4;
+                                let di = dst + dx * 4;
+                                out[di..di + 4].copy_from_slice(&game[si..si + 4]);
+                            }
+                        }
+                    }
+                    let Some(j) = (0..2).find(|&j| !busy[j]) else {
+                        return Ok(()); // the compositor holds both; repaint on release
+                    };
+                    if let Err(e) = pwrite_all(fd, *frame * j, out) {
+                        s.dirty = true;
+                        return Err(e.into());
+                    }
+                    busy[j] = true;
+                    s.surface.attach(Some(&buffers[j]), 0, 0);
+                    s.surface.damage_buffer(0, 0, p.monitor.0, p.monitor.1);
+                    p.cpu_ns = p.cpu_ns.saturating_add(started.elapsed().as_nanos() as u64);
+                    p.comp_frames += 1;
+                    if p.comp_frames % 120 == 0 {
+                        crate::log!(
+                            "-showwindows: {w:#x} CPU composition over {} frames: {:.0} us/frame ({}x{} -> {}x{})",
+                            p.comp_frames,
+                            p.cpu_ns as f64 / p.comp_frames as f64 / 1000.0,
+                            bw,
+                            bh,
+                            p.dest.0,
+                            p.dest.1
+                        );
+                    }
+                }
+                PresentKind::Gpu {
+                    child,
+                    subsurface,
+                    viewport,
+                    sync,
+                    ..
+                } => {
+                    if let Some(v) = viewport {
+                        v.set_source(0.0, 0.0, f64::from(b.width), f64::from(b.height));
+                        v.set_destination(p.dest.0, p.dest.1);
+                    }
+                    subsurface.set_position(p.offset.0, p.offset.1);
+                    child.attach(Some(&b.buffers[i]), 0, 0);
+                    child.damage_buffer(0, 0, i32::from(b.width), i32::from(b.height));
+                    commit_child = true;
+                    commit_parent = *sync;
+                }
             }
         } else {
             s.surface.attach(Some(&b.buffers[i]), 0, 0);
             s.surface
                 .damage_buffer(0, 0, i32::from(b.width), i32::from(b.height));
         }
-        if self.throttle {
+        if !commit_child && self.throttle {
             s.surface.frame(&self.qh, w);
             s.frame_pending = true;
         }
+        if commit_child {
+            // the parent is the monitor's black surface: already mapped, and
+            // in sync mode it carries the child's state for this frame
+            if commit_parent {
+                s.surface.commit();
+            }
+            if let Some(PresentKind::Gpu { child, .. }) = s.present.as_ref().map(|p| &p.kind) {
+                request_feedback(feedback.as_ref(), feedback_stats, &self.qh, w, child);
+                child.commit();
+                if self.throttle {
+                    child.frame(&self.qh, w);
+                    s.frame_pending = true;
+                }
+            }
+        } else {
+            request_feedback(feedback.as_ref(), feedback_stats, &self.qh, w, &s.surface);
+            s.surface.commit();
+        }
         s.committed_at = Some(std::time::Instant::now());
-        s.surface.commit();
         s.frames += 1;
         if s.frames == 1 {
             crate::log!("-showwindows: first frame of {w:#x} on the desktop");
@@ -2783,6 +2975,50 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// How the emulated mode presents: the compositor's scaling when it can
+    /// (wl_subcompositor + wp_viewporter), else the CPU composition. The
+    /// environment selects a variant for measurement:
+    /// `XWLBRIDGE_GAME_PRESENT=cpu|gpu|gpu-sync|gpu-async`.
+    fn present_kind(&self) -> Option<(bool, bool)> {
+        let want = std::env::var("XWLBRIDGE_GAME_PRESENT").unwrap_or_default();
+        let gpu = match want.as_str() {
+            // the default: the CPU composition is the only path measured
+            // correct on every compositor (headless and real gnome-shell,
+            // one and two heads); the compositor path is for measurement
+            "" | "cpu" => return Some((false, false)),
+            "gpu-sync" => true,
+            "gpu-async" | "gpu" => false,
+            _ => return Some((false, false)),
+        };
+        if self.subcompositor.is_some() && self.viewporter.is_some() {
+            Some((true, gpu))
+        } else if want.starts_with("gpu") {
+            None
+        } else {
+            Some((false, false))
+        }
+    }
+
+    /// The compositor's output whose logical origin is `(x, y)` (or, failing
+    /// an exact match, the one containing the point): the monitor a fullscreen
+    /// window belongs on.
+    fn output_at(&self, x: i32, y: i32) -> Option<&wl_output::WlOutput> {
+        let exact = self
+            .outputs
+            .iter()
+            .find(|o| o.proxy.is_some() && o.x == x && o.y == y);
+        let containing = || {
+            self.outputs.iter().find(|o| {
+                o.proxy.is_some()
+                    && o.x <= x
+                    && x < o.x + o.w.max(1)
+                    && o.y <= y
+                    && y < o.y + o.h.max(1)
+            })
+        };
+        exact.or_else(containing).and_then(|o| o.proxy.as_ref())
     }
 
     /// The emulated mode the agent set on `w`: monitor x, y, w, h and the
@@ -2836,8 +3072,10 @@ impl State {
     }
 
     /// Turns the emulated-mode view on, off, or updates it for `w`'s current
-    /// X size. The game's pixels are scaled into the monitor-sized parent
-    /// buffer with its aspect kept (nearest-neighbour; the bars are black).
+    /// X size. The game's pixels go either to the compositor on a subsurface
+    /// scaled by wp_viewporter (the preferred GPU path) or, as the measured
+    /// fallback, into a monitor-sized CPU-composed buffer with the aspect kept
+    /// (nearest-neighbour; the bars are black).
     fn refresh_presentation(&mut self, w: Window, qh: &QueueHandle<State>) {
         let Some((mx, my, mw, mh, _mode_w, _mode_h)) = self.emulated_mode_of(w) else {
             if self.windows.get(&w).is_some_and(|s| s.present.is_some()) {
@@ -2870,6 +3108,7 @@ impl State {
             return;
         }
         self.drop_present(w);
+        let (gpu, sync) = self.present_kind().unwrap_or((false, false));
         let Ok((fd, pool, buffers)) = self.present_parent(w, mw, mh) else {
             crate::warning!("-showwindows: can't allocate the letterbox buffer");
             return;
@@ -2881,46 +3120,126 @@ impl State {
         let (dw, dh) = letterbox((sw, sh), monitor);
         let offset = ((mw - dw) / 2, (mh - dh) / 2);
         let Some(s) = self.windows.get(&w) else {
+            for b in &buffers {
+                b.destroy();
+            }
+            pool.destroy();
             return;
         };
-        s.surface.attach(Some(&buffers[0]), 0, 0);
-        s.surface.damage_buffer(0, 0, mw, mh);
-        s.surface.commit();
-        let out = vec![0u8; (mw as usize) * (mh as usize) * 4];
-        crate::log!(
-            "-showwindows: {w:#x} shown on its emulated mode: game {sw}x{sh} in {mw}x{mh} at {dw}x{dh}+{}+{}",
-            offset.0,
-            offset.1
-        );
-        if let Some(s) = self.windows.get_mut(&w) {
-            s.present = Some(Present {
+        let toplevel = match &s.role {
+            Role::Toplevel(t) => Some(t.clone()),
+            _ => None,
+        };
+        let output = self.output_at(mx, my).cloned();
+        // On a real gnome-shell with the window-sync extension (the VM), a
+        // fullscreen game keeps the content size it had when it went
+        // fullscreen: measured on two heads, the 1024x768 game sat at its old
+        // centred position (128,16). Leave fullscreen, commit the
+        // monitor-sized parent, then enter it again on this output. Headless
+        // mutter (the container tier) has no extension and composites the
+        // plain fullscreen surface correctly: keep round 1's path there.
+        let window_synced = self.synced();
+        if let Some(t) = &toplevel
+            && !gpu
+            && window_synced
+        {
+            t.unset_fullscreen();
+        }
+        let parent = s.surface.clone();
+        let kind = if gpu {
+            let Some(compositor) = self.compositor.as_ref() else {
+                return;
+            };
+            let Some(subcompositor) = self.subcompositor.as_ref() else {
+                return;
+            };
+            let child = compositor.create_surface(qh, w);
+            let subsurface = subcompositor.get_subsurface(&child, &parent, qh, ());
+            if sync {
+                subsurface.set_sync();
+            } else {
+                subsurface.set_desync();
+            }
+            subsurface.set_position(offset.0, offset.1);
+            let viewport = self
+                .viewporter
+                .as_ref()
+                .map(|v| v.get_viewport(&child, qh, ()));
+            if let Some(v) = &viewport {
+                v.set_source(0.0, 0.0, f64::from(sw), f64::from(sh));
+                v.set_destination(dw, dh);
+            }
+            // the parent is the monitor: one black frame, then the child
+            // carries every game frame
+            parent.attach(Some(&buffers[0]), 0, 0);
+            parent.damage_buffer(0, 0, mw, mh);
+            parent.commit();
+            child.commit();
+            PresentKind::Gpu {
+                fd,
+                pool,
+                buffers,
+                child,
+                subsurface,
+                viewport,
+                sync,
+            }
+        } else {
+            parent.attach(Some(&buffers[0]), 0, 0);
+            parent.damage_buffer(0, 0, mw, mh);
+            parent.commit();
+            PresentKind::Cpu {
                 fd,
                 pool,
                 buffers,
                 busy: [true, false], // buffer 0 is attached now
+                out: vec![0u8; (mw as usize) * (mh as usize) * 4],
+                frame: (mw as usize) * (mh as usize) * 4,
+            }
+        };
+        if let Some(t) = &toplevel
+            && let Some(o) = output.as_ref()
+        {
+            if !gpu && window_synced {
+                t.set_fullscreen(Some(o));
+            }
+            crate::log!("-showwindows: {w:#x} fullscreen on the output at {mx},{my}");
+        }
+        crate::log!(
+            "-showwindows: {w:#x} shown on its emulated mode: game {sw}x{sh} in {mw}x{mh} at {dw}x{dh}+{}+{} ({})",
+            offset.0,
+            offset.1,
+            if gpu {
+                if sync {
+                    "compositor scaling, sync subsurface"
+                } else {
+                    "compositor scaling, desync subsurface"
+                }
+            } else {
+                "CPU composition"
+            }
+        );
+        if let Some(s) = self.windows.get_mut(&w) {
+            s.present = Some(Present {
                 monitor,
                 dest: (dw, dh),
                 offset,
-                out,
-                frame: (mw as usize) * (mh as usize) * 4,
-                bars_done: false,
                 painted: false,
+                enter_ns: monotonic_ns().unwrap_or(0),
+                cpu_ns: 0,
+                comp_frames: 0,
+                kind,
             });
             s.dirty = true;
         }
-        let _ = (mx, my, qh);
         self.paint(w);
     }
 
     /// Removes the emulated-mode view (leave case or a window going away).
     fn drop_present(&mut self, w: Window) {
-        let Some(p) = self.windows.get_mut(&w).and_then(|s| s.present.take()) else {
-            return;
-        };
-        for b in &p.buffers {
-            b.destroy();
+        if let Some(p) = self.windows.get_mut(&w).and_then(|s| s.present.take()) {
+            destroy_present(p);
         }
-        p.pool.destroy();
     }
 
     fn close_window(&mut self, w: Window) {
@@ -5253,6 +5572,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.relative_manager = Some(registry.bind(name, 1, qh, ()))
                 }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
+                "wl_output" => {
+                    let idx = state.outputs.len();
+                    let proxy = registry.bind(name, version.min(4), qh, idx);
+                    state.outputs.push(Output {
+                        proxy: Some(proxy),
+                        ..Output::default()
+                    });
+                }
+                "wp_presentation" => {
+                    state.presentation = Some(registry.bind(name, version.min(2), qh, ()))
+                }
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
                 "xdg_toplevel_tag_manager_v1" => state.tags = Some(registry.bind(name, 1, qh, ())),
                 "zwp_tablet_manager_v2" => {
@@ -5843,6 +6173,99 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for State {
 wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
+impl Dispatch<wl_output::WlOutput, usize> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        idx: &usize,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(out) = state.outputs.get_mut(*idx) else {
+            return;
+        };
+        match event {
+            wl_output::Event::Geometry { x, y, .. } => {
+                out.x = x;
+                out.y = y;
+            }
+            wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                ..
+            } => {
+                if let WEnum::Value(flags) = flags
+                    && flags.contains(wl_output::Mode::Current)
+                {
+                    out.w = width;
+                    out.h = height;
+                }
+            }
+            wl_output::Event::Name { name } => out.name = name,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event
+            && clk_id != libc::CLOCK_MONOTONIC as u32
+        {
+            crate::warning!("-showwindows: presentation clock {clk_id} is not CLOCK_MONOTONIC");
+        }
+        let _ = state;
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, FeedbackMark> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        mark: &FeedbackMark,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation_feedback::Event::Presented {
+            tv_sec_hi,
+            tv_sec_lo,
+            tv_nsec,
+            ..
+        } = event
+        {
+            let at = (u64::from(tv_sec_hi) << 32 | u64::from(tv_sec_lo))
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::from(tv_nsec));
+            let lat = at.saturating_sub(mark.at_ns);
+            let samples = state.present_latency.entry(mark.window).or_default();
+            samples.push(lat);
+            if samples.len() >= 120 {
+                samples.sort_unstable();
+                let n = samples.len();
+                let p50 = samples[n / 2] / 1000;
+                let p95 = samples[(n * 95 / 100).min(n - 1)] / 1000;
+                crate::log!(
+                    "-showwindows: {:#x} commit-to-presentation over {n} frames: p50 {p50} us, p95 {p95} us, min {} us, max {} us",
+                    mark.window,
+                    samples[0] / 1000,
+                    samples[n - 1] / 1000
+                );
+                samples.clear();
+            }
+        }
+    }
+}
+
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
 wayland_client::delegate_noop!(State: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);

@@ -3535,7 +3535,13 @@ impl Agent {
             let (rx, ry) = (i64::from(rect.0), i64::from(rect.1));
             let (rx2, ry2) = (rx + i64::from(rect.2), ry + i64::from(rect.3));
             let overlap = (x2.min(rx2) - x.max(rx)).max(0) * (y2.min(ry2) - y.max(ry)).max(0);
-            if overlap * 2 >= i64::from(rect.2) * i64::from(rect.3) {
+            // A fullscreen game often keeps its small mode-sized X window
+            // (1024x768 on a 1920x1080 monitor is under half the monitor's
+            // area): a fullscreen window whose centre is on the monitor is
+            // on that monitor too.
+            let (cx, cy) = ((x + x2) / 2, (y + y2) / 2);
+            let centred = cx >= rx && cx < rx2 && cy >= ry && cy < ry2;
+            if overlap * 2 >= i64::from(rect.2) * i64::from(rect.3) || centred {
                 return Some(w);
             }
         }
