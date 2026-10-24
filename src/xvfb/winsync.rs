@@ -726,17 +726,23 @@ pub fn inner_size(w: i32, h: i32, border: u16) -> (u32, u32) {
 }
 
 /// What the X window should be told of the desktop's rectangle `desk`: its
-/// position, with X's own size `x`. A shown window's size on the desktop is
-/// the size of the buffer the bridge committed last, so a desktop report can
-/// only lag X's size, never lead it: the desktop's own resizes (the user's,
-/// tiling, maximise) come as the toplevel's configure, which resizes the X
-/// window, and a clamped size comes back in the MoveResize reply. Taking the
-/// reported size would shrink a window that just grew itself back to the
-/// size of its last frame.
-pub fn desktop_position(desk: Rect, x: Rect) -> Rect {
+/// position, with X's own size `x` **in the desktop's space**. A shown
+/// window's size on the desktop is the size of the buffer the bridge
+/// committed last, so a desktop report can only lag X's size, never lead it:
+/// the desktop's own resizes (the user's, tiling, maximise) come as the
+/// toplevel's configure, which resizes the X window, and a clamped size comes
+/// back in the MoveResize reply. Taking the reported size would shrink a
+/// window that just grew itself back to the size of its last frame.
+///
+/// `desk` is logical and `x` is X pixels: the size is converted through
+/// `space` here, once, or a desktop report at S != 1 would make the X window
+/// S times too big (the size was already X pixels, and `Geometry` multiplies
+/// the whole rectangle by S again).
+pub fn desktop_position(desk: Rect, x: Rect, space: Space) -> Rect {
+    let xd = space.to_desk(x);
     Rect {
-        w: x.w,
-        h: x.h,
+        w: xd.w,
+        h: xd.h,
         ..desk
     }
 }
@@ -2914,7 +2920,10 @@ mod tests {
         // frame (400x300) at a new position: X keeps its size
         let x = Rect::new(100, 100, 500, 400);
         let desk = Rect::new(150, 120, 400, 300);
-        assert_eq!(desktop_position(desk, x), Rect::new(150, 120, 500, 400));
+        assert_eq!(
+            desktop_position(desk, x, Space::new(1)),
+            Rect::new(150, 120, 500, 400)
+        );
         // fed to Geometry, the stale size does not shrink X back
         let mut g = synced(Rect::new(100, 100, 400, 300));
         let t = t0();
@@ -2926,7 +2935,7 @@ mod tests {
         assert_eq!(
             g.changed(
                 XID,
-                desktop_position(stale, g.x_rect(XID).unwrap()),
+                desktop_position(stale, g.x_rect(XID).unwrap(), Space::new(1)),
                 0,
                 11,
                 t
@@ -2935,6 +2944,28 @@ mod tests {
             "the frame before the new buffer is no desktop resize"
         );
         assert_eq!(g.x_rect(XID), Some(x));
+    }
+
+    #[test]
+    fn desktop_reports_carry_the_logical_size_at_s() {
+        // a 600x400 X window at S = 2 is 300x200 on the desktop: a reported
+        // logical 300x200 must stay 600x400 X, not become 1200x800
+        let x = Rect::new(0, 0, 600, 400);
+        let desk = Rect::new(363, 216, 300, 200);
+        assert_eq!(
+            desktop_position(desk, x, Space::new(2)),
+            Rect::new(363, 216, 300, 200)
+        );
+        // a stale logical frame (250x150) does not shrink the X size either
+        assert_eq!(
+            desktop_position(Rect::new(363, 216, 250, 150), x, Space::new(2)),
+            Rect::new(363, 216, 300, 200)
+        );
+        // rounding once: an odd X size
+        assert_eq!(
+            desktop_position(desk, Rect::new(0, 0, 601, 401), Space::new(2)),
+            Rect::new(363, 216, 301, 201)
+        );
     }
 
     #[test]

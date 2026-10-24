@@ -4147,7 +4147,7 @@ impl State {
                     return;
                 };
                 let fresh = sync.geo.is_fresh(xid, wire);
-                let rect = winsync::desktop_position(rect, x);
+                let rect = winsync::desktop_position(rect, x, sync.geo.space());
                 let back = sync.geo.changed(xid, rect, flags, wire, Instant::now());
                 // the user's Always on Top on the desktop is the window's
                 // keep-above (_NET_WM_STATE_ABOVE), so a retell repeats it
@@ -4178,7 +4178,7 @@ impl State {
                     let Some(x) = sync.geo.x_rect(ws.xid) else {
                         continue;
                     };
-                    let rect = winsync::desktop_position(ws.rect, x);
+                    let rect = winsync::desktop_position(ws.rect, x, sync.geo.space());
                     let back = sync.geo.resync(ws.xid, rect, ws.flags, wire);
                     self.set_origin(ws.xid);
                     if let Some(r) = back {

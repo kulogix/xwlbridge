@@ -39,7 +39,23 @@ the 0.1.2/0.2.0 behaviour, in which one X pixel is one GNOME logical pixel.
   lines are preserved). Qt and Xft toolkits read it; Java reads
   `gnome.Xft/DPI`/`gnome.Gdk/WindowScalingFactor` from XSETTINGS.
 
-GTK 3/4, Qt 5/6 and Java therefore render their UI at the right physical size.
+Toolkits that read these settings scale their UI; two caveats measured in the
+2x VM (`research/release/p5_hidpi.md`, round 2):
+
+- Qt 5 does not scale window geometry from Xft.dpi by default (it reports
+  `devicePixelRatio=1` and a 300x200 X window on a 2x monitor, exactly as it
+  does on GNOME's own Xwayland); Qt 6 reports `dpr=2`. Qt 5 needs
+  `QT_AUTO_SCREEN_SCALE_FACTOR=1`/`QT_SCALE_FACTOR` if the app wants its
+  geometry scaled.
+- Java's AWT/Swing on this VM stayed at `screen_resolution=96`,
+  `sun.java2d.uiScale=null` and a 300x200 request became a 150x100 X window;
+  `-Dsun.java2d.uiScale=2` makes it 300x200 X (still half of GTK's Xwayland
+  control in the same acceptance). The bridge does not publish
+  `gnome.Xft/DPI`, which some JDKs read.
+- GTK 3/4 and Qt 6 reported scale 2 on the bridge, but their first 300x200
+  window ended at half the Xwayland control's logical size; the open geometry
+  bug is in `research/release/p5_hidpi.md` (round 2).
+
 Wine keeps its own DPI (its registry's `logpixels`, or `WINEDEBUG`/`winecfg`);
 Electron/Chromium follow GTK's XSETTINGS. Toolkits that ignore both XSETTINGS
 and Xft.dpi keep rendering at 96 dpi.
@@ -50,6 +66,28 @@ One X screen has one S. On a 1x + 2x desktop S is 2, so the 1x monitor's X
 windows are rendered at 2x and downscaled to 1x (slightly soft), while the 2x
 monitor is native. This is the same trade-off Xwayland makes; a window moved
 between the monitors keeps its X pixels and is resampled by the compositor.
+
+## Measured in the 2x VM (2026-10-24)
+
+`dsh-p2mon`, Virtual-1 1920x1200 at 2x + Virtual-2 1280x800 at 1x, GNOME 50.1;
+a 300x200 window requested by the toolkit (its own `get_scale_factor`/`dpr`
+and `xwininfo`; a parallel run on GNOME's Xwayland `:0` at the same scale is
+the control):
+
+| toolkit | bridge `:20`, 2x | Xwayland `:0`, 2x |
+|---|---|---|
+| GTK 3 | scale 2, allocation 150x100, X 300x200 | scale 2, allocation 300x200, X 600x400 |
+| GTK 4 | scale 2, allocation 150x100, X 300x200 | scale 2, allocation 300x200, X 600x400 |
+| Qt 6 | dpr 2, X 300x200 | dpr 2, X 600x400 |
+| Qt 5 | dpr 1, logical DPI 192, X 300x200 | dpr 1, logical DPI 192, X 300x200 |
+| Java | `screen_resolution=96`, `uiScale=null`, X 150x100 | — |
+| xterm | Xft font 29.33 px at 2x (14.67 at 1x) | — |
+
+The geometries of real GTK apps were also affected: `gnome-calculator` was
+820x1332 X on `:0` and 370x616 X on `:20`. The `desktop_position` fix in the
+round-2 commit request removes the 2x-too-large oscillation (GIMP's toolbox
+went from 2520x1376 X to a sane 432x1120 X in the 2x cell), but the remaining
+half-size/window-sync findings above are open.
 
 ## Opting out
 
