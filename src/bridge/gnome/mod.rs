@@ -42,6 +42,7 @@ mod display;
 mod eis;
 mod keymap;
 mod outbox;
+mod primary;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -339,6 +340,8 @@ struct Backend {
     fps: Option<u32>,
     baked_cursor: bool,
     monitors: Vec<Monitor>,
+    /// Which monitor GNOME's primary one is, from mutter's (stale) flags.
+    primary: primary::PrimaryModel,
     /// Connector name -> output key, stable across sessions and layout changes
     /// so RandR output ids don't churn.
     keys: HashMap<String, u32>,
@@ -560,6 +563,7 @@ impl Backend {
             signals,
             wake,
             monitors: Vec::new(),
+            primary: primary::PrimaryModel::new(),
             keys: HashMap::new(),
             next_key: FIRST_KEY,
             keymap_watch: None,
@@ -1711,7 +1715,18 @@ impl Backend {
     /// Re-reads mutter's layout into the RandR model. `Ok` whether the
     /// layout changed.
     fn refresh_outputs(&mut self, notify: bool) -> Result<bool, zbus::Error> {
-        let (monitors, colour) = dbus::display_state_detailed(&self.conn)?;
+        let (mut monitors, colour) = dbus::display_state_detailed(&self.conn)?;
+        // mutter 50.1 leaves the old primary flagged after a change: what it
+        // flags is a candidate, which one is primary is worked out
+        let flags: Vec<(&str, bool)> = monitors
+            .iter()
+            .map(|m| (m.connector.as_str(), m.primary))
+            .collect();
+        let mut src = ShellPrimary(&self.conn);
+        let primary = self.primary.update(&flags, &mut src);
+        for (i, m) in monitors.iter_mut().enumerate() {
+            m.primary = primary == Some(i);
+        }
         let changed = monitors != self.monitors || colour != self.colour;
         if changed {
             for m in &monitors {
@@ -1909,6 +1924,19 @@ impl Backend {
         if let Some(kind) = self.placeholder {
             placeholder::paint(&self.server, kind);
         }
+    }
+}
+
+/// GNOME Shell's own view of the monitors, for [`primary::PrimaryModel`].
+struct ShellPrimary<'a>(&'a Connection);
+
+impl primary::PrimarySource for ShellPrimary<'_> {
+    fn shell_primary(&mut self) -> Option<usize> {
+        dbus::shell_primary(self.0)
+    }
+
+    fn log(&mut self, msg: &str) {
+        crate::warning!("{msg}");
     }
 }
 

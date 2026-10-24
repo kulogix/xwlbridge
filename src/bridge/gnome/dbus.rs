@@ -127,6 +127,33 @@ pub fn extension_state(conn: &Connection, uuid: &str) -> Option<u32> {
         .map(|v| v as u32)
 }
 
+/// The `xwlbridge-windows` shell extension (`contrib/gnome-shell/`): its
+/// `GetMonitors` is GNOME Shell's own view of the monitors, primary flag
+/// included, and answers anyone.
+const WINDOWS_BUS_NAME: &str = "org.xwlbridge.Windows";
+const WINDOWS_PATH: &str = "/org/xwlbridge/Windows";
+const WINDOWS_IFACE: &str = "org.xwlbridge.Windows1";
+
+/// One monitor of `GetMonitors`: its index and GNOME Shell's `primary` flag.
+type ShellMonitor = (i32, ((i32, i32, i32, i32), (i32, i32, i32, i32), f64, bool));
+
+/// The primary monitor according to GNOME Shell itself (the
+/// `xwlbridge-windows` extension), or `None` if the extension is not there
+/// or does not answer: it tells apart what mutter's stale primary flags
+/// cannot (see [`super::primary`]).
+pub fn shell_primary(conn: &Connection) -> Option<usize> {
+    let p = Proxy::new(conn, WINDOWS_BUS_NAME, WINDOWS_PATH, WINDOWS_IFACE).ok()?;
+    let monitors: Vec<ShellMonitor> = p
+        .call("GetMonitors", &())
+        .map_err(|e| crate::vlog!("gnome: GetMonitors: {e}"))
+        .ok()?;
+    let mut primaries = monitors.iter().filter(|(_, m)| m.3).map(|(i, _)| *i);
+    match (primaries.next(), primaries.next()) {
+        (Some(one), None) => usize::try_from(one).ok(),
+        _ => None,
+    }
+}
+
 /// What the X screen does not depend on: the monitor's colour state and its
 /// RGB range (`color-mode`, `rgb-range`), as `GetCurrentState` gives them.
 pub(super) type ColourState = Vec<(String, Option<i32>, Option<i32>)>;
