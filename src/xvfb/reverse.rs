@@ -205,6 +205,50 @@ fn p1_main(candidates: &[(Window, bool, bool, u64)]) -> Option<Window> {
     candidates.iter().min_by_key(key).map(|c| c.0)
 }
 
+/// P2: the most times P2 moves a window back on the X screen before its
+/// client is left to have the last word (until the window is shown again).
+const P2_MOVES: u8 = 3;
+
+/// P2's one per-axis rule, which `fit` follows for the side that does not
+/// fit: where a `size`-long side of a window at `at` on an `axis`-long
+/// screen goes so that the window lies on the screen, moving it the least
+/// that does; `None` if it already lies on it, or cannot (a side longer
+/// than the screen keeps the origin it had, off the screen end, so that a
+/// later shrink back can be followed). An axis of `None` never needs a move.
+fn p2_axis(at: i32, size: i32, axis: i32) -> Option<i32> {
+    if at >= 0 && at.saturating_add(size) <= axis {
+        return None;
+    }
+    Some(if size <= axis {
+        at.clamp(0, axis - size)
+    } else {
+        at.clamp(axis - size, 0)
+    })
+}
+
+/// P2: where a window at `(x, y)` of `w`x`h` goes so that it lies wholly on
+/// the `screen`: `None` if it does.
+fn p2_fit(pos: (i32, i32), size: (i32, i32), screen: (i32, i32)) -> Option<(i32, i32)> {
+    let (x, y) = pos;
+    let (w, h) = size;
+    match (p2_axis(x, w, screen.0), p2_axis(y, h, screen.1)) {
+        (None, None) => None,
+        (ax, ay) => Some((ax.unwrap_or(x), ay.unwrap_or(y))),
+    }
+}
+
+/// A shown toplevel's frame: its outer position and size.
+type Frame = (Window, (i32, i32), (i32, i32));
+
+/// P2 and `fit_windows`: where each window of `frames` goes so that it lies
+/// on the `screen` (`p2_fit`): the windows that are off it, and where.
+fn off_screen(frames: &[Frame], screen: (i32, i32)) -> Vec<(Window, i32, i32)> {
+    frames
+        .iter()
+        .filter_map(|(w, pos, size)| p2_fit(*pos, *size, screen).map(|(x, y)| (*w, x, y)))
+        .collect()
+}
+
 /// The bytes of one frame of `w`x`h` pixels, if a window that size may be
 /// shown at all.
 fn frame_bytes(w: u16, h: u16) -> Option<usize> {
@@ -654,6 +698,8 @@ struct Shown {
     /// to its client's main window, and waits for one to be shown.
     p1_grouped: bool,
     p1_waiting: bool,
+    /// P2: how many times P2 moved the window back on the X screen.
+    p2_moves: u8,
 }
 
 /// `-showscreen`: a window of the X screen, composited onto the canvas.
@@ -972,6 +1018,9 @@ struct State {
     /// The shown window under the desktop's pointer / with keyboard focus.
     pointer_on: Option<Window>,
     keyboard_on: Option<Window>,
+    /// P2: the shown toplevels whose geometry changed, whose place on the X
+    /// screen is checked before the next wait for events.
+    on_screen: Vec<Window>,
     /// The last X window the reverse keyboard was focused on.
     x_focus: Option<Window>,
     /// The desktop took the keyboard from our windows (wl_keyboard.leave)
@@ -1162,6 +1211,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         canvas: None,
         pointer_on: None,
         keyboard_on: None,
+        on_screen: Vec::new(),
         x_focus: None,
         keyboard_left: false,
         enter_serial: 0,
@@ -1625,6 +1675,7 @@ impl State {
             fullscreen: false,
             p1_grouped: grouped,
             p1_waiting: waiting,
+            p2_moves: 0,
         };
         if let Some(sync) = self.sync.as_mut() {
             let r = Rect::new(
@@ -1911,6 +1962,7 @@ impl State {
                 fullscreen: false,
                 p1_grouped: false,
                 p1_waiting: false,
+                p2_moves: 0,
             },
         );
         self.popups.push(w);
@@ -2100,6 +2152,13 @@ impl State {
                     (e.x, e.y)
                 };
                 let synced = self.synced_toplevel(e.window);
+                let toplevel = self
+                    .windows
+                    .get(&e.window)
+                    .is_some_and(|s| matches!(s.role, Role::Toplevel(_)));
+                if toplevel {
+                    self.on_screen.push(e.window);
+                }
                 let desk = self.sync.as_ref().and_then(|sync| sync.geo.desk(e.window));
                 let mut restacked = false;
                 if let Some(s) = self.windows.get_mut(&e.window) {
@@ -2320,6 +2379,9 @@ impl State {
         for (dx, dy) in std::mem::take(&mut self.relative) {
             self.relative_motion(dx, dy);
         }
+        // after the last drain of X events: a window that moved or grew off
+        // the X screen goes back on it (P2)
+        self.keep_on_screen();
         let dirty: Vec<Window> = self
             .windows
             .iter()
@@ -3483,6 +3545,59 @@ impl State {
         }
     }
 
+    /// P2: the shown toplevels whose geometry changed since the last call
+    /// lie wholly on the X screen: one moved or grown past its edge is moved
+    /// back by the least that does it (`p2_fit`), as `fit` does for a window
+    /// that is shown. The X screen's own bounds are all P2 knows (not the
+    /// desktop's work area). A window the window sync keeps on the screen
+    /// is the sync's; so is one whose client keeps putting it back
+    /// (`P2_MOVES` times, until it is shown again).
+    fn keep_on_screen(&mut self) {
+        let mut seen: Vec<Window> = std::mem::take(&mut self.on_screen);
+        seen.sort_unstable();
+        seen.dedup();
+        for w in seen {
+            if !self.synced_toplevel(w) {
+                self.put_back(w);
+            }
+        }
+    }
+
+    /// P2: moves shown toplevel `w` back on the X screen if it is off it.
+    fn put_back(&mut self, w: Window) {
+        let (sw, sh) = (i32::from(self.screen.0), i32::from(self.screen.1));
+        match self.windows.get(&w) {
+            Some(s) if matches!(s.role, Role::Toplevel(_)) && s.p2_moves < P2_MOVES => {}
+            _ => return,
+        }
+        let Ok(g) = self
+            .x
+            .get_geometry(w)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .ok_or(())
+        else {
+            return;
+        };
+        let b = i32::from(g.border_width);
+        let (x, y) = (i32::from(g.x), i32::from(g.y));
+        let size = (i32::from(g.width) + 2 * b, i32::from(g.height) + 2 * b);
+        let Some((nx, ny)) = p2_fit((x, y), size, (sw, sh)) else {
+            return;
+        };
+        if let Some(s) = self.windows.get_mut(&w) {
+            s.p2_moves += 1;
+        }
+        crate::log!(
+            "-showwindows: {w:#x} at {x},{y} {}x{} reaches past the {sw}x{sh} X screen: moved to {nx},{ny}",
+            size.0,
+            size.1
+        );
+        let _ = self
+            .x
+            .configure_window(w, &ConfigureWindowAux::new().x(nx).y(ny));
+    }
+
     /// Configures X window `w` to `r` for the desktop (its move, a clamp, a
     /// resync), sends the synthetic ConfigureNotify an X window manager
     /// sends (ICCCM 4.1.5), and tells the sync it was ours.
@@ -3885,21 +4000,23 @@ impl State {
             // the desktop's layout is followed, and with it the windows
             return;
         }
+        let frames: Vec<Frame> = self
+            .windows
+            .iter()
+            .filter(|(_, s)| matches!(s.role, Role::Toplevel(_)))
+            .map(|(w, s)| {
+                let size = (i32::from(s.width), i32::from(s.height));
+                (*w, (i32::from(s.x), i32::from(s.y)), size)
+            })
+            .collect();
         let (sw, sh) = (i32::from(self.screen.0), i32::from(self.screen.1));
-        let fits = |s: &&Shown| (fit(s.x, s.width, sw), fit(s.y, s.height, sh)) == (s.x, s.y);
-        for (w, s) in self.windows.iter().filter(|(_, s)| !fits(s)) {
-            let (x, y) = (fit(s.x, s.width, sw), fit(s.y, s.height, sh));
+        for (w, x, y) in off_screen(&frames, (sw, sh)) {
             crate::vlog!(
-                "-showwindows: {w:#x} at {}+{} is outside the {}x{} X screen: moved to {x}+{y}",
-                s.x,
-                s.y,
-                self.screen.0,
-                self.screen.1
+                "-showwindows: {w:#x} is outside the {sw}x{sh} X screen: moved to {x}+{y}"
             );
-            let _ = self.x.configure_window(
-                *w,
-                &ConfigureWindowAux::new().x(i32::from(x)).y(i32::from(y)),
-            );
+            let _ = self
+                .x
+                .configure_window(w, &ConfigureWindowAux::new().x(x).y(y));
         }
     }
 
@@ -4431,6 +4548,7 @@ impl State {
                 fullscreen: false,
                 p1_grouped: false,
                 p1_waiting: false,
+                p2_moves: 0,
             },
         );
         Ok(())
@@ -6086,6 +6204,49 @@ mod tests {
     }
 
     #[test]
+    fn p2_a_window_that_fits_stays_where_it_is() {
+        assert_eq!(p2_axis(100, 400, 1280), None);
+        assert_eq!(p2_axis(0, 1280, 1280), None);
+        assert_eq!(p2_axis(880, 400, 1280), None);
+        assert_eq!(p2_axis(31, 1, 1280), None);
+        assert_eq!(p2_fit((10, 10), (400, 400), (1280, 720)), None);
+    }
+
+    #[test]
+    fn p2_a_window_past_the_edge_comes_back_the_least() {
+        // past the right and bottom edges
+        assert_eq!(p2_axis(1287, 400, 1280), Some(880));
+        assert_eq!(p2_axis(214, 1280, 1280), Some(0));
+        assert_eq!(p2_axis(-30, 400, 1280), Some(0));
+        // a side longer than the screen keeps its origin (up to the screen's)
+        assert_eq!(p2_axis(100, 2000, 1280), Some(0));
+        assert_eq!(p2_axis(-100, 2000, 1280), Some(-100));
+        // one axis at a time: a window too tall still moves back in x
+        assert_eq!(p2_fit((900, 30), (400, 2000), (1280, 720)), Some((880, 0)));
+        // and both, when both are out
+        assert_eq!(p2_fit((900, 400), (400, 700), (1280, 720)), Some((880, 20)));
+        assert_eq!(p2_fit((0, 0), (400, 400), (1280, 720)), None);
+    }
+
+    #[test]
+    fn p2_fit_windows_moves_what_the_screen_leaves_out() {
+        // (window, position, size): one fits, one hangs over the right and
+        // bottom edges, one is taller than the screen
+        let frames = [
+            (1, (0, 0), (100, 100)),
+            (2, (1000, 400), (400, 400)),
+            (3, (0, 0), (1280, 800)),
+        ];
+        assert_eq!(
+            off_screen(&frames, (1280, 720)),
+            vec![(2, 880, 320), (3, 0, 0)]
+        );
+        // a shrunk screen: the rest of the window that fits moves in
+        // (the one taller than the screen keeps its origin)
+        assert_eq!(off_screen(&frames[..2], (1024, 768)), vec![(2, 624, 368)]);
+    }
+
+    #[test]
     fn p1_panels_toolbars_dialogs_and_menus_belong_to_a_main_window() {
         let t = |v: &[u32], modal| p1_groups(v, &[8, 9, 10, 11], modal);
         assert!(t(&[8], false));
@@ -6122,6 +6283,35 @@ mod tests {
             p1_main(&[(9, true, false, 100), (7, true, false, 100)]),
             Some(7)
         );
+    }
+
+    #[test]
+    fn the_x_screens_fit_and_p2_are_one_rule() {
+        // `fit` (a window shown, which also centres a side longer than the
+        // screen) and p2_axis (a window that moved or grew: back on the
+        // screen by the least that does it) agree on every side that fits:
+        // what fits stays, and what does not goes to the same edge
+        for at in [-50i32, -1, 0, 31, 639, 640, 700, 1279, 1280, 2000] {
+            for len in [1u16, 100, 720, 1280] {
+                let fitted = i32::from(fit(at as i16, len, 1280));
+                // a window wholly on the screen stays there
+                assert_eq!(fitted == at, at >= 0 && at + i32::from(len) <= 1280);
+                match p2_axis(at, i32::from(len), 1280) {
+                    None => assert_eq!(fitted, at, "x={at} w={len} fits"),
+                    Some(x) => assert_eq!(x, fitted, "x={at} w={len}"),
+                }
+            }
+            // wider than the screen: out of the right edge, or the left one
+            for len in [1281u16, 2000] {
+                let left = 1280 - i32::from(len);
+                let back = if at < 0 {
+                    at.max(left)
+                } else {
+                    at.min(0).max(left)
+                };
+                assert_eq!(p2_axis(at, len.into(), 1280), Some(back));
+            }
+        }
     }
 
     #[test]
