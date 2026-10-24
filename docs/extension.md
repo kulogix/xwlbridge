@@ -110,7 +110,7 @@ The bridge accepts the name `org.xwlbridge.Windows` only from gnome-shell's own 
 - **No focus stealing.** `Activate` needs the timestamp of the input it follows (0 is refused) and focuses the
   window only while the keyboard is on no window or on one of the caller's own; otherwise the window demands
   attention. A timestamp alone would not do: compositor time is the monotonic clock in ms, easy to make up.
-- **Nothing else.** `Version`, `Features` and `GetMonitors` answer anyone: they carry nothing private (the
+- **Nothing else.** `Version`, `Features`, `GetMonitors` and `GetPointer` answer anyone: they carry nothing private (the
   monitor layout is public through GNOME's own D-Bus APIs). Arguments are range-checked; at most 64 callers
   are remembered (4 per process; a process crowds out only its own) and 256 waiting initial positions (64 per
   process; each expires after 60 s).
@@ -127,7 +127,7 @@ rectangle.
 | method | |
 |---|---|
 | `Version() -> u` | API version: 1 |
-| `Features() -> as` | `move-resize`, `clamp-work-area`, `initial-position`, `activate`, `raise`, `above`, `demands-attention`, `stick`, `workspace`, `minimize`, `state`, `monitors`, `restacked`; empty on a mutter without window tags |
+| `Features() -> as` | `move-resize`, `clamp-work-area`, `initial-position`, `activate`, `raise`, `above`, `demands-attention`, `stick`, `workspace`, `minimize`, `state`, `monitors`, `restacked`, `pointer`; empty on a mutter without window tags |
 | `MoveResize(s tag, i x, i y, i w, i h, u flags) -> (iiii)` | Moves and resizes. `w` or `h` 0 keeps the size. Flags: 1 = clamp into the work area of the monitor the rectangle is (mostly) on (shrinking it to fit; a rectangle that is exactly a monitor is left alone), 2 = user-initiated (mutter's user-action constraints). Returns the rectangle applied: a move is applied at once and the reply is mutter's result; a new size waits for the app to draw it, so the reply is the rectangle asked for after the clamp, and `Changed` carries the final one. A maximized or fullscreen window is not changed; the reply is its rectangle. |
 | `SetInitialPosition(s tag, i x, i y)` | Where the window opens. Before the window exists it waits (up to 60 s) and is applied when GNOME first shows it, after GNOME's own placement and before the first frame is drawn, so the window appears there without a jump. For a window already shown, it moves it now. |
 | `Activate(s tag, u timestamp)` | Raises, focuses and switches to the window's workspace, if the keyboard is on no window or on one of the caller's; otherwise the window demands attention. `timestamp` is compositor time in ms (the time of the input event that led to it, e.g. a `wl_pointer`/`wl_keyboard` event); 0 is refused (`InvalidArgs`). GNOME's focus-stealing prevention applies to old timestamps. |
@@ -139,6 +139,7 @@ rectangle.
 | `Minimize(s tag, b)` | Minimize / restore. |
 | `GetState() -> a(sa{sv})` | The caller's tagged windows, bottom to top: tag and `rect (iiii)`, `monitor i`, `workspace i` (-1 = all), `minimized b`, `maximized b`, `fullscreen b`, `above b`, `focused b`, `user b` (a user grab is active), `shown b`, `stack u` (0 = bottom), `flags u` and `serial u` (as in `Changed`). |
 | `GetMonitors() -> a(i(iiii)(iiii)db)` | Per monitor: index, geometry, work area (without panels), scale, primary. |
+| `GetPointer() -> (iib)` | The pointer's position and whether a button is held (`Features` lists `pointer`). The session's status icons use it to open an X app's own menu where the menu was clicked. |
 
 | signal | |
 |---|---|

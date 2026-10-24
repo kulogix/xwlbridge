@@ -23,7 +23,7 @@
 // - Activate focuses the window only while the keyboard is on none of the other apps' windows (no focus, or a
 //   window of the caller's process); otherwise the window demands attention. A timestamp of 0 is refused.
 // - Signals about windows are sent to the owning process's bus names only (unicast), not broadcast.
-// - Version, Features and GetMonitors carry nothing private and answer anyone. Per-process caps keep one
+// - Version, Features, GetMonitors and GetPointer carry nothing private and answer anyone. Per-process caps keep one
 //   process from crowding out another's subscriptions or initial positions.
 // Lock screen: gnome-shell disables extensions in its unlock-dialog mode, so the service goes away while the
 // screen is locked and comes back at unlock; the bridge watches the name and resyncs with GetState.
@@ -70,6 +70,9 @@ const PENDING_TTL_US = 60 * GLib.USEC_PER_SEC;
 const FEATURES = [
     'move-resize', 'clamp-work-area', 'initial-position', 'activate', 'raise', 'above', 'demands-attention',
     'stick', 'workspace', 'minimize', 'state', 'monitors', 'restacked', 'work-area',
+    // a feature is advertised only once its method exists: callers ask Features first (GetPointer: the
+    // pointer's position, which the session's status icon menu needs to place its icon's own menu)
+    'pointer',
 ];
 
 const IFACE_XML = `
@@ -130,6 +133,9 @@ const IFACE_XML = `
     </method>
     <method name="GetWorkArea">
       <arg type="(iiii)" name="workArea" direction="out"/>
+    </method>
+    <method name="GetPointer">
+      <arg type="(iib)" name="pointer" direction="out"/>
     </method>
     <signal name="Changed">
       <arg type="s" name="tag"/>
@@ -695,6 +701,7 @@ export default class XwlbridgeWindows extends Extension {
         add('GetState', this._getState);
         add('GetMonitors', this._getMonitors);
         add('GetWorkArea', this._getWorkArea);
+        add('GetPointer', this._getPointer);
         return m;
     }
 
@@ -795,5 +802,16 @@ export default class XwlbridgeWindows extends Extension {
     _getWorkArea() {
         const ws = global.workspace_manager.get_active_workspace();
         return new GLib.Variant('((iiii))', [rectArray(ws.get_work_area_all_monitors())]);
+    }
+
+    // The pointer's position, and whether a button is held: what a status icon's menu needs to open
+    // where the user clicked (nothing private: whoever can read the pointer of the session they run
+    // in can read it from X or from the compositor directly).
+    _getPointer() {
+        const [x, y] = global.get_pointer();
+        const pressed = global.display.get_grab_op
+            ? global.display.get_grab_op() !== 0
+            : false;
+        return new GLib.Variant('((iib))', [[x, y, pressed]]);
     }
 }

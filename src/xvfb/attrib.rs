@@ -99,6 +99,16 @@ pub struct Sig {
 }
 
 impl Fake {
+    /// Whether this request must never reach the desktop, whoever else
+    /// `Rules::classify` would take it for: the agent's own input, which only
+    /// ever drives windows on this display (its window management, its focus
+    /// helper, and the tray's clicks on a status icon: see `xvfb::tray`).
+    /// The forwarder asks this before anything else, so that no rule and no
+    /// binding of the event can make it reach the desktop.
+    pub fn stays_here(&self) -> bool {
+        self.who.class == Class::Agent
+    }
+
     fn matches(&self, s: &Sig) -> bool {
         if self.type_ != s.type_ {
             return false;
@@ -248,6 +258,46 @@ mod tests {
             xy,
             xy_raw: None,
         }
+    }
+
+    #[test]
+    fn the_agents_own_input_never_goes_to_the_desktop() {
+        for (class, stays) in [
+            (Class::Agent, true),
+            (Class::Helper, false),
+            (Class::Driver, false),
+            (Class::Other, false),
+        ] {
+            let mut w = (*who(1, Class::Agent)).clone();
+            w.class = class;
+            let f = fake(&Arc::new(w), BUTTON_PRESS, 1, 0, 0, 100);
+            assert_eq!(f.stays_here(), stays, "{class:?}");
+        }
+    }
+
+    /// The tray clicks icons with XTest on the agent's own connection, so its
+    /// motion and buttons are classified `Class::Agent` (the process's pid): they
+    /// must stay on the display, whatever they bind to, while every other
+    /// client's input keeps its own verdict.
+    #[test]
+    fn the_trays_clicks_stay_on_the_display() {
+        let tray = who(std::process::id(), Class::Agent);
+        for (type_, detail) in [
+            (crate::bridge::input::MOTION_NOTIFY, 0),
+            (BUTTON_PRESS, 1),
+            (BUTTON_PRESS, 3),
+            (crate::bridge::input::BUTTON_RELEASE, 1),
+        ] {
+            for (x, y) in [(0, 0), (1600, 12), (-200, -200)] {
+                assert!(
+                    fake(&tray, type_, detail, x, y, 100).stays_here(),
+                    "{type_}/{detail} at {x},{y}"
+                );
+            }
+        }
+        // another client's clicks (the desktop's own window manager) are not the agent's input
+        let wm = who(2, Class::Other);
+        assert!(!fake(&wm, BUTTON_PRESS, 1, 10, 10, 100).stays_here());
     }
 
     #[test]

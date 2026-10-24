@@ -49,11 +49,11 @@ die() { local rc=$1; shift; say "$*"; exit "$rc"; }
 
 # ---------------------------------------------------------------- configuration
 
-CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension)
+CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension tray)
 declare -A CFG=(
   [engine]=auto [capture]=area [uidisplay]=auto [server]=vncserver-x11 [rfb_port]=5900
   [server_log]=30 [server_args]="" [log]=normal [bridge_args]="" [xvnc]=auto [xvfb]=auto
-  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto
+  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto [tray]=on
 )
 # the GNOME Shell extension for -showwindows' window integration (install.sh installs it; setting `extension`)
 WINDOWS_EXT=xwlbridge-windows@xwlbridge
@@ -109,6 +109,7 @@ cfg_validate() {
   case ${CFG[backend]} in gnome|wlr|auto) ;; *) CFG_ERRORS+=("backend: '${CFG[backend]}' is not gnome, wlr or auto");; esac
   case ${CFG[log]} in quiet|normal|verbose) ;; *) CFG_ERRORS+=("log: '${CFG[log]}' is not quiet, normal or verbose");; esac
   case ${CFG[extension]} in auto|off) ;; *) CFG_ERRORS+=("extension: '${CFG[extension]}' is not auto or off");; esac
+  case ${CFG[tray]} in on|off) ;; *) CFG_ERRORS+=("tray: '${CFG[tray]}' is not on or off");; esac
   if [ -n "${CFG[rfb_port]}" ] && [ "${CFG[rfb_port]}" != realvnc ]; then
     if [[ ! ${CFG[rfb_port]} =~ ^[0-9]{1,5}$ ]] || (( 10#${CFG[rfb_port]} < 1 || 10#${CFG[rfb_port]} > 65535 )); then
       CFG_ERRORS+=("rfb_port: '${CFG[rfb_port]}' is not a TCP port (1-65535), realvnc or empty")
@@ -310,6 +311,8 @@ build_command() {
   ENGINE=$engine
   # extension=off: the bridge leaves the window extension alone even where GNOME runs it
   [ "${CFG[extension]}" = off ] && CMD_ENV+=(XWLBRIDGE_WINDOWS_EXTENSION=off)
+  # tray=off: no X tray icons in the top bar (the bridge runs with -notray, as 0.2.0 behaved)
+  local tray_args=(); [ "${CFG[tray]}" = on ] || tray_args=(-notray)
   local w
   if [ "$MODE" = display ]; then
     # the bridge's X display alone, for X11 tools (xwlbridge.service): no VNC server, no RealVNC UI
@@ -319,6 +322,7 @@ build_command() {
     [[ -v BRIDGE_OVERRIDES[engine] ]] || CMD+=(-engine "$engine")
     [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
     [[ -v BRIDGE_OVERRIDES[display] || ${CFG[display]} = auto ]] || CMD+=(-display "$((10#${CFG[display]#:}))")
+    CMD+=("${tray_args[@]}")
     CMD+=("${BRIDGE_ARGS[@]}")
     CMD+=(-nowrap)
     return 0
@@ -362,6 +366,7 @@ build_command() {
   # DISPLAY takes RealVNC's windows to it by default
   [[ -v BRIDGE_OVERRIDES[uidisplay] ]] || CMD+=(-uidisplay "$ui")
 
+  CMD+=("${tray_args[@]}")
   CMD+=("${BRIDGE_ARGS[@]}")
 
   # Under NoNewPrivileges (the service's hardening) RealVNC's set-uid launcher
@@ -974,6 +979,19 @@ cmd_doctor() {
   else
     report warn gnome.appindicator "no AppIndicator extension: RealVNC's tray icon will not show (its status window: $PROG show)" \
       "Ubuntu: sudo apt install gnome-shell-extension-appindicator; then enable it in Extensions"
+  fi
+  # the X tray icons of -showwindows (docs/tray.md): they are shown through a StatusNotifierWatcher,
+  # which the AppIndicator extension owns on GNOME
+  if [ "${CFG[tray]}" = off ]; then
+    report info gnome.tray "X tray icons of -showwindows are turned off (tray=off)"
+  elif bus_has org.kde.StatusNotifierWatcher; then
+    report ok gnome.tray "a StatusNotifierWatcher is on the session bus: X tray icons appear in the top bar"
+  elif [ -n "$shell_run" ] && [ -z "$info" ]; then
+    report warn gnome.tray "no StatusNotifierWatcher: X tray icons (Java, Wine, GTK, ...) have nowhere to go" \
+      "GNOME shows status icons with the AppIndicator extension: sudo apt install gnome-shell-extension-appindicator" \
+      "then enable it (Extensions) and log out and in; or set tray=off to turn the X tray off"
+  else
+    report info gnome.tray "no StatusNotifierWatcher on the session bus (X tray icons need the AppIndicator extension)"
   fi
 
   if command -v gsettings >/dev/null 2>&1 && gsettings list-schemas 2>/dev/null | grep -qx org.gnome.desktop.remote-desktop.rdp; then

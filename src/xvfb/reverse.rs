@@ -627,6 +627,8 @@ struct Atoms {
     net_workarea: u32,
     gtk_workareas: u32,
     gtk_workareas_d0: u32,
+    /// Marks the tray's containers (`xvfb::tray`), which hold the tray icons.
+    tray_container: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -1178,6 +1180,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_workarea: atom(b"_NET_WORKAREA")?,
         gtk_workareas: atom(b"_GTK_WORKAREAS")?,
         gtk_workareas_d0: atom(b"_GTK_WORKAREAS_D0")?,
+        tray_container: atom(crate::xvfb::tray::dock::CONTAINER.as_bytes())?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -1452,6 +1455,9 @@ impl State {
         if self.windows.contains_key(&w) || w == self.root {
             return;
         }
+        if self.tray_icon(w) {
+            return;
+        }
         let Ok(Ok(attrs)) = self.x.get_window_attributes(w).map(|c| c.reply()) else {
             return;
         };
@@ -1475,6 +1481,38 @@ impl State {
         if let Err(e) = result {
             crate::warning!("-showwindows: can't show {w:#x}: {e}");
         }
+    }
+
+    /// Whether `w` is a tray container or a tray icon (see [`crate::xvfb::tray`]): a tray icon is
+    /// shown in the desktop's top bar (through its StatusNotifierItem), never as a window of its own,
+    /// and its container holds it, parked off the screen, for as long as it is docked.
+    ///
+    /// The property alone is not enough: an undocked icon keeps it (it says where it was), and once its
+    /// container is gone the icon is shown like any other window again.
+    fn tray_icon(&self, w: Window) -> bool {
+        let Ok(cookie) = self.x.query_tree(w) else {
+            return false;
+        };
+        let Ok(tree) = cookie.reply() else {
+            return false;
+        };
+        let in_container = |window: Window| {
+            self.x
+                .get_property(
+                    false,
+                    window,
+                    self.atoms.tray_container,
+                    AtomEnum::WINDOW,
+                    0,
+                    1,
+                )
+                .is_ok_and(|c| c.reply().is_ok_and(|r| r.value_len > 0))
+        };
+        // the icon itself: it has no property to say so, its parent (the container) has
+        if tree.parent != self.root && in_container(tree.parent) {
+            return true;
+        }
+        in_container(w)
     }
 
     /// The X-side part of showing `w`: its geometry, a DAMAGE object, and

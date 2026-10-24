@@ -35,6 +35,10 @@ macro_rules! arg_default {
     ($ty:ty, flag) => {
         false
     };
+    // a setting that is on unless it is asked for: `-notray`
+    ($ty:ty, noflag) => {
+        true
+    };
     ($ty:ty, value, $vn:literal) => {
         ::core::option::Option::None
     };
@@ -47,6 +51,9 @@ macro_rules! arg_default {
 macro_rules! arg_usage {
     ($ty:ty, flag, $field:ident) => {
         format!("-{}", opt_name!($field))
+    };
+    ($ty:ty, noflag, $field:ident) => {
+        format!("-no{}", opt_name!($field))
     };
     ($ty:ty, value, $field:ident, $vn:literal) => {
         format!("-{} {}", opt_name!($field), $vn)
@@ -116,6 +123,9 @@ macro_rules! arg_repeat {
 macro_rules! arg_apply {
     ($ty:ty, flag, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident) => {
         $field = true;
+    };
+    ($ty:ty, noflag, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident) => {
+        $field = false;
     };
     ($ty:ty, value, $field:ident, $inline:ident, $argv:ident, $i:ident, $seen:ident, $warnings:ident, $vn:literal) => {{
         let raw = take_value!($inline, $argv, $i, $field);
@@ -237,7 +247,15 @@ macro_rules! define_config {
                         std::process::exit(0);
                     }
                     $(
-                        if name == opt_name!($field) {
+                        // `-notray` is the `noflag` spelling of the `tray` field
+                        let spelled = match stringify!($kind) {
+                            // the field's name does not start with "no": `tray` is `-notray`
+                            "noflag" => opt_name!($field)
+                                .strip_prefix("no")
+                                .map_or_else(|| Some(format!("no{}", opt_name!($field))), |_| None),
+                            _ => Some(opt_name!($field)),
+                        };
+                        if spelled.as_deref() == Some(name.as_str()) {
                             arg_apply!($ty, $kind, $field, inline, argv, i, seen, warnings $(, $karg)?);
                             let _ = &mut inline;
                             i += 1;

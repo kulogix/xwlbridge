@@ -530,7 +530,21 @@ out=$(PATH="$T/empty:$SYS" "$C" run 2>/dev/null)
 check "  ...run gives it to the bridge" grep -qx "ENV_WINDOWS_EXTENSION=off" <<<"$out"
 out=$(PATH="$T/empty:$SYS" "$C" --display run 2>/dev/null)
 check "  ...--display run too" grep -qx "ENV_WINDOWS_EXTENSION=off" <<<"$out"
+# ---- the tray setting: on by default, off runs the bridge with -notray
 conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5"
+out=$(PATH="$T/empty:$SYS" "$C" command 2>&1)
+check "tray (default on): the bridge is not given -notray" bash -c '! grep -q -- "-notray" <<<"$1"' _ "$out"
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "tray=off"
+out=$(PATH="$T/empty:$SYS" "$C" command 2>&1)
+check "tray=off: the bridge runs with -notray" grep -q -- "-notray" <<<"$out"
+out=$( (PATH="$T/empty:$SYS" "$C" --display command 2>&1) || true )
+check "  ...--display too" grep -q -- "-notray" <<<"$out"
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "tray=sometimes"
+PATH="$T/empty:$SYS" "$C" command >/dev/null 2>"$T/err"; trc=$?
+check "tray=sometimes -> exit 78, named" bash -c '[ $1 -eq 78 ] && grep -qF "tray: '"'"'sometimes'"'"' is not on or off" "$2"' _ $trc "$T/err"
+# a valid configuration again (the next tests would inherit the invalid tray value)
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5"
+
 out=$(env -u XWLBRIDGE_WINDOWS_EXTENSION PATH="$T/empty:$SYS" "$C" run 2>/dev/null)
 check "extension=auto (default): nothing set for the bridge" grep -qx "ENV_WINDOWS_EXTENSION=unset" <<<"$out"
 if command -v python3 >/dev/null; then
