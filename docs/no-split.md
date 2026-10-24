@@ -163,6 +163,17 @@ the bridge on GNOME:
   loaded).
 
 The header is removed while a window is maximised or fullscreen, as GNOME's
-own windows are, and comes back on restore. The doctor prints the setting and
-the values in force; `-verbose` logs the reason for every window's frame
-decision.
+own windows are, and comes back on restore. While it is removed the surface is
+the content itself (so the client fills the work area, not the work area minus
+a phantom header), and the restore configure is converted with the frame it is
+coming back to. The doctor prints the setting and the values in force;
+`-verbose` logs the reason for every window's frame decision.
+
+Measured on GNOME 50.1 (headless bed, window sync on): xterm, GTK 3, GTK 4,
+Qt 5, Qt 6, Java/Swing, Tk and Wine each end with exactly one title bar (the
+bridge's, or GTK 4's declared `_MOTIF_WM_HINTS decorations 0`), drag by the
+header, resize from the bottom-right margin and double-click maximise/restore
+to the same content size (40/40 checks). GTK 4/3 apps that declare their own
+frame are not framed by the bridge, so they do not get a second bar. The pixel
+bar for the header is in `tests/p4_decor/compare_headers.py` and
+`tests/out/release/p4_decor/`.

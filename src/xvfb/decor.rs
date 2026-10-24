@@ -367,7 +367,10 @@ pub struct Metrics {
     #[allow(dead_code)]
     pub margin: i32,
     pub radius: f64,
+    /// The visible window-control circle (Adwaita `> image`, 24 px).
     pub button: f64,
+    /// The clickable control around it (24 px + 2*5 px padding, 34 px).
+    pub control: f64,
     pub icon: f64,
     pub pad: f64,
     pub spacing: f64,
@@ -390,20 +393,24 @@ const fn rgba(r: u8, g: u8, b: u8, a: f64) -> [f64; 4] {
 
 impl Metrics {
     pub fn adwaita(_gnome_major: u32, dark: bool) -> Metrics {
+        // Yaru's libadwaita 1.9.1 override (the theme of the GNOME 50.1
+        // test session), `default-light.css`/`default-dark.css`:
+        // light headerbar #fafafa active and backdrop, fg #3d3d3d;
+        // dark active #393939, backdrop #2c2c2c, fg #f7f7f7.  Backdrop is
+        // `headerbar:backdrop > windowhandle { filter: opacity(.5) }`, i.e.
+        // the 50 % foreground below, not a second hand-picked colour.
         let (bg_active, bg_backdrop, fg, fg_back) = if dark {
             (
-                // measured from the native Adw header on GNOME 50.1
-                // (Ubuntu Yaru): 44,44,44 in both active and backdrop
                 rgba(0x2c, 0x2c, 0x2c, 1.0),
                 rgba(0x2c, 0x2c, 0x2c, 1.0),
-                rgba(0xff, 0xff, 0xff, 0.90),
-                rgba(0xff, 0xff, 0xff, 0.50),
+                rgba(0xf7, 0xf7, 0xf7, 1.0),
+                rgba(0xf7, 0xf7, 0xf7, 0.50),
             )
         } else {
             (
                 rgba(0xfa, 0xfa, 0xfa, 1.0),
                 rgba(0xfa, 0xfa, 0xfa, 1.0),
-                rgba(0x3d, 0x3d, 0x3d, 0.90),
+                rgba(0x3d, 0x3d, 0x3d, 1.0),
                 rgba(0x3d, 0x3d, 0x3d, 0.50),
             )
         };
@@ -414,11 +421,13 @@ impl Metrics {
             // `windowcontrols > button { min-width: 24px; padding: 5px }`,
             // `windowcontrols { border-spacing: 3px }`,
             // `headerbar > windowhandle > box { padding: 6px 7px 7px 7px }`,
-            // the CSS says `--window-radius: 15px`, but the measured native
-            // Adw window corner is 10 px on GNOME 50.1; `.title { font-weight:
-            // bold }` at the system font size (11 pt)
-            radius: 10.0,
+            // measured from the native Adw window's top row on GNOME 50.1:
+            // the first opaque pixel is 14 px in at y=0, i.e. the CSS
+            // `--window-radius: 15px` (the earlier "10" came from a crop
+            // that was 14 px off); `.title { font-weight: bold }`
+            radius: 15.0,
             button: 24.0,
+            control: 34.0,
             icon: 16.0,
             pad: 7.0,
             spacing: 3.0,
@@ -478,17 +487,20 @@ pub fn button_rects(
     layout: &Layout,
 ) -> Vec<(Button, f64, f64, f64, f64)> {
     let mut out = Vec::with_capacity(layout.left.len() + layout.right.len());
-    let y = ((f64::from(m.height) - m.button) / 2.0).round();
-    let mut x = m.pad;
+    // `windowcontrols > button { min-width: 24px; padding: 5px }` makes the
+    // clickable control 34 px and the visible circle 24 px; `border-spacing:
+    // 3px` then gives the native 37 px pitch.  GTK snaps the circle to
+    // half-pixels (native columns 685..708 at width 720), hence the +0.5.
+    let y = ((f64::from(m.height) - m.control) / 2.0).round();
+    let mut x = m.pad + 0.5;
     for &b in &layout.left {
-        out.push((b, x, y, m.button, m.button));
-        x += m.button + m.spacing;
+        out.push((b, x, y, m.control, m.control));
+        x += m.control + m.spacing;
     }
-    let mut x = surface_w - m.pad;
+    let mut x = surface_w - m.pad - m.control + 0.5;
     for &b in layout.right.iter().rev() {
-        x -= m.button;
-        out.push((b, x, y, m.button, m.button));
-        x -= m.spacing;
+        out.push((b, x, y, m.control, m.control));
+        x -= m.control + m.spacing;
     }
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     out
@@ -521,6 +533,7 @@ struct PangoRectangle {
 const CAIRO_FORMAT_ARGB32: c_int = 0;
 const CAIRO_OPERATOR_OVER: c_int = 2;
 const CAIRO_OPERATOR_SOURCE: c_int = 1;
+const CAIRO_FILL_RULE_EVEN_ODD: c_int = 1;
 const PANGO_ELLIPSIZE_END: c_int = 3;
 const PANGO_ALIGN_CENTER: c_int = 1;
 const PANGO_SCALE: c_int = 1024;
@@ -546,6 +559,7 @@ pub struct Painter {
     paint: unsafe extern "C" fn(Cairo),
     rectangle: unsafe extern "C" fn(Cairo, f64, f64, f64, f64),
     fill: unsafe extern "C" fn(Cairo),
+    set_fill_rule: unsafe extern "C" fn(Cairo, c_int),
     new_sub_path: unsafe extern "C" fn(Cairo),
     arc: unsafe extern "C" fn(Cairo, f64, f64, f64, f64, f64),
     close_path: unsafe extern "C" fn(Cairo),
@@ -609,6 +623,7 @@ impl Painter {
                 paint: symbol(&cairo, "cairo_paint")?,
                 rectangle: symbol(&cairo, "cairo_rectangle")?,
                 fill: symbol(&cairo, "cairo_fill")?,
+                set_fill_rule: symbol(&cairo, "cairo_set_fill_rule")?,
                 new_sub_path: symbol(&cairo, "cairo_new_sub_path")?,
                 arc: symbol(&cairo, "cairo_arc")?,
                 close_path: symbol(&cairo, "cairo_close_path")?,
@@ -768,22 +783,16 @@ impl Painter {
                 };
                 (self.set_operator)(cr, CAIRO_OPERATOR_OVER);
                 (self.set_source_rgba)(cr, color[0], color[1], color[2], color[3]);
+                let (cx, cy) = (bx + bw / 2.0, by + bh / 2.0);
                 (self.new_sub_path)(cr);
-                (self.arc)(
-                    cr,
-                    bx + bw / 2.0,
-                    by + bh / 2.0,
-                    bw / 2.0,
-                    0.0,
-                    2.0 * std::f64::consts::PI,
-                );
+                (self.arc)(cr, cx, cy, m.button / 2.0, 0.0, 2.0 * std::f64::consts::PI);
                 (self.fill)(cr);
                 let glyph = if b == Button::Close && (hovered || pressed) {
                     [1.0, 1.0, 1.0, 1.0]
                 } else {
                     fg
                 };
-                self.glyph(cr, b, bx + bw / 2.0, by + bh / 2.0, m.icon, glyph);
+                self.glyph(cr, b, cx, cy, m.icon, glyph);
             }
             // `headerbar { box-shadow: inset 0 -1px headerbar-shade }`
             (self.set_operator)(cr, CAIRO_OPERATOR_OVER);
@@ -796,18 +805,27 @@ impl Painter {
             (self.rectangle)(cr, 0.0, h - 1.0, w, 1.0);
             (self.fill)(cr);
 
-            // title: centred between the button groups, ellipsised
-            let (left_end, right_start) = match (rects.first(), rects.last()) {
-                (Some(f), Some(l)) => (f.1 + f.3 + m.pad, l.1 - m.pad),
-                _ => (m.pad, w - m.pad),
-            };
+            // Title: GtkHeaderBar centres it in the *window*, so the
+            // available band is between the left/right button groups (plus
+            // the CSS 6 px box margin and 12 px title padding) but the text
+            // is centred at `w / 2`, not at the band's centre (measured on
+            // the native header: 'xterm' ink 330..389 in a 720 px window).
+            let left_group = rects.iter().filter(|r| r.1 < w / 2.0).map(|r| r.1 + r.3);
+            let right_group = rects.iter().filter(|r| r.1 >= w / 2.0).map(|r| r.1);
+            let left_end = left_group.fold(0.0f64, f64::max) + 6.0 + 12.0;
+            let right_start = right_group.fold(w, f64::min) - 6.0 - 12.0;
             let tw = (right_start - left_end).max(10.0);
-            let family = if m.title_weight >= 600.0 {
-                "Cantarell Bold"
-            } else {
-                "Cantarell"
-            };
-            let font = CString::new(format!("{family} {}", m.title_pt)).unwrap_or_default();
+            // The titlebar font from GNOME (`titlebar-font` /
+            // `titlebar-uses-system-font` + `font-name`), already carrying
+            // Bold; the design's Cantarell only when no setting arrived.
+            let font = st.font.clone().unwrap_or_else(|| {
+                if m.title_weight >= 600.0 {
+                    format!("Cantarell Bold {}", m.title_pt)
+                } else {
+                    format!("Cantarell {}", m.title_pt)
+                }
+            });
+            let font = CString::new(font).unwrap_or_default();
             let desc = (self.font_description_from_string)(font.as_ptr());
             let pl = (self.pango_create_layout)(cr);
             if !desc.is_null() && !pl.is_null() {
@@ -827,7 +845,7 @@ impl Painter {
                 let ty = (h - f64::from(logical.height)) / 2.0;
                 (self.set_operator)(cr, CAIRO_OPERATOR_OVER);
                 (self.set_source_rgba)(cr, fg[0], fg[1], fg[2], fg[3]);
-                (self.move_to)(cr, left_end, ty);
+                (self.move_to)(cr, (w - tw) / 2.0, ty);
                 (self.pango_show_layout)(cr, pl);
             }
             if !pl.is_null() {
@@ -845,43 +863,77 @@ impl Painter {
     }
 
     /// One symbolic glyph, centred at `(cx, cy)` and `size` px across.
+    ///
+    /// The shapes are the Yaru (Ubuntu's Adwaita) 16 px symbolic icons the
+    /// native header uses -- `window-close-symbolic` (a filled 10-point
+    /// outline), `window-minimize-symbolic` (a filled 8x1 bar) and
+    /// `window-maximize-symbolic` (an 8x8 outline, even-odd) -- mapped from
+    /// the icon's 16 px viewBox, not hand-tuned strokes.  That is why the
+    /// glyph ink now matches GTK's instead of being a thinner approximation.
     unsafe fn glyph(&self, cr: Cairo, b: Button, cx: f64, cy: f64, size: f64, color: [f64; 4]) {
-        let s = size / 2.0;
+        let s = size / 16.0;
+        let ox = cx - size / 2.0;
+        let oy = cy - size / 2.0;
+        let x = |v: f64| ox + v * s;
+        let y = |v: f64| oy + v * s;
         unsafe {
             (self.set_source_rgba)(cr, color[0], color[1], color[2], color[3]);
-            (self.set_line_width)(cr, 1.6);
             match b {
                 Button::Close => {
-                    let d = s * 0.62;
+                    // Yaru `window-close-symbolic.svg` outline verbatim
+                    let pts = [
+                        (4.795, 3.912),
+                        (3.912, 4.795),
+                        (4.059, 4.941),
+                        (7.117, 8.0),
+                        (4.060, 11.059),
+                        (3.913, 11.205),
+                        (4.796, 12.088),
+                        (4.942, 11.941),
+                        (8.000, 8.883),
+                        (11.059, 11.941),
+                        (11.205, 12.088),
+                        (12.088, 11.205),
+                        (11.941, 11.059),
+                        (8.883, 8.0),
+                        (11.941, 4.941),
+                        (12.088, 4.795),
+                        (11.205, 3.912),
+                        (11.059, 4.059),
+                        (8.000, 7.117),
+                        (4.941, 4.059),
+                    ];
+                    (self.set_fill_rule)(cr, 0); // CAIRO_FILL_RULE_WINDING
                     (self.new_sub_path)(cr);
-                    (self.move_to)(cr, cx - d, cy - d);
-                    (self.line_to)(cr, cx + d, cy + d);
-                    (self.move_to)(cr, cx + d, cy - d);
-                    (self.line_to)(cr, cx - d, cy + d);
-                    (self.stroke)(cr);
+                    (self.move_to)(cr, x(pts[0].0), y(pts[0].1));
+                    for (px, py) in &pts[1..] {
+                        (self.line_to)(cr, x(*px), y(*py));
+                    }
+                    (self.close_path)(cr);
+                    (self.fill)(cr);
                 }
                 Button::Minimize => {
-                    let d = s * 0.7;
+                    (self.set_fill_rule)(cr, 0);
                     (self.new_sub_path)(cr);
-                    (self.move_to)(cr, cx - d, cy);
-                    (self.line_to)(cr, cx + d, cy);
-                    (self.stroke)(cr);
+                    (self.rectangle)(cr, x(4.0), y(10.0), x(12.0) - x(4.0), y(12.0) - y(10.0));
+                    (self.fill)(cr);
                 }
                 Button::Maximize => {
-                    let d = s * 0.62;
+                    (self.set_fill_rule)(cr, CAIRO_FILL_RULE_EVEN_ODD);
                     (self.new_sub_path)(cr);
-                    (self.rectangle)(cr, cx - d, cy - d, 2.0 * d, 2.0 * d);
-                    (self.stroke)(cr);
+                    (self.rectangle)(cr, x(4.0), y(4.0), x(12.0) - x(4.0), y(12.0) - y(4.0));
+                    (self.rectangle)(cr, x(5.0), y(5.0), x(11.0) - x(5.0), y(11.0) - y(5.0));
+                    (self.fill)(cr);
                 }
                 Button::Menu => {
-                    let d = s * 0.65;
+                    // `open-menu-symbolic`: three 1 px bars, 8 px wide
+                    (self.set_fill_rule)(cr, 0);
                     for i in -1..=1 {
-                        let y = cy + f64::from(i) * s * 0.45;
+                        let yy = 8.0 + f64::from(i) * 3.0;
                         (self.new_sub_path)(cr);
-                        (self.move_to)(cr, cx - d, y);
-                        (self.line_to)(cr, cx + d, y);
+                        (self.rectangle)(cr, x(4.0), y(yy - 0.5), x(12.0) - x(4.0), s);
                     }
-                    (self.stroke)(cr);
+                    (self.fill)(cr);
                 }
                 Button::Spacer => {}
             }
@@ -1103,6 +1155,31 @@ mod tests {
         let p = (close.1 + 1.0, close.2 + 1.0);
         assert_eq!(hit_button(&m, 400.0, &l, p), Some(Button::Close));
         assert_eq!(hit_button(&m, 400.0, &l, (200.0, 10.0)), None);
+    }
+
+    #[test]
+    fn buttons_match_libadwaita_geometry() {
+        // Native GNOME 50.1 at width 720: circles at x 685..708, 648..671,
+        // 611..634 (37 px pitch) -> centres 696.5/659.5/622.5, visible
+        // diameter 24, clickable control 34 (`min-width 24` + `padding 5`),
+        // right edge 720 - 7 (`headerbar` padding) = 713.
+        let m = Metrics::adwaita(50, false);
+        let l = Layout::parse(":minimize,maximize,close");
+        let rects = button_rects(&m, 720.0, &l);
+        let close = rects.iter().find(|r| r.0 == Button::Close).unwrap();
+        assert_eq!(close.1, 679.0 + 0.5);
+        assert_eq!(close.1 + close.3, 713.0 + 0.5);
+        assert_eq!(close.2 + close.3 / 2.0, 23.0); // circle centre row (11..34)
+        let max = rects.iter().find(|r| r.0 == Button::Maximize).unwrap();
+        let min = rects.iter().find(|r| r.0 == Button::Minimize).unwrap();
+        assert_eq!(max.1 - min.1, 37.0); // control 34 + border-spacing 3
+        // the visible circle is inset 5 px in the control
+        assert_eq!(min.1 + 5.0 + m.button, min.1 + m.control - 5.0);
+        // and the left side mirrors it
+        let left = button_rects(&m, 720.0, &Layout::parse("appmenu:minimize,close"));
+        let menu = left.iter().find(|r| r.0 == Button::Menu).unwrap();
+        assert_eq!(menu.1, 7.0 + 0.5);
+        assert_eq!(menu.1 + 5.0, 12.0 + 0.5);
     }
 
     #[test]

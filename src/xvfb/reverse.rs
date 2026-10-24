@@ -1880,22 +1880,20 @@ impl State {
             c.shown = false;
             c.drop_buffers();
         }
-        // the window geometry follows: whole surface normally, content while
-        // maximised/fullscreen (the header is detached)
-        if s.frame.is_framed() {
-            let (ox, oy) = s.frame.content_origin();
+        // The window geometry follows the surface: whole surface while the
+        // header is drawn, content (origin 0,0) while maximised/fullscreen,
+        // because `s.frame` is NONE there and the buffer is content-sized.
+        let geom = if want && s.frame.is_framed() {
             let (sw, sh) = s.frame.surface_size((s.width, s.height));
-            let geom = if want {
-                (0, 0, i32::from(sw), i32::from(sh))
-            } else {
-                (ox, oy, i32::from(s.width), i32::from(s.height))
-            };
-            if s.window_geometry != geom {
-                s.xdg_surface
-                    .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
-                s.window_geometry = geom;
-                s.surface.commit();
-            }
+            (0, 0, i32::from(sw), i32::from(sh))
+        } else {
+            (0, 0, i32::from(s.width), i32::from(s.height))
+        };
+        if s.window_geometry != geom {
+            s.xdg_surface
+                .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
+            s.window_geometry = geom;
+            s.surface.commit();
         }
     }
 
@@ -2800,13 +2798,18 @@ impl State {
         let p = self.windows.get(&parent).expect("found above");
         let (dx, dy) = (i32::from(x) - origin.0, i32::from(y) - origin.1);
         let ((ax, ay), (ox, oy)) = popup_anchor(dx, dy, p.width, p.height);
-        // xdg_positioner's anchor rectangle is in the parent surface's space:
-        // content at the frame's origin in the surface
+        // xdg_positioner's anchor rectangle is relative to the parent's
+        // *window geometry* (xdg-shell set_anchor_rect).  A normally framed
+        // window's geometry is the whole surface, so the content origin is
+        // added; a maximised/fullscreen window's geometry is the content at
+        // `(fx,fy)` in the surface, so the geometry origin is subtracted
+        // again (measured: LibreOffice, maximised, menus were 6 px off).
         let (fx, fy) = p.frame.content_origin();
+        let (gx, gy) = (p.window_geometry.0, p.window_geometry.1);
         let wm_base = self.wm_base.as_ref().expect("checked at start");
         let positioner = wm_base.create_positioner(qh, ());
         positioner.set_size(i32::from(width), i32::from(height));
-        positioner.set_anchor_rect(ax + fx, ay + fy, 1, 1);
+        positioner.set_anchor_rect(ax + fx - gx, ay + fy - gy, 1, 1);
         positioner.set_offset(ox, oy);
         positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
         positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
@@ -3252,8 +3255,26 @@ impl State {
                     .find(|(x, _, _)| *x == w)
                     .map(|(_, m, f)| (*m, *f));
                 let (max, full) = pending.unwrap_or((s.maximized, s.fullscreen));
-                let (gw, gh) = if s.frame.is_framed() && !max && !full {
-                    let (_, _, cw, ch) = s.frame.content_rect(0, 0, width, height);
+                // The restore configure of an unmaximised toplevel carries the
+                // *surface* size (the pre-maximise window geometry), not the
+                // content size, even though `s.frame` is NONE while maximised.
+                // A configure smaller than the screen while the window still
+                // says maximised is that restore; add the chrome's frame back
+                // (without this the content came back 12x52 too large).
+                let chrome_frame = s
+                    .chrome
+                    .as_ref()
+                    .map(|c| c.frame)
+                    .unwrap_or(decor::FrameGeom::NONE);
+                let restoring = (s.maximized || s.fullscreen)
+                    && (width < self.screen.0 as i32 || height < self.screen.1 as i32);
+                let use_frame = if !max && !full {
+                    if restoring { chrome_frame } else { s.frame }
+                } else {
+                    decor::FrameGeom::NONE
+                };
+                let (gw, gh) = if use_frame.is_framed() {
+                    let (_, _, cw, ch) = use_frame.content_rect(0, 0, width, height);
                     (cw, ch)
                 } else {
                     (width, height)
@@ -3289,9 +3310,30 @@ impl State {
             }
         }
         for (w, maximized, fullscreen) in std::mem::take(&mut self.states) {
+            // While maximised/fullscreen the header is detached and the
+            // surface must be the content itself: the X client fills the work
+            // area, so its surface origin is the work-area origin.  Keeping
+            // the 6 px margin + 46 px header inside the surface shifted the
+            // content by (6,46) on the desktop (measured: LibreOffice
+            // maximised, X [6,78] instead of [0,25]).  Remember the chrome's
+            // frame and go back to it on restore.
+            let chrome_frame = self
+                .windows
+                .get(&w)
+                .and_then(|s| s.chrome.as_ref().map(|c| c.frame))
+                .unwrap_or(decor::FrameGeom::NONE);
+            let want_frame = if maximized || fullscreen {
+                decor::FrameGeom::NONE
+            } else {
+                chrome_frame
+            };
             let changed = self.windows.get_mut(&w).is_some_and(|s| {
                 let c = (s.maximized, s.fullscreen) != (maximized, fullscreen);
                 (s.maximized, s.fullscreen) = (maximized, fullscreen);
+                if s.frame != want_frame {
+                    s.frame = want_frame;
+                    s.dirty = true;
+                }
                 c
             });
             if changed {
@@ -3379,8 +3421,11 @@ impl State {
             let p = self.windows.get(&parent);
             let frame = p.map_or(decor::FrameGeom::NONE, |s| s.frame);
             // xdg_popup's configure is relative to the parent's window
-            // geometry (the surface origin), the X window to its content
-            let (ox, oy) = frame.content_origin();
+            // geometry, the X window to its content: subtract the content
+            // origin's offset *from the geometry origin* (zero for a normally
+            // framed window, `(fx,fy)` while maximised/fullscreen).
+            let (fx, fy) = frame.content_origin();
+            let (ox, oy) = (fx - s.window_geometry.0, fy - s.window_geometry.1);
             let (nx, ny) = popup_position(origin, (px - ox, py - oy));
             if (nx, ny) != (i32::from(s.x), i32::from(s.y)) {
                 crate::vlog!(
