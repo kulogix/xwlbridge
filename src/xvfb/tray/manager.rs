@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::damage;
+use x11rb::protocol::xinput::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
     EventMask, ImageFormat, MapState, PropMode, StackMode, WindowClass,
@@ -32,6 +33,9 @@ use super::pixels::Image;
 use super::{ICON_SIZE, Look, MAX_ICON_UPDATES, selection_name};
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, MOTION_NOTIFY};
 use crate::xvfb::{self, AnyError, Auth};
+
+/// The property of the tray's own window that says whose it is (the tests find the tray that runs).
+const PID_ATOM: &str = "_XWLBridge_TRAY_PID";
 
 /// How long to wait before connecting to the X server again (the tray lost its connection).
 const RETRY: Duration = Duration::from_secs(2);
@@ -70,6 +74,7 @@ pub fn spawn(
     auth: Auth,
     screen: u32,
     bus: Option<String>,
+    pointer: Option<u16>,
 ) -> std::io::Result<Running> {
     let (tx, commands) = channel();
     let (ready, started) = channel();
@@ -103,7 +108,7 @@ pub fn spawn(
                             return;
                         }
                     }
-                    let manager = match Manager::connect(display, &auth, screen)
+                    let manager = match Manager::connect(display, &auth, screen, pointer)
                         .and_then(|mut m| m.take_selection().map(|()| m))
                     {
                         Ok(m) => Rc::new(RefCell::new(m)),
@@ -166,6 +171,8 @@ struct Atoms {
     manager: u32,
     selection: u32,
     opcode: u32,
+    /// `_NET_SYSTEM_TRAY_MESSAGE_DATA`: the message type GTK and Qt send balloon text with.
+    message_data: u32,
     orientation: u32,
     icon_size: u32,
     visual: u32,
@@ -174,6 +181,8 @@ struct Atoms {
     wm_name: u32,
     wm_class: u32,
     container: u32,
+    /// findable by the tests (a tray that starts again must not depend on an earlier one's atoms)
+    pid: u32,
 }
 
 impl Atoms {
@@ -181,10 +190,11 @@ impl Atoms {
         let atom = |name: &[u8]| -> Result<u32, AnyError> {
             Ok(conn.intern_atom(false, name)?.reply()?.atom)
         };
-        Ok(Atoms {
+        let atoms = Atoms {
             manager: atom(b"MANAGER")?,
             selection: atom(selection_name(screen).as_bytes())?,
             opcode: atom(b"_NET_SYSTEM_TRAY_OPCODE")?,
+            message_data: atom(b"_NET_SYSTEM_TRAY_MESSAGE_DATA")?,
             orientation: atom(b"_NET_SYSTEM_TRAY_ORIENTATION")?,
             icon_size: atom(b"_NET_SYSTEM_TRAY_ICON_SIZE")?,
             visual: atom(b"_NET_SYSTEM_TRAY_VISUAL")?,
@@ -193,7 +203,11 @@ impl Atoms {
             wm_name: atom(b"WM_NAME")?,
             wm_class: atom(b"WM_CLASS")?,
             container: atom(CONTAINER.as_bytes())?,
-        })
+            pid: atom(PID_ATOM.as_bytes())?,
+        };
+        // (the requests are queued: this waits until the server has them all)
+        conn.get_input_focus()?.reply()?;
+        Ok(atoms)
     }
 }
 
@@ -204,6 +218,7 @@ struct Balloon {
 
 struct Manager {
     conn: RustConnection,
+    screen: u32,
     root: u32,
     window: u32,
     atoms: Atoms,
@@ -219,14 +234,39 @@ struct Manager {
     read: HashMap<u32, Instant>,
     /// Icons whose DAMAGE came too soon for a read.
     pending: Vec<u32>,
+    /// Events already read from the server that are not handled yet (see [`Manager::undock`]).
+    waiting: Vec<XEvent>,
     /// The 32-bit ARGB visual, and the screen's default one.
     argb: Option<u32>,
     default_visual: u32,
 }
 
 impl Manager {
-    fn connect(display: u32, auth: &Auth, screen: u32) -> Result<Manager, AnyError> {
+    fn connect(
+        display: u32,
+        auth: &Auth,
+        screen: u32,
+        pointer: Option<u16>,
+    ) -> Result<Manager, AnyError> {
         let (conn, screen_num) = xvfb::connect(display, auth)?;
+        super::set_connection_base(conn.setup().resource_id_base);
+        // Our XTest goes through the reverse master's XTest devices (as the reverse path's own does):
+        // the core pointer is held by the agent's grab, and events injected on it from another client
+        // reach no X window. With this connection's ClientPointer on the reverse master, the icons get
+        // the clicks, and they are still the bridge's own input (`attrib`: the connection is ours).
+        if let Some(device) = pointer {
+            let set = (|| -> Result<(), AnyError> {
+                conn.xinput_xi_query_version(2, 2)?.reply()?;
+                conn.xinput_xi_set_client_pointer(x11rb::NONE, device)?
+                    .check()?;
+                Ok(())
+            })();
+            if let Err(e) = set {
+                crate::warning!(
+                    "-showwindows: tray: the reverse pointer {device} can't be the tray's ({e}): clicks may not reach the icons"
+                );
+            }
+        }
         let root = conn.setup().roots[screen_num].root;
         let atoms = Atoms::new(&conn, screen)?;
         let (default_visual, argb) = {
@@ -239,10 +279,9 @@ impl Manager {
                 .map(|v| v.visual_id);
             (root.root_visual, argb)
         };
-        // (the connection's ClientPointer is left alone: its XTest goes to the core pointer, which is the
-        // only pointer of the display, and no input device of the desktop is touched)
         Ok(Manager {
             conn,
+            screen,
             root,
             window: 0,
             atoms,
@@ -254,6 +293,7 @@ impl Manager {
             last_poll: Instant::now(),
             read: HashMap::new(),
             pending: Vec::new(),
+            waiting: Vec::new(),
             argb,
             default_visual,
         })
@@ -275,6 +315,10 @@ impl Manager {
 
     /// Takes the selection and announces the tray. `Err` if another tray has it.
     fn take_selection(&mut self) -> Result<(), AnyError> {
+        // an earlier tray may have gone with the display this one starts on (a restarted X server keeps
+        // the numbers), so every atom is interned again: x11rb interns them without waiting for the reply,
+        // and a round trip first makes sure the server knows them all
+        self.atoms = Atoms::new(&self.conn, self.screen)?;
         let window = self.conn.generate_id()?;
         self.conn.create_window(
             0,
@@ -288,6 +332,14 @@ impl Manager {
             WindowClass::INPUT_ONLY,
             0,
             &CreateWindowAux::new(),
+        )?;
+        // whose tray it is (the tests find the tray that runs)
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            self.atoms.pid,
+            AtomEnum::CARDINAL,
+            &[std::process::id()],
         )?;
         self.conn
             .set_selection_owner(window, self.atoms.selection, x11rb::CURRENT_TIME)?;
@@ -379,7 +431,11 @@ impl Manager {
     /// Handles what is there, and the commands.
     fn pump(&mut self, commands: &Receiver<Command>) -> Result<(), AnyError> {
         loop {
-            match self.conn.poll_for_event() {
+            let event = match self.waiting.pop() {
+                Some(event) => Ok(Some(event)),
+                None => self.conn.poll_for_event(),
+            };
+            match event {
                 Ok(Some(event)) => {
                     if let Err(e) = self.event(event) {
                         crate::vlog!("-showwindows: tray: {e}");
@@ -409,6 +465,11 @@ impl Manager {
     fn event(&mut self, event: XEvent) -> Result<(), AnyError> {
         match event {
             XEvent::ClientMessage(e) if e.type_ == self.atoms.opcode => self.client_message(&e)?,
+            XEvent::ClientMessage(e) if e.type_ == self.atoms.message_data => {
+                // the text of a balloon: the icon it belongs to is the message's window, the text its data
+                let bytes = e.data.as_data8();
+                self.message_data(e.window, &bytes);
+            }
             XEvent::DestroyNotify(e) => self.undock(e.window),
             XEvent::UnmapNotify(e) => {
                 // an XEMBED 0 client (or one that has not set _XEMBED_INFO yet) shows itself
@@ -450,50 +511,56 @@ impl Manager {
     }
 
     fn client_message(&mut self, e: &ClientMessageEvent) -> Result<(), AnyError> {
-        self.client_message2(e.data.as_data32())
-    }
-
-    fn client_message2(&mut self, data: [u32; 5]) -> Result<(), AnyError> {
-        let (kind, icon) = (data[1], data[2]);
-        match kind {
-            REQUEST_DOCK => self.dock(icon)?,
+        let data = e.data.as_data32();
+        match data[1] {
+            REQUEST_DOCK => self.dock(data[2])?,
             BEGIN_MESSAGE => {
+                // data[2] is the timeout, data[3] the length, data[4] the id; the icon is the message's
+                // window (as GTK's and Qt's tray code send it), not the manager's
                 let mut header = [0u8; 40];
-                for (i, v) in data[3..].iter().enumerate() {
-                    header[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-                }
-                let h = self.balloons.begin(icon, &header);
-                self.open.insert(icon, Balloon { timeout: h.timeout });
+                header[0..4].copy_from_slice(&data[2].to_ne_bytes());
+                header[4..8].copy_from_slice(&data[3].to_ne_bytes());
+                let h = self.balloons.begin(e.window, &header);
+                self.open.insert(e.window, Balloon { timeout: h.timeout });
             }
+            // (some clients send the text with the opcode type instead of _NET_SYSTEM_TRAY_MESSAGE_DATA)
             MESSAGE_DATA => {
-                let mut chunk = Vec::with_capacity(20);
-                for v in &data[3..] {
-                    chunk.extend_from_slice(&v.to_ne_bytes());
-                }
-                if let Some((_, text)) = self.balloons.data(icon, &chunk) {
-                    let timeout = self.open.get(&icon).map_or(0, |b| b.timeout);
-                    if let Some(container) = self.icons.get(&icon).map(|i| i.container) {
-                        let title = self
-                            .told
-                            .get(&container)
-                            .map(|l| l.title.clone())
-                            .unwrap_or_default();
-                        self.send(Event::Notify {
-                            container,
-                            title,
-                            text,
-                            timeout,
-                        });
-                    }
-                }
+                let bytes = e.data.as_data8();
+                self.message_data(e.window, &bytes);
             }
+            // data[2] is the balloon's id, not an icon: the icon is the message's window
             CANCEL_MESSAGE => {
-                self.balloons.cancel(icon);
-                self.open.remove(&icon);
+                self.balloons.cancel(e.window);
+                self.open.remove(&e.window);
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Text of a balloon: one 20-byte segment (`_NET_SYSTEM_TRAY_MESSAGE_DATA`, or `MESSAGE_DATA` sent with
+    /// the opcode type). The message goes out as a notification once the length announced is there.
+    fn message_data(&mut self, icon: u32, bytes: &[u8]) {
+        if !self.icons.contains_key(&icon) {
+            return;
+        }
+        let Some((_, text)) = self.balloons.data(icon, bytes) else {
+            return;
+        };
+        let timeout = self.open.get(&icon).map_or(0, |b| b.timeout);
+        let container = self.icons.get(&icon).map(|i| i.container);
+        let title = container
+            .and_then(|c| self.told.get(&c))
+            .map(|l| l.title.clone())
+            .unwrap_or_default();
+        if let Some(container) = container {
+            self.send(Event::Notify {
+                container,
+                title,
+                text,
+                timeout,
+            });
+        }
     }
 
     // ------------------------------------------------------------------ docking
@@ -577,17 +644,34 @@ impl Manager {
     }
 
     fn undock(&mut self, w: u32) {
-        if let Some(icon) = self.icons.remove(&w) {
-            self.balloons.cancel(w);
-            self.open.remove(&w);
-            damage::destroy(&self.conn, icon.damage).ok();
-            self.conn.destroy_window(icon.container).ok();
-            self.conn.flush().ok();
-            self.told.remove(&icon.container);
-            self.send(Event::Undocked {
-                container: icon.container,
-            });
+        let Some(icon) = self.icons.remove(&w) else {
+            return;
+        };
+        self.balloons.cancel(w);
+        self.open.remove(&w);
+        damage::destroy(&self.conn, icon.damage).ok();
+        self.conn.destroy_window(icon.container).ok();
+        self.conn.flush().ok();
+        self.told.remove(&icon.container);
+        // the server still owes us this window's events: they are not the next icon's (a window number is
+        // used again soon), and neither are the ones for the container that went with them
+        let mut below: Vec<XEvent> = Vec::new();
+        while let Ok(Some(event)) = self.conn.poll_for_event() {
+            match &event {
+                XEvent::DestroyNotify(e) if e.window == w || e.window == icon.container => {}
+                XEvent::UnmapNotify(e) if e.window == w || e.window == icon.container => {}
+                XEvent::ReparentNotify(e) if e.window == w || e.window == icon.container => {}
+                _ => below.push(event),
+            }
         }
+        below.reverse();
+        self.waiting.extend(below);
+        crate::log!(
+            "-showwindows: tray icon {w:#x} undocked (its window is gone or was taken away)"
+        );
+        self.send(Event::Undocked {
+            container: icon.container,
+        });
     }
 
     fn xembed_changed(&mut self, w: u32) -> Result<(), AnyError> {
@@ -776,6 +860,13 @@ impl Manager {
         };
         let (w, size) = (icon.window, icon.size);
         let target = clicks::target(size);
+        // the click's root point for a container at `(ox, oy)`: the icon's click point inside it
+        let inside = |ox: i32, oy: i32| {
+            (
+                (ox + i32::from(target.0)).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                (oy + i32::from(target.1)).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            )
+        };
         #[allow(clippy::type_complexity)]
         let (steps, at, restore): (Vec<Step>, (i32, i32), Option<clicks::Restore>) = match command {
             Command::Click {
@@ -785,14 +876,17 @@ impl Manager {
                 ..
             } => match clicks::origin(x, y, target) {
                 // the click's X point is the desktop's point: the container moves under it
-                clicks::Origin::Container(ox, oy) => (
-                    clicks::click(target.0, target.1, button),
-                    (ox, oy),
-                    Some(clicks::Restore::Window(container, PARK.0, PARK.1)),
-                ),
+                clicks::Origin::Container(ox, oy) => {
+                    let (px, py) = inside(ox, oy);
+                    (
+                        clicks::click(px, py, button),
+                        (ox, oy),
+                        Some(clicks::Restore::Window(container, PARK.0, PARK.1)),
+                    )
+                }
                 // under the top bar: the icon stays parked, the click goes to the point itself
                 clicks::Origin::Asked(x, y) => (
-                    clicks::click(target.0, target.1, button),
+                    clicks::click(x, y, button),
                     (PARK.0.into(), PARK.1.into()),
                     Some(clicks::Restore::Pointer(x, y, w)),
                 ),
@@ -804,32 +898,41 @@ impl Manager {
                 y: Some(y),
                 ..
             } => match clicks::origin(x, y, target) {
-                clicks::Origin::Container(ox, oy) => (
-                    clicks::scroll(target.0, target.1, steps, horizontal),
-                    (ox, oy),
-                    Some(clicks::Restore::Window(container, PARK.0, PARK.1)),
-                ),
+                clicks::Origin::Container(ox, oy) => {
+                    let (px, py) = inside(ox, oy);
+                    (
+                        clicks::scroll(px, py, steps, horizontal),
+                        (ox, oy),
+                        Some(clicks::Restore::Window(container, PARK.0, PARK.1)),
+                    )
+                }
                 clicks::Origin::Asked(x, y) => (
-                    clicks::scroll(target.0, target.1, steps, horizontal),
+                    clicks::scroll(x, y, steps, horizontal),
                     (PARK.0.into(), PARK.1.into()),
                     Some(clicks::Restore::Pointer(x, y, w)),
                 ),
             },
             // no position in the call: the icon is in front of the pointer, where the desktop's pointer is
-            Command::Click { button, .. } => (
-                clicks::click(target.0, target.1, button),
-                self.pointer(),
-                None,
-            ),
+            Command::Click { button, .. } => {
+                let at = self.pointer();
+                let (px, py) = inside(at.0, at.1);
+                (clicks::click(px, py, button), at, None)
+            }
             Command::Scroll {
                 steps, horizontal, ..
-            } => (
-                clicks::scroll(target.0, target.1, steps, horizontal),
-                self.pointer(),
-                None,
-            ),
+            } => {
+                let at = self.pointer();
+                let (px, py) = inside(at.0, at.1);
+                (clicks::scroll(px, py, steps, horizontal), at, None)
+            }
         };
         let _ = w;
+        crate::vlog!(
+            "-showwindows: tray: click {:?}: container to {:?}, {} step(s)",
+            command_kind(&command),
+            at,
+            steps.len()
+        );
         self.conn.configure_window(
             container,
             &ConfigureWindowAux::new()
@@ -917,24 +1020,26 @@ impl Manager {
         crate::xvfb::tray::pointer::point()
     }
 
-    /// The XTest events of a click: the core pointer, whose `ClientPointer` is the reverse direction's
-    /// device where there is one — never sent to the desktop, which has its own device
+    /// The XTest events of a click: this connection's XTest devices, which are the reverse master's when
+    /// the tray has one (see [`Manager::connect`]) — never sent to the desktop, which has its own device
     /// (`xvfb::attrib`: the agent's own input stays on this display).
     fn play(&self, steps: &[Step]) -> Result<(), AnyError> {
         for step in steps {
-            let (type_, detail) = match *step {
-                Step::Move(..) => (MOTION_NOTIFY, 0),
-                Step::Press(b) => (BUTTON_PRESS, b),
-                Step::Release(b) => (BUTTON_RELEASE, b),
+            let (type_, detail, x, y) = match *step {
+                Step::Move(x, y) => (MOTION_NOTIFY, 0, x, y),
+                Step::Press(b) => (BUTTON_PRESS, b, 0, 0),
+                Step::Release(b) => (BUTTON_RELEASE, b, 0, 0),
             };
+            // a motion is absolute (the root window given): to the step's root point
+            let root = if type_ == MOTION_NOTIFY { self.root } else { 0 };
             xtest::fake_input(
                 &self.conn,
                 type_,
                 detail,
                 x11rb::CURRENT_TIME,
-                self.root,
-                0,
-                0,
+                root,
+                x,
+                y,
                 0,
             )?;
         }
@@ -953,4 +1058,12 @@ fn wait(fd: std::os::fd::RawFd, timeout: Duration) {
     };
     // SAFETY: one valid pollfd
     unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) };
+}
+
+/// A short name of a command, for the log.
+fn command_kind(command: &Command) -> String {
+    match command {
+        Command::Click { button, x, y, .. } => format!("button {button} at {x:?},{y:?}"),
+        Command::Scroll { steps, x, y, .. } => format!("scroll {steps} at {x:?},{y:?}"),
+    }
 }

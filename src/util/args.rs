@@ -247,7 +247,15 @@ macro_rules! define_config {
                         std::process::exit(0);
                     }
                     $(
-                        if name == opt_name!($field) {
+                        // `-notray` is the `noflag` spelling of the `tray` field
+                        let spelled = match stringify!($kind) {
+                            // the field's name does not start with "no": `tray` is `-notray`
+                            "noflag" => opt_name!($field)
+                                .strip_prefix("no")
+                                .map_or_else(|| Some(format!("no{}", opt_name!($field))), |_| None),
+                            _ => Some(opt_name!($field)),
+                        };
+                        if spelled.as_deref() == Some(name.as_str()) {
                             arg_apply!($ty, $kind, $field, inline, argv, i, seen, warnings $(, $karg)?);
                             let _ = &mut inline;
                             i += 1;

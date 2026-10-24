@@ -190,9 +190,9 @@ impl Item {
 }
 
 impl Item {
-    /// The object path of the icon's menu.
+    /// The object path of the icon's menu (on the icon's own connection, see [`super::session`]).
     pub fn menu_path(&self) -> String {
-        format!("/StatusNotifierItem/{}/Menu", self.shared.container)
+        super::session::MENU_PATH.to_string()
     }
 }
 

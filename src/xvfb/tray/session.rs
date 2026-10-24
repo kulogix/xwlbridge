@@ -1,18 +1,23 @@
 //! The session bus side of the tray: one item and one menu per icon, and the tray's names.
 //!
-//! One thread owns the connection (the pattern of [`crate::xvfb::winsync::bus`]): it exports the well-known
-//! names, the items and their menus, and keeps what it exports in step with the tray ([`Event`]). What the
-//! desktop does with an icon arrives as a call on that icon's item or menu, which turns it into a
-//! [`Command`] for the tray thread, at the position the call carried.
+//! One thread owns the tray's connection (the pattern of [`crate::xvfb::winsync::bus`]): it keeps what is
+//! exported in step with the tray ([`Event`]). What the desktop does with an icon arrives as a call on that
+//! icon's item or menu, which turns it into a [`Command`] for the tray thread, at the position the call
+//! carried.
 //!
-//! # Names
+//! # One connection per icon
 //!
-//! The first free of [`candidates`] (`org.kde.StatusNotifierItem-<pid>-<n>`), the objects
-//! [`item_path`]`(container)` and [`menu_path`]`(container)` per icon. Each item is registered with the
-//! StatusNotifierWatcher — again whenever the watcher's owner changes, and once it appears (the watcher is
-//! looked for every tick) — and unregistered by dropping its name when its icon goes. Without a watcher
-//! (GNOME without the AppIndicator extension) the items are exported all the same, and one log line says
-//! that nothing shows them.
+//! Each icon is exported on a connection of its own, which owns the icon's well-known name
+//! (`org.kde.StatusNotifierItem-<pid>-<n>`, [`candidates`]) and serves the objects [`ITEM_PATH`] and
+//! [`MENU_PATH`]. The StatusNotifierWatcher knows an item by its owner's *unique* bus name plus the object
+//! path, so a connection per icon is what makes an item go away: dropping the connection (the icon undocked)
+//! is a `NameOwnerChanged` the desktop sees, and GNOME's AppIndicator extension destroys the icon with it.
+//! (The watcher has no `UnregisterStatusNotifierItem`, and releasing a well-known name does not change the
+//! unique name's owner, so one connection for all icons would leave every exited icon in the top bar.)
+//!
+//! Each item is registered with the StatusNotifierWatcher — again whenever the watcher's owner changes, and
+//! once it appears (the watcher is looked for every tick). Without a watcher (GNOME without the AppIndicator
+//! extension) the items are exported all the same, and one log line says that nothing shows them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,19 +43,15 @@ pub const WATCHER_IFACE: &str = "org.kde.StatusNotifierWatcher";
 /// How long the bus thread waits for the tray before it looks at the watcher again.
 pub const TICK: Duration = Duration::from_millis(500);
 
-/// The object of the icon docked in `container`.
-pub fn item_path(container: u32) -> String {
-    format!("/StatusNotifierItem/{container}")
-}
+/// The object every icon is exported at (each on its own connection, see the module comment).
+pub const ITEM_PATH: &str = "/StatusNotifierItem";
 
-/// The menu object of the icon docked in `container`.
-pub fn menu_path(container: u32) -> String {
-    format!("/StatusNotifierItem/{container}/Menu")
-}
+/// The object of every icon's menu.
+pub const MENU_PATH: &str = "/StatusNotifierItem/Menu";
 
-/// The names an item may take, in order (the first free one is used).
-pub fn candidates(pid: u32) -> [String; 3] {
-    std::array::from_fn(|i| format!("org.kde.StatusNotifierItem-{pid}-{}", i + 1))
+/// The names an item may take, in order (the first free one is used per icon).
+pub fn candidates(pid: u32) -> impl Iterator<Item = String> {
+    (1..).map(move |n| format!("org.kde.StatusNotifierItem-{pid}-{n}"))
 }
 
 /// A running bus thread, which ends with the tray's events (or when dropped).
@@ -89,7 +90,7 @@ pub fn start(
                     return;
                 }
             };
-            Bus::new(conn, commands).run(events, &stop_thread);
+            Bus::new(conn, address, commands).run(events, &stop_thread);
         })
         .ok();
     Session { stop, thread }
@@ -114,16 +115,23 @@ pub fn watcher(conn: &Connection) -> Option<String> {
 
 /// One exported icon.
 struct Icon {
+    /// The icon's own connection: it owns the icon's well-known name and its unique name is what the
+    /// watcher knows the item by, so ending the connection takes the icon off the desktop.
+    conn: Connection,
     shared: Arc<Shared>,
+    /// The well-known name it owns (`org.kde.StatusNotifierItem-<pid>-<n>`).
+    #[allow(dead_code)]
+    name: String,
     /// The look the desktop has of it.
     #[allow(dead_code)]
     sent: Look,
 }
 
 struct Bus {
+    /// The tray's own connection: the watcher is looked for on it.
     conn: Connection,
-    /// Our well-known name, once taken.
-    name: Option<String>,
+    /// The bus the icons get connections of their own on (`None`: the session's own).
+    address: Option<String>,
     items: HashMap<u32, Icon>,
     /// The watcher our items were registered with.
     registered: Option<String>,
@@ -132,10 +140,10 @@ struct Bus {
 }
 
 impl Bus {
-    fn new(conn: Connection, commands: Sender<Command>) -> Bus {
+    fn new(conn: Connection, address: Option<String>, commands: Sender<Command>) -> Bus {
         Bus {
             conn,
-            name: None,
+            address,
             items: HashMap::new(),
             registered: None,
             commands,
@@ -144,12 +152,6 @@ impl Bus {
     }
 
     fn run(mut self, events: Receiver<Event>, stop: &AtomicBool) {
-        match self.acquire() {
-            Some(name) => crate::log!("-showwindows: tray icons: {name}"),
-            None => crate::warning!(
-                "-showwindows: tray icons: no free org.kde.StatusNotifierItem-<pid>-<n> name on the session bus"
-            ),
-        }
         let mut watcher = session_watcher(&self.conn);
         if watcher.is_none() {
             self.no_watcher();
@@ -182,16 +184,6 @@ impl Bus {
         self.items.clear();
     }
 
-    fn acquire(&mut self) -> Option<String> {
-        for name in candidates(std::process::id()) {
-            if self.conn.request_name(name.as_str()).is_ok() {
-                self.name = Some(name.clone());
-                return Some(name);
-            }
-        }
-        None
-    }
-
     fn no_watcher(&mut self) {
         if !self.reported {
             self.reported = true;
@@ -207,22 +199,9 @@ impl Bus {
         if self.registered.as_deref() == Some(watcher) {
             return;
         }
-        if self.name.is_none() {
-            return;
-        }
-        let Ok(proxy) =
-            zbus::blocking::Proxy::new(&self.conn, watcher, WATCHER_PATH, WATCHER_IFACE)
-        else {
-            return;
-        };
         self.registered = Some(watcher.to_string());
-        for container in self.items.keys().copied().collect::<Vec<u32>>() {
-            if let Err(e) = proxy.call::<_, _, ()>(
-                "RegisterStatusNotifierItem",
-                &(item_path(container).as_str(),),
-            ) {
-                crate::vlog!("-showwindows: tray: can't register an icon, {e}");
-            }
+        for (container, icon) in &self.items {
+            register_one(*container, icon, watcher);
         }
     }
 
@@ -241,17 +220,43 @@ impl Bus {
     }
 
     fn dock(&mut self, container: u32, look: Look) {
+        // the icon's own connection: the watcher knows the item by its unique name, which goes with it
+        let conn = match connect(self.address.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                crate::warning!(
+                    "-showwindows: tray: can't export icon {container:#x}: no session bus ({e})"
+                );
+                return;
+            }
+        };
+        let Some(name) = free_name(&conn) else {
+            crate::warning!(
+                "-showwindows: tray: no free org.kde.StatusNotifierItem-<pid>-<n> name for icon {container:#x}"
+            );
+            return;
+        };
         let shared = Shared::new(container, look.clone(), self.commands.clone());
-        let (ipath, mpath) = (item_path(container), menu_path(container));
         {
-            let server = self.conn.object_server();
-            let _ = server.at(&*ipath, item::Item::new(shared.clone()));
-            let _ = server.at(&*mpath, Menu::new(shared.clone()));
+            let server = conn.object_server();
+            let _ = server.at(ITEM_PATH, item::Item::new(shared.clone()));
+            let _ = server.at(MENU_PATH, Menu::new(shared.clone()));
         }
-        self.items.insert(container, Icon { shared, sent: look });
-        let watcher = session_watcher(&self.conn);
-        self.registered = None;
-        self.register(watcher.as_deref());
+        self.items.insert(
+            container,
+            Icon {
+                conn,
+                shared,
+                name: name.clone(),
+                sent: look,
+            },
+        );
+        crate::vlog!("-showwindows: tray icon {container:#x} exported as {name}");
+        if let Some(watcher) = session_watcher(&self.conn)
+            && let Some(icon) = self.items.get(&container)
+        {
+            register_one(container, icon, &watcher);
+        }
     }
 
     fn look(&mut self, container: u32, look: Look) {
@@ -261,7 +266,13 @@ impl Bus {
     }
 
     fn undock(&mut self, container: u32) {
-        self.items.remove(&container);
+        // dropping the icon's connection ends its unique name: the watcher (and the desktop) drops the item
+        if let Some(icon) = self.items.remove(&container) {
+            crate::vlog!(
+                "-showwindows: tray icon {container:#x} unexported ({})",
+                icon.name
+            );
+        }
     }
 
     fn notify(&mut self, container: u32, title: &str, text: &str, timeout: i32) {
@@ -269,6 +280,26 @@ impl Bus {
         if let Err(e) = notify::send(title, title, text, timeout) {
             crate::vlog!("-showwindows: tray: no notification ({e}): {title}: {text}");
         }
+    }
+}
+
+/// The first free `org.kde.StatusNotifierItem-<pid>-<n>` on `conn`.
+fn free_name(conn: &Connection) -> Option<String> {
+    // no AllowReplacement/ReplaceExisting (the defaults of request_name): two icons would take the same
+    // name from each other; DoNotQueue: a name that is taken is the next one's turn
+    let flags = zbus::fdo::RequestNameFlags::DoNotQueue.into();
+    candidates(std::process::id())
+        .find(|name| conn.request_name_with_flags(name.as_str(), flags).is_ok())
+}
+
+/// Registers one icon's item with `watcher` from the icon's own connection (which is the item's service).
+fn register_one(container: u32, icon: &Icon, watcher: &str) {
+    let Ok(proxy) = zbus::blocking::Proxy::new(&icon.conn, watcher, WATCHER_PATH, WATCHER_IFACE)
+    else {
+        return;
+    };
+    if let Err(e) = proxy.call::<_, _, ()>("RegisterStatusNotifierItem", &(ITEM_PATH,)) {
+        crate::vlog!("-showwindows: tray: can't register icon {container:#x}, {e}");
     }
 }
 
@@ -321,5 +352,80 @@ pub(crate) mod tests {
         };
         let conn = connect(Some(&bus.address)).unwrap();
         assert_eq!(watcher(&conn), None);
+    }
+
+    /// A fake StatusNotifierWatcher: it records every registration (its name is what the tray looks for).
+    struct FakeWatcher {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+    impl FakeWatcher {
+        fn register_status_notifier_item(&self, service: &str) {
+            self.calls.lock().unwrap().push(service.to_string());
+        }
+    }
+
+    fn serve_watcher(conn: &Connection, calls: Arc<std::sync::Mutex<Vec<String>>>) {
+        conn.object_server()
+            .at(WATCHER_PATH, FakeWatcher { calls })
+            .unwrap();
+        conn.request_name(WATCHER).unwrap();
+        assert!(watcher(conn).is_some());
+    }
+
+    fn owner_of(conn: &Connection, name: &str) -> Option<String> {
+        let dbus = zbus::blocking::fdo::DBusProxy::new(conn).ok()?;
+        dbus.get_name_owner(BusName::try_from(name).ok()?)
+            .ok()
+            .map(|o| o.to_string())
+    }
+
+    #[test]
+    fn an_icon_is_registered_from_its_own_connection_that_ends_with_it() {
+        let Some(bus) = bus() else {
+            eprintln!("no dbus-daemon: skipped");
+            return;
+        };
+        let watcher_conn = connect(Some(&bus.address)).unwrap();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        serve_watcher(&watcher_conn, calls.clone());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut tray = Bus::new(
+            connect(Some(&bus.address)).unwrap(),
+            Some(bus.address.clone()),
+            tx,
+        );
+        tray.dock(0x1234, Look::default());
+        tray.dock(0x5678, Look::default());
+        // each icon registers the same object path, from a connection of its own
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[ITEM_PATH.to_string(), ITEM_PATH.to_string()]
+        );
+        let names: Vec<String> = [&tray.items[&0x1234], &tray.items[&0x5678]]
+            .iter()
+            .map(|icon| icon.name.clone())
+            .collect();
+        assert_ne!(names[0], names[1]);
+        for name in &names {
+            assert!(owner_of(&watcher_conn, name).is_some(), "{name}");
+        }
+        let (first_name, first_owner) = (names[0].clone(), owner_of(&watcher_conn, &names[0]));
+        // undocking ends the icon's connection: its name goes (the watcher then drops the item)
+        tray.undock(0x1234);
+        let mut gone = false;
+        for _ in 0..150 {
+            if owner_of(&watcher_conn, &first_name) != first_owner {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            gone,
+            "the icon's connection is still on the bus as {first_name}"
+        );
+        assert!(owner_of(&watcher_conn, &names[1]).is_some());
     }
 }

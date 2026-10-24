@@ -542,6 +542,8 @@ check "  ...--display too" grep -q -- "-notray" <<<"$out"
 conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5" "tray=sometimes"
 PATH="$T/empty:$SYS" "$C" command >/dev/null 2>"$T/err"; trc=$?
 check "tray=sometimes -> exit 78, named" bash -c '[ $1 -eq 78 ] && grep -qF "tray: '"'"'sometimes'"'"' is not on or off" "$2"' _ $trc "$T/err"
+# a valid configuration again (the next tests would inherit the invalid tray value)
+conf "engine=builtin" "server=$T/rvnc/vncserver-x11" "uidisplay=:5"
 
 out=$(env -u XWLBRIDGE_WINDOWS_EXTENSION PATH="$T/empty:$SYS" "$C" run 2>/dev/null)
 check "extension=auto (default): nothing set for the bridge" grep -qx "ENV_WINDOWS_EXTENSION=unset" <<<"$out"

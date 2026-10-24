@@ -1266,35 +1266,33 @@ impl State {
     /// Whether `w` is a tray container or a tray icon (see [`crate::xvfb::tray`]): a tray icon is
     /// shown in the desktop's top bar (through its StatusNotifierItem), never as a window of its own,
     /// and its container holds it, parked off the screen, for as long as it is docked.
+    ///
+    /// The property alone is not enough: an undocked icon keeps it (it says where it was), and once its
+    /// container is gone the icon is shown like any other window again.
     fn tray_icon(&self, w: Window) -> bool {
-        let Ok(cookie) =
-            self.x
-                .get_property(false, w, self.atoms.tray_container, AtomEnum::WINDOW, 0, 1)
-        else {
-            return false;
-        };
-        if cookie.reply().is_ok_and(|r| r.value_len > 0) {
-            return true;
-        }
-        // the icon itself: it has no property to say so, its parent (the container) has
         let Ok(cookie) = self.x.query_tree(w) else {
             return false;
         };
         let Ok(tree) = cookie.reply() else {
             return false;
         };
-        tree.parent != self.root
-            && self
-                .x
+        let in_container = |window: Window| {
+            self.x
                 .get_property(
                     false,
-                    tree.parent,
+                    window,
                     self.atoms.tray_container,
                     AtomEnum::WINDOW,
                     0,
                     1,
                 )
                 .is_ok_and(|c| c.reply().is_ok_and(|r| r.value_len > 0))
+        };
+        // the icon itself: it has no property to say so, its parent (the container) has
+        if tree.parent != self.root && in_container(tree.parent) {
+            return true;
+        }
+        in_container(w)
     }
 
     /// The X-side part of showing `w`: its geometry, a DAMAGE object, and

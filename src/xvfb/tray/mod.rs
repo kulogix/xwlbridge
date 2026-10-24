@@ -35,14 +35,28 @@ pub mod session;
 
 use crate::xvfb::Auth;
 
+/// The X resource base of the tray's own connection (0: none yet). Its XTest clicks are the agent's input,
+/// as the reverse path's are (`xvfb::record` classifies it so: it must never reach the desktop).
+static CONNECTION_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether `xid_base` is the tray thread's X connection.
+pub fn is_tray_client(xid_base: u32) -> bool {
+    xid_base != 0 && CONNECTION_BASE.load(std::sync::atomic::Ordering::Relaxed) == xid_base
+}
+
+/// Records the tray's connection base (called by the tray thread once it is connected).
+pub fn set_connection_base(xid_base: u32) {
+    CONNECTION_BASE.store(xid_base, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Starts the tray for `-showwindows` on the engine display: `None` (and a log line) if another tray has the
 /// selection or the X server can't be reached.
 ///
 /// `devs` is the reverse direction's master device once `-showwindows` has it: the pointer the icons are
 /// clicked with (so that a click stays on the display, see [`clicks`]).
-pub fn start(display: u32, auth: Auth) -> Option<manager::Running> {
+pub fn start(display: u32, auth: Auth, pointer: Option<u16>) -> Option<manager::Running> {
     let screen = 0;
-    match manager::spawn(display, auth, screen, None) {
+    match manager::spawn(display, auth, screen, None, pointer) {
         Ok(running) => {
             crate::log!(
                 "-showwindows: system tray: _NET_SYSTEM_TRAY_S{screen} taken, X tray icons are shown on the desktop"
@@ -127,5 +141,17 @@ mod tests {
         look.title = String::new();
         assert_eq!(look.id(7), "xwlbridge-tray-7");
         assert!(look.pixmaps().is_empty());
+    }
+
+    #[test]
+    fn the_trays_connection_is_known_by_its_base() {
+        // no connection yet: no base is the tray's
+        set_connection_base(0);
+        assert!(!is_tray_client(0));
+        assert!(!is_tray_client(0x200000));
+        set_connection_base(0x200000);
+        assert!(is_tray_client(0x200000));
+        assert!(!is_tray_client(0x400000));
+        set_connection_base(0);
     }
 }

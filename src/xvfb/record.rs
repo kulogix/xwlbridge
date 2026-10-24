@@ -354,7 +354,8 @@ impl Classifier {
         if let Some(w) = self.known.get(&base) {
             return w.clone();
         }
-        let who = if base == self.agent_base {
+        // the tray's connection is the agent's too: its clicks are the bridge's own input (never the desktop's)
+        let who = if base == self.agent_base || crate::xvfb::tray::is_tray_client(base) {
             Who {
                 base,
                 class: Class::Agent,
