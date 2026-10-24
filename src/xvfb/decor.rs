@@ -565,6 +565,7 @@ pub struct Painter {
     close_path: unsafe extern "C" fn(Cairo),
     move_to: unsafe extern "C" fn(Cairo, f64, f64),
     line_to: unsafe extern "C" fn(Cairo, f64, f64),
+    curve_to: unsafe extern "C" fn(Cairo, f64, f64, f64, f64, f64, f64),
     stroke: unsafe extern "C" fn(Cairo),
     set_line_width: unsafe extern "C" fn(Cairo, f64),
     set_antialias: unsafe extern "C" fn(Cairo, c_int),
@@ -629,6 +630,7 @@ impl Painter {
                 close_path: symbol(&cairo, "cairo_close_path")?,
                 move_to: symbol(&cairo, "cairo_move_to")?,
                 line_to: symbol(&cairo, "cairo_line_to")?,
+                curve_to: symbol(&cairo, "cairo_curve_to")?,
                 stroke: symbol(&cairo, "cairo_stroke")?,
                 set_line_width: symbol(&cairo, "cairo_set_line_width")?,
                 set_antialias: symbol(&cairo, "cairo_set_antialias")?,
@@ -707,20 +709,17 @@ impl Painter {
             // content); outside the radius is transparent.
             let r = m.radius.min(h / 2.0).min(w / 2.0);
             (self.new_sub_path)(cr);
+            // quarter circles as cubic Beziers (k = 4*(sqrt(2)-1)/3):
+            // cairo_arc is avoided here because on some cairo builds the
+            // arc's implicit line-to produced a notched right edge.
+            const K: f64 = 0.552_284_749_830_793_4;
             (self.move_to)(cr, r, 0.0);
             (self.line_to)(cr, w - r, 0.0);
-            (self.arc)(cr, w - r, r, -std::f64::consts::FRAC_PI_2, 0.0, 0.0);
+            (self.curve_to)(cr, w - r + K * r, 0.0, w, r - K * r, w, r);
             (self.line_to)(cr, w, h);
             (self.line_to)(cr, 0.0, h);
             (self.line_to)(cr, 0.0, r);
-            (self.arc)(
-                cr,
-                r,
-                r,
-                std::f64::consts::PI,
-                1.5 * std::f64::consts::PI,
-                0.0,
-            );
+            (self.curve_to)(cr, 0.0, r - K * r, r - K * r, 0.0, r, 0.0);
             (self.close_path)(cr);
             let (bg, fg) = if st.active {
                 (m.bg_active, m.fg_active)
@@ -735,21 +734,15 @@ impl Painter {
                 (self.set_operator)(cr, CAIRO_OPERATOR_OVER);
                 (self.set_source_rgba)(cr, m.border[0], m.border[1], m.border[2], m.border[3]);
                 (self.set_line_width)(cr, 1.0);
+                const K: f64 = 0.552_284_749_830_793_4;
                 (self.new_sub_path)(cr);
                 (self.move_to)(cr, r, 0.5);
                 (self.line_to)(cr, w - r, 0.5);
-                (self.arc)(cr, w - r, r, -std::f64::consts::FRAC_PI_2, 0.0, 0.0);
+                (self.curve_to)(cr, w - r + K * r, 0.5, w - 0.5, r - K * r, w - 0.5, r);
                 (self.line_to)(cr, w - 0.5, h);
                 (self.line_to)(cr, 0.5, h);
                 (self.line_to)(cr, 0.5, r);
-                (self.arc)(
-                    cr,
-                    r,
-                    r,
-                    std::f64::consts::PI,
-                    1.5 * std::f64::consts::PI,
-                    0.0,
-                );
+                (self.curve_to)(cr, 0.5, r - K * r, r - K * r, 0.5, r, 0.5);
                 (self.stroke)(cr);
             }
 
@@ -913,9 +906,11 @@ impl Painter {
                     (self.fill)(cr);
                 }
                 Button::Minimize => {
+                    // Yaru `window-minimize-symbolic.svg`: `m4 10v1h8v-1z`,
+                    // an 8x1 bar (the old 2 px rectangle was visibly thick).
                     (self.set_fill_rule)(cr, 0);
                     (self.new_sub_path)(cr);
-                    (self.rectangle)(cr, x(4.0), y(10.0), x(12.0) - x(4.0), y(12.0) - y(10.0));
+                    (self.rectangle)(cr, x(4.0), y(10.0), x(12.0) - x(4.0), y(11.0) - y(10.0));
                     (self.fill)(cr);
                 }
                 Button::Maximize => {
@@ -1081,6 +1076,139 @@ pub fn round_bottom(
             }
         }
     }
+}
+
+// ------------------------------------------------------------- drop shadow
+
+/// Space reserved around the window geometry for the client-side drop shadow,
+/// in logical pixels.  GTK's extents for `0 3px 9px 1px` at scale 1 are 15 px
+/// sideways and 18 px down (GSK's triple-box blur); 20 covers both and is one
+/// value for active and backdrop, so a focus change never reallocates.
+pub const SHADOW_PAD: i32 = 26;
+
+/// One rendered drop shadow.  The CSS values are GTK's `window.csd`
+/// (`0 3px 9px 1px rgba(0,0,0,.5)` and the backdrop
+/// `0 2px 6px 2px rgba(0,0,0,.2)`); `sigma` is the Gaussian fitted to the
+/// field a native libadwaita window actually renders on GNOME 50.1 (the
+/// measured field is symmetric top/bottom, see the report).  The 1 px ring is
+/// the CSS `0 0 0 1px` shadow.
+#[derive(Clone, Copy, Debug)]
+pub struct ShadowSpec {
+    /// CSS blur radius (the fitted `sigma` is what is rendered; kept so the
+    /// table reads as GTK's CSS).
+    #[allow(dead_code)]
+    pub blur: f64,
+    /// Opacity of the blurred layer at the window edge.
+    pub alpha: f64,
+    /// The crisp 1 px ring just outside the window shape.
+    pub ring: f64,
+    pub sigma: f64,
+}
+
+/// The measured active/backdrop shadow of GNOME 50.1's libadwaita window.
+pub fn shadow_spec(active: bool) -> ShadowSpec {
+    if active {
+        ShadowSpec {
+            blur: 9.0,
+            alpha: 0.39,
+            ring: 0.23,
+            sigma: 6.0,
+        }
+    } else {
+        ShadowSpec {
+            blur: 6.0,
+            alpha: 0.22,
+            ring: 0.18,
+            sigma: 4.5,
+        }
+    }
+}
+
+/// `erfc` (A&S 7.1.26, |error| < 1.5e-7): the Gaussian-blurred edge profile.
+fn erfc(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * z);
+    let y = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let y = y * (-z * z).exp();
+    if x >= 0.0 { y } else { 2.0 - y }
+}
+
+/// Signed distance to a `w`x`h` rounded rectangle of radius `r` whose top
+/// left is (0,0); negative inside.  Used for the window shape and its shadow.
+pub fn rounded_sdf(x: f64, y: f64, w: f64, h: f64, r: f64) -> f64 {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let qx = (x - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (y - h / 2.0).abs() - (h / 2.0 - r);
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r
+}
+
+/// Paints the window's drop shadow into an ARGB8888 buffer of
+/// `width`x`height`: the window geometry is inset by [`SHADOW_PAD`] on every
+/// side, and the shadow lives outside its rounded shape (the visible corner
+/// cuts show it).  The buffer is transparent inside the window: the parent
+/// surface covers it there.  Painted once per size, focus or scheme change,
+/// never per client frame.
+pub fn paint_shadow(
+    pixels: &mut [u8],
+    width: u16,
+    height: u16,
+    stride: usize,
+    active: bool,
+    radius: f64,
+) {
+    let (bw, bh) = (width as usize, height as usize);
+    if bw == 0 || bh == 0 || stride < bw * 4 || pixels.len() < stride * bh {
+        return;
+    }
+    let pad = f64::from(SHADOW_PAD);
+    let (ww, wh) = (bw as f64 - 2.0 * pad, bh as f64 - 2.0 * pad);
+    if ww <= 1.0 || wh <= 1.0 {
+        return;
+    }
+    let spec = shadow_spec(active);
+    let cut = 4.0 * spec.sigma + 2.0;
+    pixels[..stride * bh].fill(0);
+    for y in 0..bh {
+        let row = y * stride;
+        let py = y as f64 + 0.5 - pad;
+        for x in 0..bw {
+            let i = row + x * 4;
+            // the parent covers the window; only the outside is ours
+            let px = x as f64 + 0.5 - pad;
+            let d = rounded_sdf(px, py, ww, wh, radius);
+            if d <= 0.0 || d > cut {
+                continue;
+            }
+            // a crisp 1 px band just outside the shape (the CSS
+            // `0 0 0 1px` ring): full at the first outside pixel, gone by
+            // the second
+            let ring = spec.ring * (1.5 - d).clamp(0.0, 1.0);
+            // the measured blurred field starts just outside that ring
+            let blur = if d >= 1.0 {
+                spec.alpha * 0.5 * erfc(d / (spec.sigma * std::f64::consts::SQRT_2))
+            } else {
+                0.0
+            };
+            let a = 1.0 - (1.0 - ring) * (1.0 - blur);
+            let byte = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+            pixels[i] = 0;
+            pixels[i + 1] = 0;
+            pixels[i + 2] = 0;
+            pixels[i + 3] = byte;
+        }
+    }
+}
+
+/// The shadow band's outer size for a surface box.
+pub fn shadow_size(surface: (u16, u16)) -> (u16, u16) {
+    let p = SHADOW_PAD.max(0) as u32;
+    (
+        (u32::from(surface.0) + 2 * p).min(u32::from(u16::MAX)) as u16,
+        (u32::from(surface.1) + 2 * p).min(u32::from(u16::MAX)) as u16,
+    )
 }
 
 #[cfg(test)]
@@ -1282,6 +1410,96 @@ mod tests {
         assert_eq!(px[(4 * 40) + 3], 0, "bottom-left corner");
         assert_eq!(px[(4 * 40) + 9 * 4 + 3], 0, "bottom-right corner");
         assert_eq!(px[(4 * 40) + 5 * 4 + 3], 0xff, "middle bottom");
+    }
+
+    fn shadow_alpha(px: &[u8], stride: usize, x: usize, y: usize) -> u8 {
+        px[y * stride + x * 4 + 3]
+    }
+
+    #[test]
+    fn shadow_is_outside_the_window_only() {
+        let (bw, bh) = (120u16, 120u16);
+        let stride = bw as usize * 4;
+        let mut px = vec![0u8; stride * bh as usize];
+        paint_shadow(&mut px, bw, bh, stride, true, 15.0);
+        let p = SHADOW_PAD as usize;
+        let ww = bw as usize - 2 * p;
+        // inside the window geometry (covered by the parent) is transparent
+        assert_eq!(shadow_alpha(&px, stride, p + ww / 2, p + ww / 2), 0);
+        assert_eq!(shadow_alpha(&px, stride, p + ww / 2, p + 2), 0);
+        // 1 px outside the straight edge: the CSS ring
+        let ring = shadow_alpha(&px, stride, p + ww / 2, p - 1);
+        assert!((55..=62).contains(&ring), "ring alpha {ring}");
+        // 2 px outside: the blurred layer starts, and is lighter than the ring
+        let near = shadow_alpha(&px, stride, p + ww / 2, p - 2);
+        assert!(near > 0 && near <= ring, "near {near} ring {ring}");
+        // monotonic falloff along the edge
+        let mut last = 0u8;
+        for d in 1..18 {
+            let a = shadow_alpha(&px, stride, p + ww / 2, p - d);
+            assert!(a <= last.max(ring), "d {d}: {a}");
+            last = a;
+        }
+        // the field is symmetric: left/right and top/bottom
+        for d in 1..18 {
+            assert_eq!(
+                shadow_alpha(&px, stride, p - d, p + ww / 2),
+                shadow_alpha(&px, stride, p + ww - 1 + d, p + ww / 2),
+                "side {d}"
+            );
+            assert_eq!(
+                shadow_alpha(&px, stride, p + ww / 2, p - d),
+                shadow_alpha(&px, stride, p + ww / 2, p + ww - 1 + d),
+                "top/bottom {d}"
+            );
+        }
+        // nothing beyond the cut
+        assert_eq!(shadow_alpha(&px, stride, p + ww / 2, 0), 0);
+        assert_eq!(shadow_alpha(&px, stride, 0, p + ww / 2), 0);
+        // inside the rounded corner (outside the shape) is shadowed
+        assert!(shadow_alpha(&px, stride, p + 2, p + 2) > 0);
+    }
+
+    #[test]
+    fn painted_header_is_opaque_to_the_right_edge() {
+        let Ok(p) = Painter::load(false) else {
+            return; // no cairo/pango on this machine; the VM covers it
+        };
+        let (w, h, stride) = (720u16, 46u16, 720usize * 4);
+        let mut px = vec![0u8; stride * usize::from(h)];
+        p.paint(&mut px, w, h, stride, &HeaderState::default());
+        for x in [0usize, 1, 700, 709, 710, 715, 719] {
+            let a = px[23 * stride + x * 4 + 3];
+            assert_eq!(a, 0xff, "alpha at x={x}");
+        }
+        // and the top-right corner is the only transparent part of the top row
+        assert_eq!(px[719 * 4 + 3], 0, "rounded top-right corner");
+        assert_eq!(
+            px[23 * stride + 719 * 4 + 3],
+            0xff,
+            "right edge at mid height"
+        );
+    }
+
+    #[test]
+    fn backdrop_shadow_is_lighter_and_has_the_css_values() {
+        let a = shadow_spec(true);
+        let b = shadow_spec(false);
+        assert!(b.alpha < a.alpha && b.ring < a.ring && b.blur < a.blur);
+        assert!((a.blur - 9.0).abs() < f64::EPSILON);
+        assert!((b.blur - 6.0).abs() < f64::EPSILON);
+        // the pad covers the rendered field (4 sigma + the 1 px ring)
+        assert!(f64::from(SHADOW_PAD) >= 4.0 * a.sigma + 1.0);
+    }
+
+    #[test]
+    fn rounded_sdf_matches_the_window_shape() {
+        assert!(rounded_sdf(50.0, 50.0, 100.0, 100.0, 15.0) < 0.0);
+        assert!((rounded_sdf(50.0, 0.0, 100.0, 100.0, 15.0) - 0.0).abs() < 1e-9);
+        assert!((rounded_sdf(50.0, -3.0, 100.0, 100.0, 15.0) - 3.0).abs() < 1e-9);
+        // the corner is 15 px in from the square corner
+        assert!(rounded_sdf(1.0, 1.0, 100.0, 100.0, 15.0) > 0.0);
+        assert!(rounded_sdf(15.0, 15.0, 100.0, 100.0, 15.0) < 0.0);
     }
 
     #[test]

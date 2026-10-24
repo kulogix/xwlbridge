@@ -150,6 +150,15 @@ the bridge on GNOME:
   fullscreen the geometry becomes the content (the header is detached).
   `_NET_FRAME_EXTENTS` = `0,0,header,0` and `_NET_REQUEST_FRAME_EXTENTS` are
   published as EWMH asks;
+- the client-side drop shadow GTK draws around a CSD window, outside the
+  window geometry: its own desynchronised `wl_subsurface` *below* the parent,
+  26 px larger on every side with an empty input region (visual only), painted
+  once per size/focus/scheme change. The colours/geometry are GTK's
+  `window.csd` values (`0 3px 9px 1px rgba(0,0,0,.5)` + the 1 px ring, the
+  backdrop variant with `0 2px 6px 2px rgba(0,0,0,.2)`); the *rendered* field
+  was measured on GNOME 50.1 (symmetric, ~0.39 peak, Gaussian sigma 6) and is
+  matched to within 1-2 levels. No shadow while maximised, fullscreen or
+  tiled;
 - GNOME's live settings are followed through `org.freedesktop.portal.Settings`
   (`Read` and `SettingChanged`) with dconf as the fallback: `button-layout`,
   `action-double/middle/right-click-titlebar`, `titlebar-font`,
@@ -170,10 +179,11 @@ coming back to. The doctor prints the setting and the values in force;
 `-verbose` logs the reason for every window's frame decision.
 
 Measured on GNOME 50.1 (headless bed, window sync on): xterm, GTK 3, GTK 4,
-Qt 5, Qt 6, Java/Swing, Tk and Wine each end with exactly one title bar (the
-bridge's, or GTK 4's declared `_MOTIF_WM_HINTS decorations 0`), drag by the
-header, resize from the bottom-right margin and double-click maximise/restore
-to the same content size (40/40 checks). GTK 4/3 apps that declare their own
+Qt 5, Qt 6, Java/Swing, Tk, Motif (nedit), SDL 2, Wine and Chromium each end
+with exactly one title bar (the bridge's, or GTK 4's declared
+`_MOTIF_WM_HINTS decorations 0`, or the declared decorations of the toolkit),
+drag by the header, resize from the bottom-right margin and double-click
+maximise/restore to the same content size. GTK 4/3 apps that declare their own
 frame are not framed by the bridge, so they do not get a second bar. The pixel
 bar for the header is in `tests/p4_decor/compare_headers.py` and
 `tests/out/release/p4_decor/`.

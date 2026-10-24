@@ -375,13 +375,15 @@ fn size_limits(v: &[u32]) -> ((i32, i32), (i32, i32)) {
     (min, max)
 }
 
-/// xdg_toplevel configure states -> (maximised, fullscreen).
-fn toplevel_states(states: &[u8]) -> (bool, bool) {
-    let mut out = (false, false);
+/// xdg_toplevel configure states -> (maximised, fullscreen, tiled).
+fn toplevel_states(states: &[u8]) -> (bool, bool, bool) {
+    let mut out = (false, false, false);
     for c in states.chunks_exact(4) {
         match u32::from_ne_bytes([c[0], c[1], c[2], c[3]]) {
             1 => out.0 = true,
             2 => out.1 = true,
+            // TILED_LEFT/RIGHT/TOP/BOTTOM: `xdg_toplevel_state` 5..8
+            5..=8 => out.2 = true,
             _ => {}
         }
     }
@@ -706,10 +708,12 @@ fn cursor_shape(e: decor::Edge) -> wp_cursor_shape_device_v1::Shape {
 enum Target {
     Content(Window),
     Header(Window),
+    /// The drop shadow below the content: visual only, empty input region.
+    Shadow(Window),
 }
 
-/// The header's pixels: its own memfd and two wl_shm buffers, painted only
-/// when the title, focus, layout or theme changes (never per client frame).
+/// The header's or the shadow's pixels: their own memfd and two wl_shm
+/// buffers, painted only when the title/focus/size changes (never per frame).
 struct HeaderBuffers {
     pool: wl_shm_pool::WlShmPool,
     buffers: [wl_buffer::WlBuffer; 2],
@@ -728,25 +732,43 @@ impl Drop for HeaderBuffers {
     }
 }
 
-/// A framed window's header: a `wl_subsurface` above the content surface.
+/// A framed window's header and drop shadow: two `wl_subsurface`s of the
+/// content surface.  The header is above the parent, the shadow below it; the
+/// shadow extends [`decor::SHADOW_PAD`] px outside the window geometry, where
+/// the compositor sends no input.
 struct Chrome {
     surface: wl_surface::WlSurface,
     subsurface: wl_subsurface::WlSubsurface,
+    shadow_surface: wl_surface::WlSurface,
+    shadow_subsurface: wl_subsurface::WlSubsurface,
     state: decor::HeaderState,
     frame: decor::FrameGeom,
     buffers: Option<HeaderBuffers>,
+    shadow_buffers: Option<HeaderBuffers>,
     dirty: bool,
+    /// The shadow's size/focus/scheme changed: repaint it with the header.
+    shadow_dirty: bool,
     /// The header surface has a buffer committed (not while maximised or
     /// fullscreen, where the design removes it).
     shown: bool,
 }
 
 impl Chrome {
-    /// Drops the header's buffers (a fresh allocation on the next paint; a
-    /// detached header gets no buffer releases, so stale busy flags must not
-    /// survive a hide/restore).
+    /// Drops the header's and the shadow's buffers (a fresh allocation on the
+    /// next paint; a detached surface gets no buffer releases, so stale busy
+    /// flags must not survive a hide/restore).
     fn drop_buffers(&mut self) {
         if let Some(b) = self.buffers.take() {
+            for buf in &b.buffers {
+                buf.destroy();
+            }
+            b.pool.destroy();
+        }
+        self.drop_shadow_buffers();
+    }
+
+    fn drop_shadow_buffers(&mut self) {
+        if let Some(b) = self.shadow_buffers.take() {
             for buf in &b.buffers {
                 buf.destroy();
             }
@@ -761,13 +783,25 @@ impl Chrome {
             }
             b.pool.destroy();
         }
+        if let Some(b) = self.shadow_buffers {
+            for buf in &b.buffers {
+                buf.destroy();
+            }
+            b.pool.destroy();
+        }
         self.subsurface.destroy();
+        self.shadow_subsurface.destroy();
         self.surface.destroy();
+        self.shadow_surface.destroy();
     }
 }
 
-/// A header buffer's release (its user data).
-struct HeaderMark(Window, usize);
+/// A header or shadow buffer's release (its user data).
+#[derive(Clone, Copy)]
+enum BufferMark {
+    Header(Window, usize),
+    Shadow(Window, usize),
+}
 
 enum Role {
     Toplevel(xdg_toplevel::XdgToplevel),
@@ -820,9 +854,12 @@ struct Shown {
     parent: Option<Window>,
     /// A modal dialog's xdg_dialog_v1 (GNOME attaches it to its parent).
     dialog: Option<xdg_dialog_v1::XdgDialogV1>,
-    /// The compositor's last maximised / fullscreen state, as told to X.
+    /// The compositor's last maximised / fullscreen / tiled state, as told to
+    /// X.  Tiled keeps the header but drops the shadow (a snapped window sits
+    /// against the screen edge, where a shadow would overlap its neighbour).
     maximized: bool,
     fullscreen: bool,
+    tiled: bool,
     /// P1: a panel, toolbar, dialog or menu (or a modal window) that belongs
     /// to its client's main window, and waits for one to be shown.
     p1_grouped: bool,
@@ -1189,7 +1226,7 @@ struct State {
     /// Relative motion while locked.
     relative: Vec<(f64, f64)>,
     /// Toplevel states the compositor configured: (window, maximised, fullscreen).
-    states: Vec<(Window, bool, bool)>,
+    states: Vec<(Window, bool, bool, bool)>,
     /// Serial of the last button press on a shown window (for an interactive move).
     press_serial: u32,
     /// A button the header consumed (no XTest press/release reaches X).
@@ -1727,9 +1764,23 @@ impl State {
         region.add(0, 0, i32::from(sw), frame.header.max(0));
         surface.set_input_region(Some(&region));
         region.destroy();
+        // The drop shadow is its own surface *below* the parent: it extends
+        // SHADOW_PAD px outside the window geometry, which is visual only
+        // (empty input region), exactly where GNOME clips pointer input.  It
+        // is painted once per size/focus/scheme change, never per frame.
+        let shadow_surface = compositor.create_surface(qh, Target::Shadow(w));
+        let shadow_subsurface = sub.get_subsurface(&shadow_surface, parent, qh, ());
+        shadow_subsurface.set_position(-decor::SHADOW_PAD, -decor::SHADOW_PAD);
+        shadow_subsurface.set_desync();
+        shadow_subsurface.place_below(parent);
+        let empty = compositor.create_region(qh, ());
+        shadow_surface.set_input_region(Some(&empty));
+        empty.destroy();
         Some(Chrome {
             surface,
             subsurface,
+            shadow_surface,
+            shadow_subsurface,
             state: decor::HeaderState {
                 title: self.title(w),
                 active: self.keyboard_on == Some(w),
@@ -1741,7 +1792,9 @@ impl State {
             },
             frame,
             buffers: None,
+            shadow_buffers: None,
             dirty: true,
+            shadow_dirty: true,
             shown: false,
         })
     }
@@ -1795,15 +1848,24 @@ impl State {
         };
         let shm = self.shm.clone().expect("checked at start");
         let qh = self.qh.clone();
+        let (dirty, shadow_dirty) = match self.windows.get(&w).and_then(|s| s.chrome.as_ref()) {
+            Some(c) => (c.dirty, c.shadow_dirty),
+            None => return,
+        };
+        if !dirty && !shadow_dirty {
+            return;
+        }
+        if !dirty {
+            // only the shadow changed (focus, scheme, size): no title repaint
+            self.paint_shadow(w);
+            return;
+        }
         let Some(s) = self.windows.get_mut(&w) else {
             return;
         };
         let Some(c) = s.chrome.as_mut() else {
             return;
         };
-        if !c.dirty {
-            return;
-        }
         let (ox, _) = c.frame.content_origin();
         let width = (i32::from(s.width) + 2 * ox).max(1) as u16;
         let height = c.frame.header.max(1) as u16;
@@ -1853,6 +1915,64 @@ impl State {
                 t.elapsed().as_millis()
             );
         }
+        self.paint_shadow(w);
+    }
+
+    /// Paints the window's drop shadow once per size/focus/scheme change into
+    /// its own subsurface below the parent (never per client frame).
+    fn paint_shadow(&mut self, w: Window) {
+        let shm = self.shm.clone().expect("checked at start");
+        let qh = self.qh.clone();
+        let radius = self.decor_metrics().radius;
+        let Some(s) = self.windows.get_mut(&w) else {
+            return;
+        };
+        if s.maximized || s.fullscreen || s.tiled || !s.frame.is_framed() {
+            return;
+        }
+        let (sw, sh) = s.frame.surface_size((s.width, s.height));
+        let (width, height) = decor::shadow_size((sw, sh));
+        let Some(c) = s.chrome.as_mut() else {
+            return;
+        };
+        if !c.shadow_dirty {
+            return;
+        }
+        let realloc = c
+            .shadow_buffers
+            .as_ref()
+            .is_none_or(|b| (b.width, b.height) != (width, height));
+        if realloc {
+            c.drop_shadow_buffers();
+            match shadow_buffers(&shm, &qh, w, width, height) {
+                Ok(b) => c.shadow_buffers = Some(b),
+                Err(e) => {
+                    crate::vlog!("-showwindows: can't allocate {w:#x}'s shadow: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(b) = c.shadow_buffers.as_mut() else {
+            return;
+        };
+        let Some(i) = (0..2).find(|&i| !b.busy[i]) else {
+            return;
+        };
+        // SAFETY: `map` is the mmap of `len` bytes made by `shadow_buffers`.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(b.map, b.len) };
+        decor::paint_shadow(pixels, width, height, b.stride, c.state.active, radius);
+        c.shadow_surface.attach(Some(&b.buffers[i]), 0, 0);
+        c.shadow_surface
+            .damage_buffer(0, 0, i32::from(width), i32::from(height));
+        c.shadow_surface.commit();
+        b.busy[i] = true;
+        c.shadow_dirty = false;
+        crate::vlog!(
+            "-showwindows: {w:#x} shadow painted into buffer {i} ({}x{}, {})",
+            width,
+            height,
+            if c.state.active { "active" } else { "backdrop" }
+        );
     }
 
     /// Shows or hides the header with the compositor's maximised/fullscreen
@@ -1865,20 +1985,37 @@ impl State {
             return;
         };
         let want = !s.maximized && !s.fullscreen;
+        let shadow = want && !s.tiled;
         crate::vlog!(
-            "-showwindows: {w:#x} header want {want}, shown {}, maximized {} fullscreen {}",
+            "-showwindows: {w:#x} header want {want}, shown {}, maximized {} fullscreen {} tiled {}",
             c.shown,
             s.maximized,
-            s.fullscreen
+            s.fullscreen,
+            s.tiled
         );
         if want && !c.shown {
             c.drop_buffers();
             c.dirty = true;
+            c.shadow_dirty = true;
         } else if !want && c.shown {
             c.surface.attach(None, 0, 0);
             c.surface.commit();
+            c.shadow_surface.attach(None, 0, 0);
+            c.shadow_surface.commit();
             c.shown = false;
             c.drop_buffers();
+        }
+        // The shadow follows the same rule, except that a tiled window keeps
+        // its header but not the shadow.
+        if !shadow {
+            if c.shadow_buffers.is_some() {
+                c.shadow_surface.attach(None, 0, 0);
+                c.shadow_surface.commit();
+                c.drop_shadow_buffers();
+            }
+            c.shadow_dirty = false;
+        } else if c.shadow_buffers.is_none() || c.shadow_dirty {
+            c.shadow_dirty = true;
         }
         // The window geometry follows the surface: whole surface while the
         // header is drawn, content (origin 0,0) while maximised/fullscreen,
@@ -1895,6 +2032,7 @@ impl State {
             s.window_geometry = geom;
             s.surface.commit();
         }
+        self.paint_shadow(w);
     }
 
     /// The Adwaita metrics in force (the painter's, or the design's before
@@ -1957,6 +2095,7 @@ impl State {
                     c.state.dark = dark;
                     c.drop_buffers();
                     c.dirty = true;
+                    c.shadow_dirty = true;
                 }
             }
         }
@@ -2234,10 +2373,11 @@ impl State {
         let w = if let Some(&w) = surface.data::<Window>() {
             w
         } else {
-            let Target::Header(w) = *surface.data::<Target>()? else {
-                return None;
-            };
-            w
+            match *surface.data::<Target>()? {
+                Target::Header(w) => w,
+                // the shadow has an empty input region: it never gets a point
+                Target::Shadow(_) | Target::Content(_) => return None,
+            }
         };
         // both the content surface and the header (at the surface origin)
         // are surface boxes: content starts at the frame's origin
@@ -2565,6 +2705,7 @@ impl State {
             dialog,
             maximized: false,
             fullscreen: false,
+            tiled: false,
             p1_grouped: grouped,
             p1_waiting: waiting,
             p2_moves: 0,
@@ -2872,6 +3013,7 @@ impl State {
                 dialog: None,
                 maximized: false,
                 fullscreen: false,
+                tiled: false,
                 p1_grouped: false,
                 p1_waiting: false,
                 p2_moves: 0,
@@ -3252,8 +3394,8 @@ impl State {
                 let pending = self
                     .states
                     .iter()
-                    .find(|(x, _, _)| *x == w)
-                    .map(|(_, m, f)| (*m, *f));
+                    .find(|(x, ..)| *x == w)
+                    .map(|(_, m, f, _)| (*m, *f));
                 let (max, full) = pending.unwrap_or((s.maximized, s.fullscreen));
                 // The restore configure of an unmaximised toplevel carries the
                 // *surface* size (the pre-maximise window geometry), not the
@@ -3309,7 +3451,7 @@ impl State {
                 }
             }
         }
-        for (w, maximized, fullscreen) in std::mem::take(&mut self.states) {
+        for (w, maximized, fullscreen, tiled) in std::mem::take(&mut self.states) {
             // While maximised/fullscreen the header is detached and the
             // surface must be the content itself: the X client fills the work
             // area, so its surface origin is the work-area origin.  Keeping
@@ -3328,8 +3470,12 @@ impl State {
                 chrome_frame
             };
             let changed = self.windows.get_mut(&w).is_some_and(|s| {
-                let c = (s.maximized, s.fullscreen) != (maximized, fullscreen);
+                let c = (s.maximized, s.fullscreen, s.tiled) != (maximized, fullscreen, tiled);
                 (s.maximized, s.fullscreen) = (maximized, fullscreen);
+                s.tiled = tiled;
+                if let Some(chrome) = s.chrome.as_mut() {
+                    chrome.shadow_dirty = true;
+                }
                 if s.frame != want_frame {
                     s.frame = want_frame;
                     s.dirty = true;
@@ -3394,6 +3540,7 @@ impl State {
                 if c.state.active != active {
                     c.state.active = active;
                     c.dirty = true;
+                    c.shadow_dirty = true;
                 }
                 c.dirty.then_some(*w)
             })
@@ -5706,6 +5853,7 @@ impl State {
                 dialog: None,
                 maximized: false,
                 fullscreen: false,
+                tiled: false,
                 p1_grouped: false,
                 p1_waiting: false,
                 p2_moves: 0,
@@ -6044,7 +6192,61 @@ fn header_buffers(
                 stride as i32,
                 wl_shm::Format::Argb8888,
                 qh,
-                HeaderMark(w, i),
+                BufferMark::Header(w, i),
+            )
+        };
+        [mk(0), mk(1)]
+    };
+    Ok(HeaderBuffers {
+        pool,
+        buffers,
+        busy: [false; 2],
+        width,
+        height,
+        stride,
+        map: map.cast::<u8>(),
+        len: len * 2,
+    })
+}
+
+fn shadow_buffers(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<State>,
+    w: Window,
+    width: u16,
+    height: u16,
+) -> Result<HeaderBuffers, AnyError> {
+    let stride = width as usize * 4;
+    let len = stride
+        .checked_mul(height as usize)
+        .ok_or("shadow too big")?;
+    let fd = memfd(len * 2)?;
+    // SAFETY: `fd` is `len * 2` bytes (ftruncate in `memfd`), mapped shared,
+    // and unmapped by `HeaderBuffers::drop`.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len * 2,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let pool = shm.create_pool(fd.as_fd(), (len * 2) as i32, qh, ());
+    let buffers = {
+        let mk = |i: usize| {
+            pool.create_buffer(
+                (len * i) as i32,
+                i32::from(width),
+                i32::from(height),
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                BufferMark::Shadow(w, i),
             )
         };
         [mk(0), mk(1)]
@@ -6277,8 +6479,8 @@ impl Dispatch<xdg_toplevel::XdgToplevel, Window> for State {
             } => {
                 state.resize.push((*w, width, height));
                 if *w != state.root {
-                    let (m, f) = toplevel_states(&states);
-                    state.states.push((*w, m, f));
+                    let (m, f, t) = toplevel_states(&states);
+                    state.states.push((*w, m, f, t));
                 }
             }
             _ => {}
@@ -6368,24 +6570,31 @@ impl Dispatch<wl_buffer::WlBuffer, (Window, usize)> for State {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, HeaderMark> for State {
+impl Dispatch<wl_buffer::WlBuffer, BufferMark> for State {
     fn event(
         state: &mut Self,
         _: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
-        data: &HeaderMark,
+        data: &BufferMark,
         _: &WlConnection,
         _: &QueueHandle<Self>,
     ) {
+        let (w, i, shadow) = match *data {
+            BufferMark::Header(w, i) => (w, i, false),
+            BufferMark::Shadow(w, i) => (w, i, true),
+        };
         if let wl_buffer::Event::Release = event
-            && let Some(c) = state
-                .windows
-                .get_mut(&data.0)
-                .and_then(|s| s.chrome.as_mut())
-            && let Some(b) = c.buffers.as_mut()
-            && data.1 < 2
+            && i < 2
+            && let Some(c) = state.windows.get_mut(&w).and_then(|s| s.chrome.as_mut())
         {
-            b.busy[data.1] = false;
+            let b = if shadow {
+                c.shadow_buffers.as_mut()
+            } else {
+                c.buffers.as_mut()
+            };
+            if let Some(b) = b {
+                b.busy[i] = false;
+            }
         }
     }
 }
@@ -6540,6 +6749,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         let (ox, oy) = frame.content_origin();
                         (w, (surface_x - f64::from(ox), surface_y - f64::from(oy)))
                     }
+                    // visual only, empty input region
+                    Target::Shadow(_) => return,
                 };
                 state.pointer_s = Some((sx, sy));
                 if state
@@ -7185,9 +7396,10 @@ mod tests {
     fn configure_states_are_read() {
         use super::toplevel_states;
         let b = |v: &[u32]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
-        assert_eq!(toplevel_states(&b(&[4, 1])), (true, false));
-        assert_eq!(toplevel_states(&b(&[2, 4])), (false, true));
-        assert_eq!(toplevel_states(&b(&[])), (false, false));
+        assert_eq!(toplevel_states(&b(&[4, 1])), (true, false, false));
+        assert_eq!(toplevel_states(&b(&[2, 4])), (false, true, false));
+        assert_eq!(toplevel_states(&b(&[5])), (false, false, true));
+        assert_eq!(toplevel_states(&b(&[])), (false, false, false));
     }
 
     #[test]
