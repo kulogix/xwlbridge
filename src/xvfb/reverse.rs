@@ -551,6 +551,7 @@ struct Atoms {
     net_wm_state_demands_attention: u32,
     net_workarea: u32,
     gtk_workareas: u32,
+    gtk_workareas_d0: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -1085,6 +1086,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_wm_state_demands_attention: atom(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
         net_workarea: atom(b"_NET_WORKAREA")?,
         gtk_workareas: atom(b"_GTK_WORKAREAS")?,
+        gtk_workareas_d0: atom(b"_GTK_WORKAREAS_D0")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -3835,7 +3837,7 @@ impl State {
             let area = [area.x as u32, area.y as u32, area.w as u32, area.h as u32];
             Some((area, per_monitor))
         });
-        let (name, gtk) = (self.atoms.net_workarea, self.atoms.gtk_workareas);
+        let (name, gtk) = (self.atoms.net_workarea, self.atoms.gtk_workareas_d0);
         match &areas {
             Some((area, per_monitor)) => {
                 let set = |property, v: &[u32]| {
