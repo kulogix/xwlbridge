@@ -624,6 +624,14 @@ struct Atoms {
     net_wm_moveresize: u32,
     net_supported: u32,
     net_supporting_wm_check: u32,
+    /// The compositing-manager selection: the bridge is the engine display's
+    /// compositor (it redirects and composites every toplevel), so toolkits
+    /// may use RGBA visuals and their client-side shadows.
+    net_wm_cm_s0: u32,
+    /// `_GTK_FRAME_EXTENTS` in `_NET_SUPPORTED`: without it GTK on a
+    /// composited X server drops its CSD shadow margins (a window is 50 px
+    /// smaller in each direction than on Xwayland).
+    gtk_frame_extents: u32,
     net_active_window: u32,
     net_wm_state_above: u32,
     net_wm_state_stays_on_top: u32,
@@ -1243,6 +1251,8 @@ fn run(
         net_wm_moveresize: atom(b"_NET_WM_MOVERESIZE")?,
         net_supported: atom(b"_NET_SUPPORTED")?,
         net_supporting_wm_check: atom(b"_NET_SUPPORTING_WM_CHECK")?,
+        net_wm_cm_s0: atom(b"_NET_WM_CM_S0")?,
+        gtk_frame_extents: atom(b"_GTK_FRAME_EXTENTS")?,
         net_active_window: atom(b"_NET_ACTIVE_WINDOW")?,
         net_wm_state_above: atom(b"_NET_WM_STATE_ABOVE")?,
         net_wm_state_stays_on_top: atom(b"_NET_WM_STATE_STAYS_ON_TOP")?,
@@ -3122,9 +3132,30 @@ impl State {
             AtomEnum::WINDOW,
             &[check],
         )?;
+        // We composite every toplevel (XComposite manual redirection in
+        // xvfb::mod), so own the compositing-manager selection like mutter's
+        // Xwayland does. GTK then uses an RGBA visual and its CSD shadows;
+        // with _GTK_FRAME_EXTENTS advertised it keeps those shadow margins,
+        // so an X window is the same size as on Xwayland.
+        let current = self.x.get_selection_owner(a.net_wm_cm_s0)?.reply()?.owner;
+        if current == x11rb::NONE {
+            self.x
+                .set_selection_owner(check, a.net_wm_cm_s0, x11rb::CURRENT_TIME)?;
+            self.x.sync()?;
+            let owner = self.x.get_selection_owner(a.net_wm_cm_s0)?.reply()?.owner;
+            if owner == check {
+                crate::log!(
+                    "-showwindows: announced the engine display's compositing manager (_NET_WM_CM_S0); GTK CSD shadows and RGBA visuals are on"
+                );
+            }
+        } else {
+            crate::log!(
+                "-showwindows: a compositing manager already runs on the engine display (0x{current:x}); not taking _NET_WM_CM_S0"
+            );
+        }
         self.wm_announced = true;
         crate::log!(
-            "-showwindows: announced _NET_WM_MOVERESIZE and _NET_WM_STATE (maximise, fullscreen) to clients"
+            "-showwindows: announced _NET_WM_MOVERESIZE, _NET_WM_STATE (maximise, fullscreen) and _GTK_FRAME_EXTENTS to clients"
         );
         Ok(())
     }
@@ -3136,6 +3167,7 @@ impl State {
         let mut v = vec![
             a.net_supported,
             a.net_supporting_wm_check,
+            a.gtk_frame_extents,
             a.net_wm_name,
             a.net_wm_moveresize,
             a.net_wm_state,
@@ -3704,7 +3736,8 @@ impl State {
         self.sync.as_ref().map_or(1, |s| s.scale)
     }
 
-    /// Publishes S through XSETTINGS/Xft.dpi when it changed (M3).
+    /// Publishes S through XSETTINGS/Xft.dpi and mirrors GNOME's live
+    /// settings (theme, fonts, cursor, ...) as they change (M3/M4).
     fn update_settings(&mut self) {
         let scale = self.scale();
         // the tray's Activate/Scroll points and the extension's pointer are
@@ -3713,10 +3746,8 @@ impl State {
         let Some(settings) = self.settings.as_mut() else {
             return;
         };
-        if settings.scale != scale
-            && let Err(e) = settings.set_scale(&self.x, scale)
-        {
-            crate::warning!("-showwindows: can't update HiDPI settings: {e}");
+        if let Err(e) = settings.update(&self.x, scale) {
+            crate::warning!("-showwindows: can't update the desktop settings: {e}");
         }
     }
 

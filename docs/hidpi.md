@@ -33,12 +33,41 @@ the 0.1.2/0.2.0 behaviour, in which one X pixel is one GNOME logical pixel.
   logical size at 96 dpi, so `xrandr`/`Xft` compute a DPI of `96*S`.
 - The bridge owns `_XSETTINGS_S0` on the engine display **only when no other
   XSETTINGS manager runs there**, announces itself with the spec's `MANAGER`
-  ClientMessage (and again on every scale change), and publishes
-  `Gdk/WindowScalingFactor = S`, `Gdk/UnscaledDPI = 96*1024`,
-  `Xft/DPI = 96*S*1024`.
-- `Xft.dpi` in the root's `RESOURCE_MANAGER` is kept at `96*S` (other resource
-  lines are preserved). Qt and Xft toolkits read it; Java reads
-  `gnome.Xft/DPI`/`gnome.Gdk/WindowScalingFactor` from XSETTINGS.
+  ClientMessage (and again on every change), and mirrors the same 53-key table
+  `gsd-xsettings` publishes on GNOME's own Xwayland. It is derived the same
+  way from GNOME's settings: `Net/ThemeName`, `Net/IconThemeName`, the cursor
+  theme and size, `Gtk/FontName`, `Xft/Antialias`, `Xft/Hinting`,
+  `Xft/HintStyle`, `Xft/RGBA`, `Xft/DPI`, `Gdk/WindowScalingFactor`,
+  `Gdk/UnscaledDPI`, the decoration layout and titlebar actions, the double
+  click/drag thresholds, cursor blink, sound theme and event sounds, recent
+  files, accessibility keys and the fixed GTK keys (palette, toolbar style,
+  module list, session bus id, ...).
+- The values are read from the settings portal
+  (`org.freedesktop.portal.Settings`, live `SettingChanged`) and, when that is
+  not available, from GSettings through `gsettings`/`dconf` (a 1.5 s dconf
+  poll, since `gsettings monitor` block-buffers on a pipe). A change bumps the
+  XSETTINGS serial (each key carries the serial at which it last changed) and
+  is republished at once. The key set is the same at 1x and 2x; only the
+  S-derived DPI/cursor-size values differ.
+- `Xft.dpi`, `Xft.antialias`, `Xft.hinting`, `Xft.hintstyle`, `Xft.rgba`,
+  `Xcursor.size`, `Xcursor.theme` and `*customization` in the root's
+  `RESOURCE_MANAGER` are kept in step with that table (other resource lines are
+  preserved), exactly like gsd-xsettings' Xwayland root. Qt and Xft toolkits
+  read them; Java reads `gnome.Xft/DPI`/`gnome.Gdk/WindowScalingFactor` from
+  XSETTINGS.
+
+GNOME 50's gsd-xsettings does not publish `Gtk/PrimaryButtonWarpsSlider`,
+and `color-scheme = prefer-dark` changes no XSETTINGS key on GNOME's own
+Xwayland either (`Gtk/ColorScheme` stays empty there); the mirror keeps the
+same values, and GTK apps get dark mode from the settings portal.
+
+The bridge is also the engine display's compositing manager: it redirects and
+composites every toplevel already, so it owns `_NET_WM_CM_S0` and advertises
+`_GTK_FRAME_EXTENTS` in `_NET_SUPPORTED`. GTK then uses an RGBA visual and
+keeps its client-side shadow margins, so an X window has the same size on both
+displays (without this a CSD window was 50 px smaller in each direction than
+on Xwayland, and a GTK app that sizes itself from its content drew a smaller
+window).
 
 Toolkits that read these settings scale their UI. Measured at 2x (the full
 matrix is in `research/release/p5_hidpi.md`):
@@ -57,11 +86,11 @@ matrix is in `research/release/p5_hidpi.md`):
 - xterm reads `Xft.dpi`: its 11-point font is 14.67 px at 1x and 29.33 px at
   2x.
 - Wine keeps its own DPI (its registry, or what it derives from the X server's
-  reported DPI). Our RandR millimetres give it 192 dpi at S=2, so its Notepad
-  is 1786x1136 X pixels at 2x versus 1132x821 at 1x; it does not read
-  `Xft.dpi`. GNOME's Xwayland reports its monitors' physical millimetres, so
-  Wine there stays at 1132x821 at 2x. This is Wine's own DPI model, not the
-  bridge's.
+  reported DPI). A fresh Wine prefix has **no** `LogPixels` value on either
+  display at 1x or 2x; at 1x both displays give a 1132x821 Notepad, while at
+  2x Wine's own choice varied between runs on both displays (it does not read
+  `Xft.dpi`). This is Wine's DPI model, not a setting the bridge controls;
+  a user who wants a fixed DPI can set `LogPixels` in their own Wine prefix.
 
 Electron/Chromium follow GTK's XSETTINGS. Toolkits that ignore both XSETTINGS
 and Xft.dpi keep rendering at 96 dpi.
@@ -88,14 +117,28 @@ the control):
 | Qt 5 | dpr 1, logical DPI 192, X 300x200 | dpr 1, logical DPI 192, X 300x200 |
 | Java | `screen_resolution=96`, `uiScale=null`, X 300x200 | `screen_resolution=96`, `uiScale=null`, X 300x200 |
 | xterm | Xft font 29.33 px at 2x (14.67 at 1x) | — |
-| Wine | own DPI: X 1786x1136 at 2x (1132x821 at 1x) | X 1132x821 (its own DPI there too) |
+| Wine | 1132x821 at 1x; at 2x its own DPI (no `LogPixels` on either display) | 1132x821 at 1x; at 2x its own DPI, not XSETTINGS |
 
-A real GTK app (`gnome-calculator`) is full-density again: 740x1232 X on
-`:20` at 2x (820x1332 on `:0`); the remaining difference is the theme/font
-set, which the bridge does not mirror (it publishes the scale/DPI part of
-GNOME's XSETTINGS, not its 53 keys). The first frame log of a 30x8 xterm at 2x is
+A real GTK app (`gnome-calculator`) now has exactly the Xwayland size:
+410x666 at 1x and 820x1332 at 2x on both displays, including its 25/50 px CSD
+shadow extents. The first frame log of a 30x8 xterm at 2x is
 `buffer 546x286 X pixels, viewport destination 273x143 logical, S = 2`: the
 buffer is exactly S times the logical size, so the 2x monitor shows it 1:1.
+
+### Round-4 acceptance (2026-10-24)
+
+On `dsh-p2mon`, GNOME 50.1, at 1x and 2x, the engine display's XSETTINGS is
+key-for-key equal to GNOME Xwayland's: 53 keys, no missing, no extra, no
+different values; `RESOURCE_MANAGER` is line-for-line equal. A live change of
+theme, font, cursor size, decoration layout, double-click time and
+antialiasing updated both displays to the same table (serial 2) and restoring
+updated both again (serial 3). With the portal stopped, the GSettings fallback
+produced the same table and followed a live theme change. Screenshots of
+`gnome-calculator`, a GTK 3 app, a GTK 4 app and a Qt 6 app, cropped inside the
+client area, were 100% pixel-identical between `:0` and `:20` at 1x and 2x.
+Evidence: `tests/out/release/p5_hidpi/vm/settings/round4/` (tables, diffs,
+apps, Wine), `.../pixels/` (screenshots, crops, `pixels_compare.txt`),
+`.../fallback/` (portal stopped).
 
 Earlier rounds saw GTK 3/4 and Qt 6 create half-size windows and X
 self-moves that the desktop did not follow. Both had one cause: an
