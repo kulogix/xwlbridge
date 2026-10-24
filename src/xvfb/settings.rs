@@ -19,7 +19,8 @@
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt, CreateWindowAux, PropMode, Window, WindowClass,
+    AtomEnum, ClientMessageEvent, ConnectionExt, CreateWindowAux, EventMask, PropMode, Window,
+    WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -83,6 +84,8 @@ fn values(s: u32) -> Vec<(&'static str, Value<'static>)> {
 /// the process).
 pub struct Settings {
     pub owner: Window,
+    /// The `_XSETTINGS_S0` selection atom (for the `MANAGER` announcement).
+    selection: u32,
     prop: u32,
     resource_manager: u32,
     serial: u32,
@@ -118,6 +121,7 @@ impl Settings {
         )?;
         let mut me = Settings {
             owner,
+            selection,
             prop,
             resource_manager,
             serial: 0,
@@ -144,6 +148,32 @@ impl Settings {
         Ok(me)
     }
 
+    /// Tells every client that there is an XSETTINGS manager now (the spec's `MANAGER`
+    /// ClientMessage: SelectionTime, the selection atom, the owner window). Without it a client
+    /// that was already connected when the bridge took the selection only learns of the
+    /// settings from a property change.
+    fn announce(&self, conn: &RustConnection, selection: u32) -> Result<(), AnyError> {
+        let manager = conn.intern_atom(false, b"MANAGER")?.reply()?.atom;
+        let mut data = [0u32; 5];
+        data[..3].copy_from_slice(&[x11rb::CURRENT_TIME, selection, self.owner]);
+        let event = ClientMessageEvent {
+            response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: conn.setup().roots[0].root,
+            type_: manager,
+            data: data.into(),
+        };
+        conn.send_event(
+            false,
+            conn.setup().roots[0].root,
+            EventMask::STRUCTURE_NOTIFY,
+            event,
+        )?;
+        conn.flush()?;
+        Ok(())
+    }
+
     /// Publishes S (the X scale): the XSETTINGS values and `Xft.dpi`.
     pub fn set_scale(&mut self, conn: &RustConnection, scale: u32) -> Result<(), AnyError> {
         if !self.active || self.scale == scale.max(1) {
@@ -158,6 +188,9 @@ impl Settings {
         let data = encode(&values(scale), self.serial);
         conn.change_property8(PropMode::REPLACE, self.owner, self.prop, self.prop, &data)?;
         self.set_resource_manager(conn, scale)?;
+        // (re-)announce on every change too: a client that connected after the manager
+        // took the selection still learns that the settings it has are new
+        self.announce(conn, self.selection)?;
         conn.sync()?;
         self.scale = scale;
         crate::log!(

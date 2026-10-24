@@ -39,6 +39,11 @@ use crate::xvfb::Auth;
 /// as the reverse path's are (`xvfb::record` classifies it so: it must never reach the desktop).
 static CONNECTION_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// S (X pixels = logical pixels x S), as the reverse path last reported it. The StatusNotifierItem calls
+/// (`Activate`, `Scroll`) and the extension's pointer are in the desktop's logical pixels; the icon, the
+/// XTest click and its container are in X pixels. The tray reads this at every click (it changes live).
+static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 /// Whether `xid_base` is the tray thread's X connection.
 pub fn is_tray_client(xid_base: u32) -> bool {
     xid_base != 0 && CONNECTION_BASE.load(std::sync::atomic::Ordering::Relaxed) == xid_base
@@ -47,6 +52,16 @@ pub fn is_tray_client(xid_base: u32) -> bool {
 /// Records the tray's connection base (called by the tray thread once it is connected).
 pub fn set_connection_base(xid_base: u32) {
     CONNECTION_BASE.store(xid_base, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The X <-> logical scale the tray converts with (the reverse path sets it on every sync loop).
+pub fn set_scale(scale: u32) {
+    SCALE.store(scale.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The scale in force (1 without HiDPI).
+pub fn scale() -> u32 {
+    SCALE.load(std::sync::atomic::Ordering::Relaxed).max(1)
 }
 
 /// Starts the tray for `-showwindows` on the engine display: `None` (and a log line) if another tray has the

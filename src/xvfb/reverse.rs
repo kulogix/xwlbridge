@@ -3707,6 +3707,9 @@ impl State {
     /// Publishes S through XSETTINGS/Xft.dpi when it changed (M3).
     fn update_settings(&mut self) {
         let scale = self.scale();
+        // the tray's Activate/Scroll points and the extension's pointer are
+        // logical; the icon and its XTest click are X pixels
+        super::tray::set_scale(scale);
         let Some(settings) = self.settings.as_mut() else {
             return;
         };
@@ -5296,6 +5299,12 @@ impl Dispatch<xdg_toplevel::XdgToplevel, Window> for State {
                 height,
                 states,
             } => {
+                // surface-local (logical) pixels; X is logical x S. The
+                // compositor repeats the current logical size on every
+                // configure (including a move), so converting here is what
+                // keeps an X window from shrinking by S each time.
+                let (width, height) =
+                    winsync::Space::new(state.scale()).configure_size(width, height);
                 state.resize.push((*w, width, height));
                 if *w != state.root {
                     let (m, f) = toplevel_states(&states);

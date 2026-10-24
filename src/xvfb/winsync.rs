@@ -121,6 +121,14 @@ impl Space {
         let round = |v: i32| (f64::from(v) / s).round() as i32;
         Rect::new(round(r.x), round(r.y), round(r.w), round(r.h))
     }
+
+    /// The X size of an xdg-toplevel configure size. The protocol's
+    /// `width`/`height` are surface-local, i.e. logical pixels; 0 means "no
+    /// preference" and stays 0.
+    pub fn configure_size(self, w: i32, h: i32) -> (i32, i32) {
+        let s = self.scale as i32;
+        (w.max(0).saturating_mul(s), h.max(0).saturating_mul(s))
+    }
 }
 
 /// S from the desktop's monitors: the largest scale, rounded up (at least 1).
@@ -2703,6 +2711,18 @@ mod tests {
         assert_eq!(layout_fits(&mixed, (5120, 1440), 2), Ok(()));
         // 3x
         assert_eq!(hidpi_scale(&[m(Rect::new(0, 0, 640, 360), 3.0)]), 3);
+    }
+
+    #[test]
+    fn a_configure_size_is_logical() {
+        // xdg_toplevel's width/height are logical (surface-local): X is
+        // logical x S, or a configure of the window's current size would
+        // shrink an X window by S every time the compositor sent one
+        assert_eq!(Space::new(1).configure_size(300, 200), (300, 200));
+        assert_eq!(Space::new(2).configure_size(300, 200), (600, 400));
+        assert_eq!(Space::new(2).configure_size(0, 0), (0, 0));
+        // 1.25x still runs at S = 2, and an odd logical size rounds once
+        assert_eq!(Space::new(2).configure_size(1537, 865), (3074, 1730));
     }
 
     #[test]

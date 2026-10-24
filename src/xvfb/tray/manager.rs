@@ -874,7 +874,7 @@ impl Manager {
                 x: Some(x),
                 y: Some(y),
                 ..
-            } => match clicks::origin(x, y, target) {
+            } => match clicks::origin(x, y, target, super::scale()) {
                 // the click's X point is the desktop's point: the container moves under it
                 clicks::Origin::Container(ox, oy) => {
                     let (px, py) = inside(ox, oy);
@@ -897,7 +897,7 @@ impl Manager {
                 x: Some(x),
                 y: Some(y),
                 ..
-            } => match clicks::origin(x, y, target) {
+            } => match clicks::origin(x, y, target, super::scale()) {
                 clicks::Origin::Container(ox, oy) => {
                     let (px, py) = inside(ox, oy);
                     (
@@ -1017,7 +1017,11 @@ impl Manager {
     /// The desktop's pointer, where the session shows it, or the top right corner of the primary monitor
     /// (the status icons' end) without the extension.
     fn pointer(&self) -> (i32, i32) {
-        crate::xvfb::tray::pointer::point()
+        // the extension (and the fallback) answer in the desktop's logical
+        // pixels; the XTest click is X pixels
+        let (x, y) = crate::xvfb::tray::pointer::point();
+        let s = super::scale() as i32;
+        (x.saturating_mul(s), y.saturating_mul(s))
     }
 
     /// The XTest events of a click: this connection's XTest devices, which are the reverse master's when
