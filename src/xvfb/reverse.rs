@@ -48,7 +48,7 @@ use std::time::Instant;
 
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
+    wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
 };
 use wayland_client::{Connection as WlConnection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
@@ -168,6 +168,73 @@ fn add_master_len(name_len: usize) -> u16 {
 
 /// Where a window of `len` pixels at `p` goes so it is wholly on a screen of
 /// `max` pixels (at 0 if it can't be).
+/// Reads `len` bytes at `offset` from `fd` (a memfd frame) into a Vec.
+fn pread_all(fd: &OwnedFd, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = vec![0u8; len];
+    let mut got = 0;
+    while got < len {
+        let n = unsafe {
+            libc::pread(
+                fd.as_raw_fd(),
+                out[got..].as_mut_ptr().cast(),
+                len - got,
+                (offset + got) as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short frame",
+            ));
+        }
+        got += n as usize;
+    }
+    Ok(out)
+}
+
+/// Writes `data` at `offset` into `fd`.
+fn pwrite_all(fd: &OwnedFd, offset: usize, data: &[u8]) -> std::io::Result<()> {
+    let mut put = 0;
+    while put < data.len() {
+        let n = unsafe {
+            libc::pwrite(
+                fd.as_raw_fd(),
+                data[put..].as_ptr().cast(),
+                data.len() - put,
+                (offset + put) as libc::off_t,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        put += n as usize;
+    }
+    Ok(())
+}
+
+/// The largest rectangle with `src`'s aspect inside `dst` (integer pixels,
+/// at least 1x1), for the letterboxed presentation.
+fn letterbox(src: (i32, i32), dst: (i32, i32)) -> (i32, i32) {
+    let (sw, sh) = (src.0.max(1) as i64, src.1.max(1) as i64);
+    let (dw, dh) = (dst.0.max(1) as i64, dst.1.max(1) as i64);
+    if dw * sh <= dh * sw {
+        (dw as i32, ((sh * dw + sw / 2) / sw).max(1) as i32)
+    } else {
+        (((sw * dh + sh / 2) / sh).max(1) as i32, dh as i32)
+    }
+}
+
 fn fit(p: i16, len: u16, max: i32) -> i16 {
     if len as i32 >= max {
         0
@@ -629,12 +696,18 @@ struct Atoms {
     gtk_workareas_d0: u32,
     /// Marks the tray's containers (`xvfb::tray`), which hold the tray icons.
     tray_container: u32,
+    /// `_XWLBRIDGE_EMULATED_MODE` on a fullscreen window whose output's mode
+    /// the agent is emulating (the monitor and the client's mode).
+    emulated_mode: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
 /// server (MIT-SHM) and the compositor (wl_shm) alike.
 struct Buffers {
     seg: u32,
+    /// The memfd behind `seg` (and the wl_shm pool), kept so the CPU can read
+    /// a frame when an emulated mode composes it into the letterbox.
+    fd: OwnedFd,
     pool: wl_shm_pool::WlShmPool,
     buffers: [wl_buffer::WlBuffer; 2],
     busy: [bool; 2],
@@ -654,6 +727,30 @@ enum Role {
         toplevel: xdg_toplevel::XdgToplevel,
         viewport: Option<wp_viewport::WpViewport>,
     },
+}
+
+/// A fullscreen game window's emulated mode presentation: the parent surface
+/// is the monitor (a black buffer), and the game's pixels go on a subsurface
+/// scaled by wp_viewporter to the largest aspect-correct rectangle, centered
+/// (the letterbox).
+struct Present {
+    /// The monitor-sized buffer, composed on the CPU: the game scaled into
+    /// the letterbox, black bars around it.
+    fd: OwnedFd,
+    pool: wl_shm_pool::WlShmPool,
+    buffers: [wl_buffer::WlBuffer; 2],
+    busy: [bool; 2],
+    monitor: (i32, i32),
+    /// Where the game buffer is drawn in the parent (letterbox).
+    dest: (i32, i32),
+    offset: (i32, i32),
+    /// The composed pixels (one frame), reused every paint.
+    out: Vec<u8>,
+    /// Bytes per monitor frame (for the pwrite offset).
+    frame: usize,
+    /// A black frame has been written once (the bars never change).
+    bars_done: bool,
+    painted: bool,
 }
 
 struct Shown {
@@ -703,6 +800,8 @@ struct Shown {
     p1_waiting: bool,
     /// P2: how many times P2 moved the window back on the X screen.
     p2_moves: u8,
+    /// An emulated RandR mode on this window's output: the monitor view.
+    present: Option<Present>,
 }
 
 /// `-showscreen`: a window of the X screen, composited onto the canvas.
@@ -991,6 +1090,7 @@ struct State {
     atoms: Atoms,
     resource_mask: u32,
     compositor: Option<wl_compositor::WlCompositor>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// The queue xdg_wm_base's pings are answered on (`spawn_pinger`).
@@ -1181,6 +1281,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         gtk_workareas: atom(b"_GTK_WORKAREAS")?,
         gtk_workareas_d0: atom(b"_GTK_WORKAREAS_D0")?,
         tray_container: atom(crate::xvfb::tray::dock::CONTAINER.as_bytes())?,
+        emulated_mode: atom(b"_XWLBRIDGE_EMULATED_MODE")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -1197,6 +1298,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         atoms,
         resource_mask,
         compositor: None,
+        subcompositor: None,
         shm: None,
         wm_base: None,
         ping_qh,
@@ -1267,7 +1369,9 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
     queue.roundtrip(&mut state)?;
     queue.roundtrip(&mut state)?;
     if state.compositor.is_none() || state.shm.is_none() || state.wm_base.is_none() {
-        return Err("the compositor lacks wl_compositor, wl_shm or xdg_wm_base".into());
+        return Err(
+            "the compositor lacks wl_compositor, wl_subcompositor, wl_shm or xdg_wm_base".into(),
+        );
     }
     crate::log!(
         "-showwindows: showing the engine display's {} on the desktop (reverse master {:?}; pointer lock {}, viewporter {}, toplevel tags {})",
@@ -1716,6 +1820,7 @@ impl State {
             p1_grouped: grouped,
             p1_waiting: waiting,
             p2_moves: 0,
+            present: None,
         };
         if let Some(sync) = self.sync.as_mut() {
             let r = Rect::new(
@@ -2003,6 +2108,7 @@ impl State {
                 p1_grouped: false,
                 p1_waiting: false,
                 p2_moves: 0,
+                present: None,
             },
         );
         self.popups.push(w);
@@ -2056,9 +2162,15 @@ impl State {
         for c in &children {
             self.hide(*c, qh);
         }
-        let Some(s) = self.windows.remove(&w) else {
+        let Some(mut s) = self.windows.remove(&w) else {
             return;
         };
+        if let Some(p) = s.present.take() {
+            for b in &p.buffers {
+                b.destroy();
+            }
+            p.pool.destroy();
+        }
         self.popups.retain(|p| *p != w);
         self.sync_forget(w);
         self.p1_gone(w);
@@ -2288,6 +2400,13 @@ impl State {
                 }
                 self.paint(e.window);
             }
+            // a mode emulated for this fullscreen window (the agent set the
+            // property): present it scaled on its monitor
+            Event::PropertyNotify(e)
+                if e.atom == self.atoms.emulated_mode && self.windows.contains_key(&e.window) =>
+            {
+                self.refresh_presentation(e.window, qh)
+            }
             // with the window sync: keep-above and attention hints
             Event::PropertyNotify(e)
                 if (e.atom == self.atoms.net_wm_state
@@ -2327,8 +2446,14 @@ impl State {
             self.sync_send(w);
         }
         for (w, i) in std::mem::take(&mut self.released) {
-            if let Some(b) = self.windows.get_mut(&w).and_then(|s| s.buffers.as_mut()) {
-                b.busy[i] = false;
+            if i < 2 {
+                if let Some(b) = self.windows.get_mut(&w).and_then(|s| s.buffers.as_mut()) {
+                    b.busy[i] = false;
+                }
+            } else if let Some(p) = self.windows.get_mut(&w).and_then(|s| s.present.as_mut())
+                && let Some(b) = p.busy.get_mut(i - 2)
+            {
+                *b = false;
             }
             self.paint(w);
         }
@@ -2338,6 +2463,9 @@ impl State {
         for (w, width, height) in std::mem::take(&mut self.resize) {
             if w == self.root {
                 self.rescale(width, height);
+                continue;
+            }
+            if self.windows.get(&w).is_some_and(|s| s.present.is_some()) {
                 continue;
             }
             if let Some(s) = self.windows.get(&w)
@@ -2518,6 +2646,7 @@ impl State {
             let buffers = [mk(0), mk(1)];
             s.buffers = Some(Buffers {
                 seg,
+                fd,
                 pool,
                 buffers,
                 busy: [false; 2],
@@ -2578,16 +2707,70 @@ impl State {
             s.dirty = true;
             return Err(e.into());
         }
-        s.surface.attach(Some(&b.buffers[i]), 0, 0);
-        s.surface
-            .damage_buffer(0, 0, b.width as i32, b.height as i32);
+        let (bw, bh) = (b.width, b.height);
+        if let Some(p) = s.present.as_mut() {
+            let game = match pread_all(&b.fd, b.frame * i, b.frame) {
+                Ok(v) => v,
+                Err(e) => {
+                    s.dirty = true;
+                    return Err(e.into());
+                }
+            };
+            let (sw, sh) = (usize::from(b.width), usize::from(b.height));
+            let (dw0, dh0) = letterbox((i32::from(b.width), i32::from(b.height)), p.monitor);
+            p.dest = (dw0, dh0);
+            p.offset = ((p.monitor.0 - dw0) / 2, (p.monitor.1 - dh0) / 2);
+            let (mw, mh) = (p.monitor.0 as usize, p.monitor.1 as usize);
+            let (dw, dh) = (p.dest.0 as usize, p.dest.1 as usize);
+            let (ox, oy) = (p.offset.0.max(0) as usize, p.offset.1.max(0) as usize);
+            // the bars are black every frame: an earlier, larger game frame
+            // must not leave its pixels there after the game resized
+            p.out.fill(0);
+            p.bars_done = true;
+            if sw > 0 && sh > 0 && dw > 0 && dh > 0 && mw > 0 && mh > 0 {
+                for dy in 0..dh.min(mh.saturating_sub(oy)) {
+                    let sy = dy * sh / dh;
+                    let src = sy * sw * 4;
+                    let dst = ((oy + dy) * mw + ox) * 4;
+                    for dx in 0..dw.min(mw.saturating_sub(ox)) {
+                        let sx = dx * sw / dw;
+                        let si = src + sx * 4;
+                        let di = dst + dx * 4;
+                        p.out[di..di + 4].copy_from_slice(&game[si..si + 4]);
+                    }
+                }
+            }
+            let Some(j) = (0..2).find(|&j| !p.busy[j]) else {
+                return Ok(()); // the compositor holds both; repaint on release
+            };
+            if let Err(e) = pwrite_all(&p.fd, p.frame * j, &p.out) {
+                s.dirty = true;
+                return Err(e.into());
+            }
+            p.busy[j] = true;
+            s.surface.attach(Some(&p.buffers[j]), 0, 0);
+            s.surface.damage_buffer(0, 0, p.monitor.0, p.monitor.1);
+            if !p.painted {
+                p.painted = true;
+                crate::log!(
+                    "-showwindows: {w:#x}'s first emulated-mode frame {bw}x{bh} -> {}x{} at {},{}",
+                    p.dest.0,
+                    p.dest.1,
+                    p.offset.0,
+                    p.offset.1
+                );
+            }
+        } else {
+            s.surface.attach(Some(&b.buffers[i]), 0, 0);
+            s.surface
+                .damage_buffer(0, 0, i32::from(b.width), i32::from(b.height));
+        }
         if self.throttle {
             s.surface.frame(&self.qh, w);
             s.frame_pending = true;
         }
         s.committed_at = Some(std::time::Instant::now());
         s.surface.commit();
-        b.busy[i] = true;
         s.frames += 1;
         if s.frames == 1 {
             crate::log!("-showwindows: first frame of {w:#x} on the desktop");
@@ -2600,6 +2783,144 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// The emulated mode the agent set on `w`: monitor x, y, w, h and the
+    /// client's mode w, h.
+    fn emulated_mode_of(&self, w: Window) -> Option<(i32, i32, i32, i32, i32, i32)> {
+        let r = self
+            .x
+            .get_property(false, w, self.atoms.emulated_mode, AtomEnum::CARDINAL, 0, 6)
+            .ok()?
+            .reply()
+            .ok()?;
+        let v: Vec<u32> = r.value32()?.collect();
+        if v.len() < 6 {
+            return None;
+        }
+        Some((
+            v[0] as i32,
+            v[1] as i32,
+            v[2] as i32,
+            v[3] as i32,
+            v[4] as i32,
+            v[5] as i32,
+        ))
+    }
+
+    /// The monitor-sized buffers for the parent surface: two frames of black
+    /// (the letterbox), composed into on the CPU.
+    fn present_parent(
+        &self,
+        w: Window,
+        width: i32,
+        height: i32,
+    ) -> Result<(OwnedFd, wl_shm_pool::WlShmPool, [wl_buffer::WlBuffer; 2]), AnyError> {
+        let (mw, mh) = (width.max(1) as u16, height.max(1) as u16);
+        let frame = frame_bytes(mw, mh).ok_or("the monitor is too big to show")?;
+        let fd = memfd(frame * 2)?;
+        let shm = self.shm.clone().expect("checked at start");
+        let pool = shm.create_pool(fd.as_fd(), (frame * 2) as i32, &self.qh, ());
+        let buffers = std::array::from_fn(|i| {
+            pool.create_buffer(
+                (frame * i) as i32,
+                i32::from(mw),
+                i32::from(mh),
+                i32::from(mw) * 4,
+                wl_shm::Format::Xrgb8888,
+                &self.qh,
+                (w, 2 + i),
+            )
+        });
+        Ok((fd, pool, buffers))
+    }
+
+    /// Turns the emulated-mode view on, off, or updates it for `w`'s current
+    /// X size. The game's pixels are scaled into the monitor-sized parent
+    /// buffer with its aspect kept (nearest-neighbour; the bars are black).
+    fn refresh_presentation(&mut self, w: Window, qh: &QueueHandle<State>) {
+        let Some((mx, my, mw, mh, _mode_w, _mode_h)) = self.emulated_mode_of(w) else {
+            if self.windows.get(&w).is_some_and(|s| s.present.is_some()) {
+                crate::vlog!("-showwindows: {w:#x} left its emulated mode");
+            }
+            self.drop_present(w);
+            if let Some(s) = self.windows.get_mut(&w) {
+                s.dirty = true;
+            }
+            self.paint(w);
+            return;
+        };
+        if mw <= 0 || mh <= 0 {
+            return;
+        }
+        let monitor = (mw, mh);
+        let (sw, sh) = self
+            .windows
+            .get(&w)
+            .map_or((mw, mh), |s| (i32::from(s.width), i32::from(s.height)));
+        if let Some(p) = self
+            .windows
+            .get_mut(&w)
+            .and_then(|s| s.present.as_mut())
+            .filter(|p| p.monitor == monitor)
+        {
+            let (dw, dh) = letterbox((sw, sh), monitor);
+            p.dest = (dw, dh);
+            p.offset = ((mw - dw) / 2, (mh - dh) / 2);
+            return;
+        }
+        self.drop_present(w);
+        let Ok((fd, pool, buffers)) = self.present_parent(w, mw, mh) else {
+            crate::warning!("-showwindows: can't allocate the letterbox buffer");
+            return;
+        };
+        let (sw, sh) = self
+            .windows
+            .get(&w)
+            .map_or((mw, mh), |s| (i32::from(s.width), i32::from(s.height)));
+        let (dw, dh) = letterbox((sw, sh), monitor);
+        let offset = ((mw - dw) / 2, (mh - dh) / 2);
+        let Some(s) = self.windows.get(&w) else {
+            return;
+        };
+        s.surface.attach(Some(&buffers[0]), 0, 0);
+        s.surface.damage_buffer(0, 0, mw, mh);
+        s.surface.commit();
+        let out = vec![0u8; (mw as usize) * (mh as usize) * 4];
+        crate::log!(
+            "-showwindows: {w:#x} shown on its emulated mode: game {sw}x{sh} in {mw}x{mh} at {dw}x{dh}+{}+{}",
+            offset.0,
+            offset.1
+        );
+        if let Some(s) = self.windows.get_mut(&w) {
+            s.present = Some(Present {
+                fd,
+                pool,
+                buffers,
+                busy: [true, false], // buffer 0 is attached now
+                monitor,
+                dest: (dw, dh),
+                offset,
+                out,
+                frame: (mw as usize) * (mh as usize) * 4,
+                bars_done: false,
+                painted: false,
+            });
+            s.dirty = true;
+        }
+        let _ = (mx, my, qh);
+        self.paint(w);
+    }
+
+    /// Removes the emulated-mode view (leave case or a window going away).
+    fn drop_present(&mut self, w: Window) {
+        let Some(p) = self.windows.get_mut(&w).and_then(|s| s.present.take()) else {
+            return;
+        };
+        for b in &p.buffers {
+            b.destroy();
+        }
+        p.pool.destroy();
     }
 
     fn close_window(&mut self, w: Window) {
@@ -2677,6 +2998,16 @@ impl State {
             return Some((sx / scale, sy / scale));
         }
         let s = self.windows.get(&w)?;
+        // an emulated mode: pointer coordinates are in the scaled (viewport
+        // destination) surface, the game's window is the source buffer
+        if let Some(p) = s.present.as_ref().filter(|p| p.dest.0 > 0 && p.dest.1 > 0) {
+            // the presentation is the whole monitor: the game's window origin
+            // (where the desktop may have put it) is not part of this mapping
+            return Some((
+                (sx - f64::from(p.offset.0)) * f64::from(s.width) / f64::from(p.dest.0),
+                (sy - f64::from(p.offset.1)) * f64::from(s.height) / f64::from(p.dest.1),
+            ));
+        }
         Some((f64::from(s.x) + sx, f64::from(s.y) + sy))
     }
 
@@ -3093,9 +3424,12 @@ impl State {
             }
             if props.contains(&a.net_wm_state_hidden) && want(false) {
                 t.set_minimized();
+                // leave case: minimise restores an emulated mode
+                let _ = self.x.delete_property(e.window, self.atoms.emulated_mode);
             }
         } else if e.type_ == a.wm_change_state && d[0] == 3 {
             t.set_minimized();
+            let _ = self.x.delete_property(e.window, self.atoms.emulated_mode);
             crate::log!("-showwindows: {:#x} iconifies itself: minimised", e.window);
         } else if e.type_ == a.net_wm_moveresize {
             // [x_root, y_root, direction, button, source]: an interactive move
@@ -3645,6 +3979,12 @@ impl State {
         if !self.synced_toplevel(w) {
             return;
         }
+        // an emulated mode: the game's window is its own size (the client's
+        // 1024x768), not the fullscreen monitor; the desktop's geometry must
+        // not resize it back
+        if self.windows.get(&w).is_some_and(|s| s.present.is_some()) {
+            return;
+        }
         let Some(s) = self.windows.get(&w) else {
             return;
         };
@@ -3745,6 +4085,11 @@ impl State {
             return;
         };
         sync.due.remove(&w);
+        // an emulated mode's X window is the client's mode, not the desktop
+        // geometry: do not make the desktop follow it
+        if self.windows.get(&w).is_some_and(|s| s.present.is_some()) {
+            return;
+        }
         // nothing goes before the desktop has shown the window: its first
         // report places it (where it was asked to open, or where GNOME puts
         // it) and X follows that
@@ -4589,6 +4934,7 @@ impl State {
                 p1_grouped: false,
                 p1_waiting: false,
                 p2_moves: 0,
+                present: None,
             },
         );
         Ok(())
@@ -4892,6 +5238,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_compositor" => {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
                 }
+                "wl_subcompositor" => state.subcompositor = Some(registry.bind(name, 1, qh, ())),
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => {
                     state.wm_base = Some(registry.bind(name, version.min(2), &state.ping_qh, ()))
@@ -5159,9 +5506,7 @@ impl Dispatch<wl_buffer::WlBuffer, (Window, usize)> for State {
         _: &WlConnection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_buffer::Event::Release = event
-            && data.1 < 2
-        {
+        if let wl_buffer::Event::Release = event {
             state.released.push(*data);
         }
     }
@@ -5391,6 +5736,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Leave { .. } => {
                 state.release_keys();
                 let had = state.keyboard_on;
+                // leave case (Alt+Tab, another desktop window taking the
+                // keyboard): the emulated mode is restored through the agent
+                if let Some(w) = had
+                    && state.windows.get(&w).is_some_and(|s| s.present.is_some())
+                {
+                    let _ = state.x.delete_property(w, state.atoms.emulated_mode);
+                }
                 on_keyboard_leave(&mut state.keyboard_left, &mut state.keyboard_on);
                 // its client's earlier input no longer vouches for a raise
                 if let Some(w) = had {
@@ -5489,12 +5841,14 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for State {
 }
 
 wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
+wayland_client::delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
 wayland_client::delegate_noop!(State: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
 wayland_client::delegate_noop!(State: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
 wayland_client::delegate_noop!(State: ignore wp_viewporter::WpViewporter);
+wayland_client::delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
 wayland_client::delegate_noop!(State: ignore wp_viewport::WpViewport);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_manager_v2::ZwpTabletManagerV2);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2);

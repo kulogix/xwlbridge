@@ -58,7 +58,7 @@
 //! restart: a RealVNC server, for one, outlives its X server and would
 //! otherwise keep serving nothing.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -73,8 +73,9 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Family,
-    HostMode, ImageFormat, NotifyDetail, NotifyMode, StackMode, Window, WindowClass,
+    AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
+    Family, HostMode, ImageFormat, MapState, NotifyDetail, NotifyMode, StackMode, Window,
+    WindowClass,
 };
 use x11rb::protocol::{Event, composite, randr, res, shm, xkb, xtest};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
@@ -87,6 +88,8 @@ mod cursor;
 mod motion;
 mod record;
 mod reverse;
+// Xvnc's RFB SetDesktopSize: one RandR output per desktop monitor (rfb.rs)
+mod rfb;
 // -showwindows' pointer during a held self-drag of a synced window (reverse.rs)
 mod selfdrag;
 // the -showwindows X tray (gnome and xvfb only; see tray::enabled for the setting)
@@ -104,6 +107,32 @@ use crate::bridge::Server;
 use crate::bridge::input::{BUTTON_PRESS, BUTTON_RELEASE, KEY_PRESS, KEY_RELEASE, MOTION_NOTIFY};
 use crate::bridge::xkbdesc::one_layout;
 use crate::config::EngineType;
+
+/// A CRTC's mode and position: the desktop's layout, or a client's emulated
+/// mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CrtcSnap {
+    crtc: u32,
+    output: u32,
+    mode: u32,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+}
+
+/// A client's mode change on one output that is being emulated: the output
+/// keeps the mode, the X screen and every other output stay, and the
+/// fullscreen window on that monitor is shown scaled.
+#[derive(Clone, Debug)]
+struct EmulatedMode {
+    crtc: u32,
+    window: Window,
+    /// The desktop's CRTC state before the client's change.
+    old: CrtcSnap,
+    /// The client's mode.
+    mode: (u16, u16),
+}
 
 /// The X client id the agent's forwarded input is accounted under. Xvfb
 /// merges every client's XTest into one device, so per-client accounting is
@@ -558,7 +587,10 @@ pub fn start(server: &Arc<Server>, program: &Path) -> io::Result<Started> {
             "-AcceptPointerEvents=0",
             "-AcceptCutText=0",
             "-SendCutText=0",
-            "-AcceptSetDesktopSize=0",
+            // We are Xvnc's only RFB client and use SetDesktopSize to give
+            // X one RandR output per desktop monitor (rfb.rs); its socket is
+            // private to us.
+            "-AcceptSetDesktopSize=1",
         ]);
     } else {
         cmd.args(["-screen", "0", &format!("{w}x{h}x24")]);
@@ -1316,6 +1348,30 @@ struct Agent {
     monitors: Vec<Monitor>,
     /// RandR monitors we created, to delete when the layout changes.
     monitor_atoms: Vec<u32>,
+    /// Whether Xvnc takes its output layout from our RFB `SetDesktopSize`
+    /// (one output per desktop monitor), rather than the fallback one-output
+    /// model (`-engine xvfb`, or an Xvnc that refused the layout).
+    rfb_layout: bool,
+    /// Our own RFB layout change is being read back: a root size change that
+    /// follows it is not a client's resize.
+    layout_ours: bool,
+    /// Xvnc's private RFB socket (the one `start` gave it), for the layout
+    /// requests in [`rfb`].
+    rfb_socket: PathBuf,
+    /// The desktop monitor each RandR output carries (set with the RandR 1.5
+    /// monitors; used to tell an emulated output from a real one).
+    monitor_outputs: Vec<u32>,
+    /// The CRTC state that is the desktop's (before any client mode change),
+    /// per CRTC: the mode to restore on leave.
+    crtc_state: HashMap<u32, CrtcSnap>,
+    /// Mode changes being emulated, per output/CRTC.
+    emulated: Vec<EmulatedMode>,
+    /// `_NET_WM_STATE` and `_NET_WM_STATE_FULLSCREEN` on the engine display.
+    net_wm_state_atom: u32,
+    fullscreen_atom: u32,
+    /// `_XWLBRIDGE_EMULATED_MODE` on a fullscreen window: the monitor it is
+    /// shown on and the client's mode, for -showwindows' presentation.
+    emulated_mode_atom: u32,
     warned_fixed: bool,
     /// Ends the RECORD thread when we go.
     _record: Option<RecordStop>,
@@ -1355,6 +1411,11 @@ unsafe impl Send for Agent {}
 impl Agent {
     fn new(server: Arc<Server>, display: u32, auth: Auth) -> Result<Agent, AnyError> {
         let server_engine = server.config.engine;
+        let rfb_socket = auth
+            .file
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(XVNC_SOCKET);
         let (conn, screen) = connect(display, &auth)?;
         let s = &conn.setup().roots[screen];
         let (root, width, height) = (s.root, s.width_in_pixels, s.height_in_pixels);
@@ -1514,6 +1575,15 @@ impl Agent {
         res::query_version(&conn, 1, 2)?.reply()?;
         // Xorg registers damage objects under this resource-type name
         let damage_atom = conn.intern_atom(false, b"DamageExt")?.reply()?.atom;
+        let net_wm_state_atom = conn.intern_atom(false, b"_NET_WM_STATE")?.reply()?.atom;
+        let fullscreen_atom = conn
+            .intern_atom(false, b"_NET_WM_STATE_FULLSCREEN")?
+            .reply()?
+            .atom;
+        let emulated_mode_atom = conn
+            .intern_atom(false, b"_XWLBRIDGE_EMULATED_MODE")?
+            .reply()?
+            .atom;
         conn.flush()?;
 
         let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -1709,6 +1779,15 @@ impl Agent {
             randr15: false,
             monitors: Vec::new(),
             monitor_atoms: Vec::new(),
+            rfb_layout: false,
+            layout_ours: false,
+            rfb_socket,
+            monitor_outputs: Vec::new(),
+            crtc_state: HashMap::new(),
+            emulated: Vec::new(),
+            net_wm_state_atom,
+            fullscreen_atom,
+            emulated_mode_atom,
             warned_fixed: false,
             _record: record,
             x_map: (0, Vec::new()),
@@ -1978,7 +2057,13 @@ impl Agent {
             self.randr15 = true;
             // to notice another client resizing the screen or turning its
             // output off (every RandR change is reported as a screen change)
-            randr::select_input(&self.conn, self.root, randr::NotifyMask::SCREEN_CHANGE)?;
+            randr::select_input(
+                &self.conn,
+                self.root,
+                randr::NotifyMask::SCREEN_CHANGE
+                    | randr::NotifyMask::CRTC_CHANGE
+                    | randr::NotifyMask::OUTPUT_CHANGE,
+            )?;
         }
         self.sync_screen()?;
         self.sync_cursor()?;
@@ -2242,6 +2327,37 @@ impl Agent {
             Event::RandrScreenChangeNotify(_) => {
                 if let Err(e) = self.screen_changed() {
                     crate::warning!("xvfb: following a client's resize: {e}");
+                }
+            }
+            // a client changed one output's mode (RRSetCrtcConfig, xrandr,
+            // SDL_WINDOW_FULLSCREEN): emulate it on that monitor
+            Event::RandrNotify(e) if e.sub_code == randr::Notify::CRTC_CHANGE => {
+                let cc = e.u.as_cc();
+                self.consider_crtc_change(&cc);
+            }
+            // leave cases: the fullscreen window is gone or minimised
+            Event::DestroyNotify(e) if self.emulated.iter().any(|em| em.window == e.window) => {
+                self.leave_mode_for_window(e.window, false)
+            }
+            Event::UnmapNotify(e) if self.emulated.iter().any(|em| em.window == e.window) => {
+                self.leave_mode_for_window(e.window, false)
+            }
+            // leave case: the keyboard left the fullscreen window (Alt+Tab,
+            // another desktop window taking the focus)
+            Event::FocusOut(e)
+                if e.detail != NotifyDetail::POINTER
+                    && self.emulated.iter().any(|em| em.window == e.event) =>
+            {
+                self.leave_mode_for_window(e.event, false)
+            }
+            // leave case: the window stopped being fullscreen (the reverse
+            // thread saw the compositor state) or dropped its mode property
+            Event::PropertyNotify(e)
+                if (e.atom == self.net_wm_state_atom || e.atom == self.emulated_mode_atom)
+                    && self.emulated.iter().any(|em| em.window == e.window) =>
+            {
+                if !self.has_fullscreen_state(e.window) || !self.has_emulated_mode(e.window) {
+                    self.leave_mode_for_window(e.window, false);
                 }
             }
             // someone else's window came up or moved: go back on top
@@ -2533,15 +2649,33 @@ impl Agent {
         if primary != 0 {
             self.primary = primary;
         }
+        // Option B (p2_games): Xvnc starts with one output for the whole
+        // screen. On the first layout and whenever the desktop's monitors
+        // change, give it one RFB screen (and so one RandR output/CRTC) per
+        // monitor. A client's per-output mode change does not change the
+        // desktop's monitors, so this is not applied again then and the
+        // change survives (the emulation keeps it; see `modes`).
+        let layout_changed = monitors != self.monitors;
+        if layout_changed {
+            // a monitor may be gone, and the RFB layout reconfigures every
+            // output: an emulated mode cannot survive the new desktop layout
+            self.leave_all_modes();
+        }
+        if layout_changed && self.randr15 && self.resizable && self.resizer.is_none() {
+            self.apply_rfb_layout(&monitors, w, h);
+        }
         // while a client's resize is on its way to the desktop (or another
         // client is still in the middle of one), the desktop's size is the
         // old one: following it would undo the client's resize
         let busy =
             self.dynres_out.is_some() || self.dynres_next.is_some() || self.settle_at.is_some();
         // Xvnc's one output states the primary monitor's refresh (X clients
-        // pacing themselves read it), so a refresh change alone re-modes it
+        // pacing themselves read it), so a refresh change alone re-modes it.
+        // With one output per monitor each CRTC states its own mode; changing
+        // the whole screen for a refresh would undo that model.
         let refresh_changed = self.resizable
             && self.resizer.is_none()
+            && !self.rfb_layout
             && hz != 0
             && remode_for_refresh(self.refresh_mhz, hz, w, h);
         if ((w, h) != (self.width, self.height) || refresh_changed)
@@ -2571,8 +2705,204 @@ impl Agent {
                 crate::vlog!("xvfb: can't name RandR monitors: {e}");
             }
             self.monitors = monitors;
+            self.refresh_crtc_state();
+        }
+        // With one output per monitor, a refresh change is per output: the
+        // primary output states the primary monitor's refresh (X clients pace
+        // themselves from it). The screen and the other outputs stay.
+        if self.rfb_layout
+            && hz != 0
+            && let Some(i) = self
+                .monitors
+                .iter()
+                .position(|m| m.primary)
+                .or((!self.monitors.is_empty()).then_some(0))
+            && let Some(m) = self.monitors.get(i)
+            && remode_for_refresh(self.refresh_mhz, hz, m.width, m.height)
+            && let Err(e) = self.set_output_refresh(i, hz)
+        {
+            crate::vlog!("xvfb: can't set the primary output's refresh: {e}");
         }
         Ok(())
+    }
+
+    /// Sets the CRTC carrying monitor `i` to a mode of the same size at
+    /// `refresh_mhz`, creating the mode on that output if needed. The screen
+    /// and every other output stay.
+    fn set_output_refresh(&mut self, i: usize, refresh_mhz: u32) -> Result<(), AnyError> {
+        let Some(&output) = self.monitor_outputs.get(i) else {
+            return Ok(());
+        };
+        let w = self.monitors[i].width;
+        let h = self.monitors[i].height;
+        let res = randr::get_screen_resources_current(&self.conn, self.root)?.reply()?;
+        let info = randr::get_output_info(&self.conn, output, res.config_timestamp)?.reply()?;
+        let crtc = self
+            .current_crtcs()
+            .into_iter()
+            .find(|c| c.output == output)
+            .map(|c| c.crtc)
+            .ok_or("the output has no CRTC")?;
+        let want_clock = crate::bridge::x11::randr::dot_clock(w, h, refresh_mhz);
+        let want_mhz = (u64::from(want_clock) * 1000 / (u64::from(w) * u64::from(h)).max(1)) as u32;
+        let fits =
+            |m: &randr::ModeInfo| same_refresh(crate::bridge::x11::randr::refresh_mhz(m), want_mhz);
+        let mode = match res
+            .modes
+            .iter()
+            .find(|m| m.width == w && m.height == h && info.modes.contains(&m.id) && fits(m))
+        {
+            Some(m) => m.id,
+            None => {
+                let name = format!("{w}x{h}_{}.{:02}", want_mhz / 1000, want_mhz % 1000 / 10);
+                let mi = randr::ModeInfo {
+                    id: 0,
+                    width: w,
+                    height: h,
+                    dot_clock: want_clock,
+                    hsync_start: w,
+                    hsync_end: w,
+                    htotal: w,
+                    hskew: 0,
+                    vsync_start: h,
+                    vsync_end: h,
+                    vtotal: h,
+                    name_len: name.len() as u16,
+                    mode_flags: 0u32.into(),
+                };
+                let id = randr::create_mode(&self.conn, self.root, mi, name.as_bytes())?
+                    .reply()?
+                    .mode;
+                randr::add_output_mode(&self.conn, output, id)?;
+                id
+            }
+        };
+        let c = self
+            .current_crtcs()
+            .into_iter()
+            .find(|c| c.crtc == crtc)
+            .ok_or("the CRTC went away")?;
+        randr::set_crtc_config(
+            &self.conn,
+            crtc,
+            res.timestamp,
+            res.config_timestamp,
+            c.x,
+            c.y,
+            mode,
+            randr::Rotation::ROTATE0,
+            &[output],
+        )?
+        .reply()?;
+        self.refresh_mhz = refresh_mhz;
+        self.crtc_state.insert(
+            crtc,
+            CrtcSnap {
+                crtc,
+                output,
+                mode,
+                x: c.x,
+                y: c.y,
+                width: w,
+                height: h,
+            },
+        );
+        crate::log!(
+            "xvfb: output {} is {w}x{h} at {}.{:03} Hz",
+            output,
+            want_mhz / 1000,
+            want_mhz % 1000
+        );
+        Ok(())
+    }
+
+    /// Gives Xvnc one RandR output and CRTC per desktop monitor through its
+    /// private RFB socket (`SetDesktopSize`), with the X screen the bounding
+    /// box. The server keeps the layout after this short connection closes.
+    /// A refusal falls back to the old one-output model (and is logged once).
+    fn apply_rfb_layout(&mut self, monitors: &[Monitor], w: u16, h: u16) {
+        let rects: Vec<(i16, i16, u16, u16)> = monitors
+            .iter()
+            .filter(|m| m.width > 0 && m.height > 0)
+            .map(|m| (m.x, m.y, m.width, m.height))
+            .collect();
+        if rects.is_empty() || w == 0 || h == 0 {
+            return;
+        }
+        let layout = rfb::Layout::from_rects(w, h, &rects);
+        if let Err(e) = rfb::set_desktop_size(&self.rfb_socket, &layout) {
+            if self.rfb_layout || self.monitors.is_empty() {
+                crate::warning!(
+                    "xvfb: can't ask Xvnc for the one-output-per-monitor layout ({e}); \
+                     keeping one output for the whole screen"
+                );
+            }
+            self.rfb_layout = false;
+            return;
+        }
+        // The request is applied asynchronously: wait for the X server to
+        // report exactly the screens asked for (the RFB reply only repeats
+        // this and Xvnc sends it with an update).
+        let mut want: Vec<(i16, i16, u16, u16)> = layout
+            .screens
+            .iter()
+            .map(|s| (s.x as i16, s.y as i16, s.width, s.height))
+            .collect();
+        want.sort();
+        let mut got: Vec<(i16, i16, u16, u16)> = Vec::new();
+        for _ in 0..100 {
+            got = self
+                .current_crtcs()
+                .into_iter()
+                .map(|c| (c.x, c.y, c.width, c.height))
+                .collect();
+            got.sort();
+            if got == want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if got != want {
+            if self.rfb_layout || self.monitors.is_empty() {
+                crate::warning!(
+                    "xvfb: Xvnc did not take the one-output-per-monitor layout (wanted {want:?}, X has {got:?}); \
+                     keeping one output for the whole screen"
+                );
+            }
+            self.rfb_layout = false;
+            return;
+        }
+        // the server resized the framebuffer and configured the outputs; take
+        // the size it now reports (the bbox) as ours
+        let g = self
+            .conn
+            .get_geometry(self.root)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        if let Some(g) = g
+            && (g.width, g.height) != (self.width, self.height)
+            && let Err(e) = self.adopt_size(g.width, g.height)
+        {
+            crate::warning!("xvfb: can't adopt Xvnc's new screen size: {e}");
+        }
+        self.conn.flush().ok();
+        self.layout_ours = true;
+        self.rfb_layout = true;
+        if self.monitors.is_empty() {
+            crate::log!(
+                "xvfb: Xvnc laid out with one RandR output per monitor ({} monitor(s), {}x{})",
+                layout.screens.len(),
+                layout.width,
+                layout.height
+            );
+        } else {
+            crate::log!(
+                "xvfb: Xvnc laid out again: {} monitor(s), {}x{}",
+                layout.screens.len(),
+                layout.width,
+                layout.height
+            );
+        }
     }
 
     /// Sets the screen to `w`x`h`: by having Xwayland's compositor configure
@@ -2745,8 +3075,16 @@ impl Agent {
     fn screen_changed(&mut self) -> Result<(), AnyError> {
         let g = self.conn.get_geometry(self.root)?.reply()?;
         let (w, h) = (g.width, g.height);
+        // our own RFB layout (one output per monitor): the size follows it,
+        // and this is not a client's resize to settle
+        if std::mem::take(&mut self.layout_ours) {
+            if (w, h) != (self.width, self.height) {
+                self.adopt_size(w, h)?;
+            }
+            return Ok(());
+        }
         if (w, h) == (self.width, self.height) {
-            // the size is ours, but a client may have turned the output off
+            // the size is ours, but a client may have turned an output off
             // (RealVNC does, first thing in a resize)
             if !self.output_on()? {
                 self.settle_at = Some(Instant::now() + SETTLE);
@@ -2878,22 +3216,37 @@ impl Agent {
         Ok(())
     }
 
-    /// Whether the screen's output is on and shows the whole screen.
+    /// Whether every output is on and inside the screen. With one output per
+    /// monitor (Xvnc, built-in) no CRTC covers the whole screen any more, so
+    /// this checks all of them, not just the first.
     fn output_on(&self) -> Result<bool, AnyError> {
         let res = randr::get_screen_resources_current(&self.conn, self.root)?.reply()?;
-        let Some(&crtc) = res.crtcs.first() else {
+        if res.crtcs.is_empty() {
             return Ok(true); // nothing to turn on
-        };
-        let c = randr::get_crtc_info(&self.conn, crtc, res.config_timestamp)?.reply()?;
-        Ok(c.mode != 0
-            && !c.outputs.is_empty()
-            && (c.x, c.y, c.width, c.height) == (0, 0, self.width, self.height))
+        }
+        let mut any = false;
+        for &crtc in &res.crtcs {
+            let c = randr::get_crtc_info(&self.conn, crtc, res.config_timestamp)?.reply()?;
+            if c.mode == 0 || c.outputs.is_empty() {
+                return Ok(false);
+            }
+            if c.x < 0
+                || c.y < 0
+                || c.x as i32 + c.width as i32 > self.width as i32
+                || c.y as i32 + c.height as i32 > self.height as i32
+            {
+                return Ok(false);
+            }
+            any = true;
+        }
+        Ok(any)
     }
 
     /// After other clients' RandR changes: the screen goes back to the
     /// desktop's size (Xvfb: its fixed size) unless the desktop took the
     /// client's, and an output left off is turned back on.
     fn settle(&mut self) -> Result<(), AnyError> {
+        self.restore_changed_outputs()?;
         let target = if self.resizable {
             self.desktop_size()
         } else {
@@ -2926,12 +3279,53 @@ impl Agent {
     /// RandR 1.5 monitors named and placed like the desktop's outputs; the
     /// desktop's primary output is the primary monitor (`xrandr --listmonitors`
     /// puts the `*` there), the first one if it names none.
+    /// RandR 1.5 monitors named and placed like the desktop's outputs; the
+    /// desktop's primary output is the primary monitor (`xrandr --listmonitors`
+    /// puts the `*` there) and RandR's primary output too, the first one if it
+    /// names none. Each monitor's RandR 1.5 monitor is bound to the output
+    /// whose CRTC sits at that monitor's rectangle (with Xvnc's RFB layout
+    /// there is one per monitor; Xvfb keeps its single one).
     fn set_monitors(&mut self, monitors: &[Monitor]) -> Result<(), AnyError> {
         for atom in self.monitor_atoms.drain(..) {
             randr::delete_monitor(&self.conn, self.root, atom)?;
         }
         let res = randr::get_screen_resources_current(&self.conn, self.root)?.reply()?;
+        // output id -> its CRTC rectangle
+        let mut out_rects: Vec<(u32, i16, i16, u16, u16)> = Vec::new();
+        for &crtc in &res.crtcs {
+            let c = randr::get_crtc_info(&self.conn, crtc, res.config_timestamp)?.reply()?;
+            for &output in &c.outputs {
+                out_rects.push((output, c.x, c.y, c.width, c.height));
+            }
+        }
         let primary = primary_index(monitors);
+        let mut used: Vec<u32> = Vec::new();
+        let mut monitor_outputs: Vec<Option<u32>> = Vec::with_capacity(monitors.len());
+        for m in monitors {
+            let found = out_rects
+                .iter()
+                .find(|(o, x, y, w, h)| {
+                    !used.contains(o) && *x == m.x && *y == m.y && *w == m.width && *h == m.height
+                })
+                .or_else(|| {
+                    // Xvfb (and a one-output Xvnc before the RFB layout):
+                    // the single output stands for the first monitor
+                    out_rects.iter().find(|(o, ..)| !used.contains(o))
+                })
+                .map(|&(o, ..)| o);
+            if let Some(o) = found {
+                used.push(o);
+            }
+            monitor_outputs.push(found);
+        }
+        self.monitor_outputs = monitor_outputs.iter().flatten().copied().collect();
+        // RandR's primary output: GNOME's primary monitor (RandR 1.3's
+        // RRSetOutputPrimary is server state, no driver needed)
+        if let Some(Some(o)) = monitor_outputs.get(primary)
+            && let Err(e) = randr::set_output_primary(&self.conn, self.root, *o)
+        {
+            crate::vlog!("xvfb: can't set RandR's primary output: {e}");
+        }
         for (i, m) in monitors.iter().enumerate() {
             let Monitor {
                 name,
@@ -2942,6 +3336,12 @@ impl Agent {
                 ..
             } = m;
             let atom = self.conn.intern_atom(false, name)?.reply()?.atom;
+            let outputs = monitor_outputs
+                .get(i)
+                .copied()
+                .flatten()
+                .into_iter()
+                .collect();
             randr::set_monitor(
                 &self.conn,
                 self.root,
@@ -2955,13 +3355,7 @@ impl Agent {
                     height: *h,
                     width_in_millimeters: mm(*w),
                     height_in_millimeters: mm(*h),
-                    // the one output goes with the first monitor, so RandR
-                    // doesn't add an automatic one for it beside ours
-                    outputs: if i == 0 {
-                        res.outputs.first().copied().into_iter().collect()
-                    } else {
-                        Vec::new()
-                    },
+                    outputs,
                 },
             )?;
             self.monitor_atoms.push(atom);
@@ -2970,9 +3364,409 @@ impl Agent {
         Ok(())
     }
 
+    // ---- per-output mode emulation (option B) ----
+
+    /// Every CRTC's mode and position, as the X server has it now.
+    fn current_crtcs(&self) -> Vec<CrtcSnap> {
+        let Ok(res) = randr::get_screen_resources_current(&self.conn, self.root)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .ok_or(())
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &crtc in &res.crtcs {
+            let Ok(c) = randr::get_crtc_info(&self.conn, crtc, res.config_timestamp)
+                .ok()
+                .and_then(|x| x.reply().ok())
+                .ok_or(())
+            else {
+                continue;
+            };
+            let Some(&output) = c.outputs.first() else {
+                continue;
+            };
+            out.push(CrtcSnap {
+                crtc,
+                output,
+                mode: c.mode,
+                x: c.x,
+                y: c.y,
+                width: c.width,
+                height: c.height,
+            });
+        }
+        out
+    }
+
+    /// Records the layout that is the desktop's, to restore after a client's
+    /// mode change and to tell a real change from our own reconfiguration.
+    fn refresh_crtc_state(&mut self) {
+        self.crtc_state = self
+            .current_crtcs()
+            .into_iter()
+            .map(|c| (c.crtc, c))
+            .collect();
+    }
+
+    /// Puts one CRTC back at `s` (its mode and position).
+    fn set_crtc_to(&self, s: &CrtcSnap) -> Result<(), AnyError> {
+        let res = randr::get_screen_resources_current(&self.conn, self.root)?.reply()?;
+        if !res.modes.iter().any(|m| m.id == s.mode) || s.mode == 0 {
+            return Err(format!("mode {} is gone", s.mode).into());
+        }
+        randr::set_crtc_config(
+            &self.conn,
+            s.crtc,
+            res.timestamp,
+            res.config_timestamp,
+            s.x,
+            s.y,
+            s.mode,
+            randr::Rotation::ROTATE0,
+            &[s.output],
+        )?
+        .reply()?;
+        Ok(())
+    }
+
+    /// Puts back every CRTC a client changed without an emulated mode (a
+    /// resize that was not a game going fullscreen). Returns whether one was.
+    fn restore_changed_outputs(&mut self) -> Result<bool, AnyError> {
+        let current = self.current_crtcs();
+        let mut restored = false;
+        for c in &current {
+            if self.emulated.iter().any(|e| e.crtc == c.crtc) {
+                continue;
+            }
+            let Some(old) = self.crtc_state.get(&c.crtc).copied() else {
+                continue;
+            };
+            if *c == old {
+                continue;
+            }
+            match self.set_crtc_to(&old) {
+                Ok(()) => {
+                    crate::log!(
+                        "xvfb: an X client changed CRTC {} to {}x{}+{}+{} (mode {}); putting it back",
+                        c.crtc,
+                        c.width,
+                        c.height,
+                        c.x,
+                        c.y,
+                        c.mode
+                    );
+                    restored = true;
+                }
+                Err(e) => crate::vlog!("xvfb: can't restore CRTC {}: {e}", c.crtc),
+            }
+        }
+        if restored {
+            self.refresh_crtc_state();
+        }
+        Ok(restored)
+    }
+
+    /// Whether `w` still says it is fullscreen (`_NET_WM_STATE`).
+    fn has_fullscreen_state(&self, w: Window) -> bool {
+        self.conn
+            .get_property(false, w, self.net_wm_state_atom, AtomEnum::ATOM, 0, 64)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| {
+                r.value32()
+                    .map(|mut v| v.any(|a| a == self.fullscreen_atom))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether the reverse thread still has the emulated-mode property on `w`.
+    fn has_emulated_mode(&self, w: Window) -> bool {
+        self.conn
+            .get_property(false, w, self.emulated_mode_atom, AtomEnum::CARDINAL, 0, 6)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.count() >= 6))
+            .unwrap_or(false)
+    }
+
+    /// The mapped fullscreen window covering `rect` (at least half of it), if
+    /// any: the game a mode change is emulated for.
+    fn fullscreen_window(&self, rect: (i16, i16, u16, u16)) -> Option<Window> {
+        let tree = self.conn.query_tree(self.root).ok()?.reply().ok()?;
+        for w in tree.children {
+            if w == self.top {
+                continue;
+            }
+            let Ok(attrs) = self.conn.get_window_attributes(w).ok()?.reply() else {
+                continue;
+            };
+            if attrs.map_state != MapState::VIEWABLE {
+                continue;
+            }
+            let Ok(prop) = self
+                .conn
+                .get_property(false, w, self.net_wm_state_atom, AtomEnum::ATOM, 0, 64)
+                .ok()?
+                .reply()
+            else {
+                continue;
+            };
+            let fullscreen = prop
+                .value32()
+                .is_some_and(|mut v| v.any(|a| a == self.fullscreen_atom));
+            if !fullscreen {
+                continue;
+            }
+            let Ok(g) = self.conn.get_geometry(w).ok()?.reply() else {
+                continue;
+            };
+            let Ok(p) = self
+                .conn
+                .translate_coordinates(w, self.root, 0, 0)
+                .ok()?
+                .reply()
+            else {
+                continue;
+            };
+            let (x, y) = (i64::from(p.dst_x), i64::from(p.dst_y));
+            let (x2, y2) = (x + i64::from(g.width), y + i64::from(g.height));
+            let (rx, ry) = (i64::from(rect.0), i64::from(rect.1));
+            let (rx2, ry2) = (rx + i64::from(rect.2), ry + i64::from(rect.3));
+            let overlap = (x2.min(rx2) - x.max(rx)).max(0) * (y2.min(ry2) - y.max(ry)).max(0);
+            if overlap * 2 >= i64::from(rect.2) * i64::from(rect.3) {
+                return Some(w);
+            }
+        }
+        None
+    }
+
+    /// A CRTC changed: ours (already in `crtc_state`), a client restoring the
+    /// desktop mode, a game going fullscreen at another mode (emulated), or a
+    /// resize with no fullscreen window (refused).
+    fn consider_crtc_change(&mut self, cc: &randr::CrtcChange) {
+        if !self.server.config.showwindows {
+            // no emulation without -showwindows: a client's per-output mode
+            // change is refused, as before (the whole-screen path is settle)
+            if let Err(e) = self.restore_changed_outputs() {
+                crate::vlog!("xvfb: can't restore an output after a client's mode change: {e}");
+            }
+            return;
+        }
+        let Some(now) = self.current_crtcs().into_iter().find(|c| c.crtc == cc.crtc) else {
+            return;
+        };
+        // an emulated output already at this mode: its own event
+        if self
+            .emulated
+            .iter()
+            .any(|e| e.crtc == now.crtc && (now.width, now.height) == e.mode)
+        {
+            return;
+        }
+        let Some(old) = self.crtc_state.get(&now.crtc).copied() else {
+            self.refresh_crtc_state();
+            return;
+        };
+        if now == old {
+            return;
+        }
+        // the client put the desktop's mode back (many games do on leave)
+        let desktop = self.monitors.iter().any(|m| {
+            now.x == m.x && now.y == m.y && now.width == m.width && now.height == m.height
+        });
+        if desktop {
+            if self.emulated.iter().any(|e| e.crtc == now.crtc) {
+                self.leave_mode_for_crtc(now.crtc, false);
+                crate::log!(
+                    "xvfb: a client restored CRTC {} to the desktop mode {}x{}",
+                    now.crtc,
+                    now.width,
+                    now.height
+                );
+            }
+            self.crtc_state.insert(now.crtc, now);
+            return;
+        }
+        let Some(mon) = self
+            .monitors
+            .iter()
+            .find(|m| {
+                old.x == m.x && old.y == m.y && old.width == m.width && old.height == m.height
+            })
+            .cloned()
+        else {
+            // an output that is not one of the desktop's: leave it alone
+            self.crtc_state.insert(now.crtc, now);
+            return;
+        };
+        let rect = (mon.x, mon.y, mon.width, mon.height);
+        if let Some(w) = self.fullscreen_window(rect) {
+            if self.emulated.iter().any(|e| e.crtc == now.crtc) {
+                self.leave_mode_for_crtc(now.crtc, false);
+            }
+            let vals = [
+                mon.x.max(0) as u32,
+                mon.y.max(0) as u32,
+                u32::from(mon.width),
+                u32::from(mon.height),
+                u32::from(now.width),
+                u32::from(now.height),
+            ];
+            if let Err(e) = self.conn.change_property32(
+                x11rb::protocol::xproto::PropMode::REPLACE,
+                w,
+                self.emulated_mode_atom,
+                AtomEnum::CARDINAL,
+                &vals,
+            ) {
+                crate::warning!(
+                    "xvfb: can't mark {w:#x} as a mode-emulated fullscreen window: {e}"
+                );
+                return;
+            }
+            // the focus leaving this window is a leave case (Alt+Tab)
+            let _ = self.conn.change_window_attributes(
+                w,
+                &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+                    .event_mask(EventMask::FOCUS_CHANGE | EventMask::PROPERTY_CHANGE),
+            );
+            self.crtc_state.insert(now.crtc, now);
+            self.emulated.push(EmulatedMode {
+                crtc: now.crtc,
+                window: w,
+                old,
+                mode: (now.width, now.height),
+            });
+            crate::log!(
+                "xvfb: {w:#x} switched CRTC {} from {}x{} to {}x{}: emulating the mode on monitor {}x{}+{}+{}",
+                now.crtc,
+                old.width,
+                old.height,
+                now.width,
+                now.height,
+                mon.width,
+                mon.height,
+                mon.x,
+                mon.y
+            );
+            return;
+        }
+        crate::warning!(
+            "xvfb: an X client switched CRTC {} to {}x{} with no fullscreen window on monitor {}x{}+{}+{}; putting it back",
+            now.crtc,
+            now.width,
+            now.height,
+            mon.width,
+            mon.height,
+            mon.x,
+            mon.y
+        );
+        if let Err(e) = self.set_crtc_to(&old) {
+            crate::vlog!("xvfb: can't put CRTC {} back: {e}", now.crtc);
+        }
+    }
+
+    /// Ends the emulation of `crtc`, restoring the desktop's mode unless
+    /// `keep_current` (the client restored it itself).
+    fn leave_mode_for_crtc(&mut self, crtc: u32, keep_current: bool) {
+        let Some(i) = self.emulated.iter().position(|e| e.crtc == crtc) else {
+            return;
+        };
+        let em = self.emulated.remove(i);
+        self.end_emulation(&em, keep_current);
+    }
+
+    /// Ends every emulation of `window` (unfullscreen, minimise, Alt+Tab,
+    /// the window going away).
+    fn leave_mode_for_window(&mut self, window: Window, keep_current: bool) {
+        let mut ended = Vec::new();
+        let mut i = 0;
+        while i < self.emulated.len() {
+            if self.emulated[i].window == window {
+                ended.push(self.emulated.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        for em in &ended {
+            self.end_emulation(em, keep_current);
+        }
+    }
+
+    fn end_emulation(&mut self, em: &EmulatedMode, keep_current: bool) {
+        let _ = self
+            .conn
+            .delete_property(em.window, self.emulated_mode_atom);
+        if !keep_current {
+            if let Err(e) = self.set_crtc_to(&em.old) {
+                crate::vlog!(
+                    "xvfb: can't restore CRTC {} to {}x{}: {e}",
+                    em.crtc,
+                    em.old.width,
+                    em.old.height
+                );
+            } else {
+                crate::log!(
+                    "xvfb: {:#x} left its mode: CRTC {} back to {}x{}+{}+{}",
+                    em.window,
+                    em.crtc,
+                    em.old.width,
+                    em.old.height,
+                    em.old.x,
+                    em.old.y
+                );
+                self.crtc_state.insert(em.crtc, em.old);
+            }
+        }
+    }
+
+    /// Every mode is restored when the desktop's monitor layout changes (the
+    /// RFB layout reconfigures the outputs anyway, and a monitor may be gone).
+    fn leave_all_modes(&mut self) {
+        let list = std::mem::take(&mut self.emulated);
+        for em in &list {
+            if let Err(e) = self
+                .conn
+                .delete_property(em.window, self.emulated_mode_atom)
+            {
+                crate::vlog!("xvfb: can't clear the emulated-mode property: {e}");
+            }
+        }
+        if !list.is_empty() {
+            crate::log!(
+                "xvfb: the desktop's monitors changed: restoring {} emulated mode(s)",
+                list.len()
+            );
+        }
+        self.refresh_crtc_state();
+    }
+
+    /// Restores modes whose window went away or was minimised (something a
+    /// client that crashed never tells us).
+    fn restore_orphaned_modes(&mut self) {
+        let mut gone = Vec::new();
+        for em in &self.emulated {
+            match self
+                .conn
+                .get_window_attributes(em.window)
+                .ok()
+                .and_then(|c| c.reply().ok())
+            {
+                Some(a) if a.map_state == MapState::VIEWABLE => {}
+                _ => gone.push(em.window),
+            }
+        }
+        for w in gone {
+            self.leave_mode_for_window(w, false);
+        }
+    }
+
     fn housekeeping(&mut self) -> Result<(), AnyError> {
         self.target.stats.report();
         self.sync_screen()?;
+        self.restore_orphaned_modes();
         self.keep_reverse()?;
         self.sync_cursor()?;
         if let Some(c) = self.clip.as_mut() {
