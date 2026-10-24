@@ -1855,7 +1855,6 @@ impl Backend {
                     m.height,
                     m.lw,
                     m.lh,
-                    m.primary,
                 )
             })
             .collect();
@@ -1947,7 +1946,9 @@ impl primary::PrimarySource for ShellPrimary<'_> {
 
 /// What a capture session depends on, one entry per monitor (see
 /// [`Backend::x_layout`]).
-type XLayout = Vec<(String, i32, i32, u32, u32, i32, i32, bool)>;
+// (not the primary flag: capture areas and input regions do not depend on which monitor is primary,
+// and RandR's primary follows in apply_outputs without a new session)
+type XLayout = Vec<(String, i32, i32, u32, u32, i32, i32)>;
 
 /// `-dynres` and `-pwrmgr`.
 impl Backend {
