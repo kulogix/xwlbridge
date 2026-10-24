@@ -49,11 +49,11 @@ die() { local rc=$1; shift; say "$*"; exit "$rc"; }
 
 # ---------------------------------------------------------------- configuration
 
-CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension tray)
+CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension tray decorations windowbuttons)
 declare -A CFG=(
   [engine]=auto [capture]=area [uidisplay]=auto [server]=vncserver-x11 [rfb_port]=5900
   [server_log]=30 [server_args]="" [log]=normal [bridge_args]="" [xvnc]=auto [xvfb]=auto
-  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto [tray]=on
+  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto [tray]=on [decorations]=on [windowbuttons]=""
 )
 # the GNOME Shell extension for -showwindows' window integration (install.sh installs it; setting `extension`)
 WINDOWS_EXT=xwlbridge-windows@xwlbridge
@@ -110,6 +110,7 @@ cfg_validate() {
   case ${CFG[log]} in quiet|normal|verbose) ;; *) CFG_ERRORS+=("log: '${CFG[log]}' is not quiet, normal or verbose");; esac
   case ${CFG[extension]} in auto|off) ;; *) CFG_ERRORS+=("extension: '${CFG[extension]}' is not auto or off");; esac
   case ${CFG[tray]} in on|off) ;; *) CFG_ERRORS+=("tray: '${CFG[tray]}' is not on or off");; esac
+  case ${CFG[decorations]} in on|off) ;; *) CFG_ERRORS+=("decorations: '${CFG[decorations]}' is not on or off");; esac
   if [ -n "${CFG[rfb_port]}" ] && [ "${CFG[rfb_port]}" != realvnc ]; then
     if [[ ! ${CFG[rfb_port]} =~ ^[0-9]{1,5}$ ]] || (( 10#${CFG[rfb_port]} < 1 || 10#${CFG[rfb_port]} > 65535 )); then
       CFG_ERRORS+=("rfb_port: '${CFG[rfb_port]}' is not a TCP port (1-65535), realvnc or empty")
@@ -146,7 +147,7 @@ cfg_bridge_args() {
     [[ $w == -* && $w != - && $w != -- ]] || break
     name=${w%%=*}; name=${name,,}
     case $name in
-      -display|-displayfd|-backend|-engine|-xserver|-screen|-clipboard|-outmgr|-cursor|-pwrmgr|-seat|-geometry|-fps|-xtestgrace|-pointerowner|-xtesthelpers|-xtestdrivers|-warm|-linger|-coldconnect|-coldwait|-xwayland|-uidisplay)
+      -display|-displayfd|-backend|-engine|-xserver|-screen|-clipboard|-outmgr|-cursor|-pwrmgr|-seat|-geometry|-fps|-xtestgrace|-pointerowner|-xtesthelpers|-xtestdrivers|-warm|-linger|-coldconnect|-coldwait|-xwayland|-uidisplay|-windowbuttons)
         if [[ $w == *=* ]]; then value=${w#*=}
         else i=$((i + 1)); value=${BRIDGE_ARGS[i]:-}; fi
         case $name in
@@ -323,6 +324,8 @@ build_command() {
     [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
     [[ -v BRIDGE_OVERRIDES[display] || ${CFG[display]} = auto ]] || CMD+=(-display "$((10#${CFG[display]#:}))")
     CMD+=("${tray_args[@]}")
+    [ -n "${CFG[windowbuttons]}" ] && CMD+=(-windowbuttons "${CFG[windowbuttons]}")
+    [ "${CFG[decorations]}" = off ] && CMD+=(-nodecorations)
     CMD+=("${BRIDGE_ARGS[@]}")
     CMD+=(-nowrap)
     return 0
@@ -367,6 +370,8 @@ build_command() {
   [[ -v BRIDGE_OVERRIDES[uidisplay] ]] || CMD+=(-uidisplay "$ui")
 
   CMD+=("${tray_args[@]}")
+  [ -n "${CFG[windowbuttons]}" ] && CMD+=(-windowbuttons "${CFG[windowbuttons]}")
+  [ "${CFG[decorations]}" = off ] && CMD+=(-nodecorations)
   CMD+=("${BRIDGE_ARGS[@]}")
 
   # Under NoNewPrivileges (the service's hardening) RealVNC's set-uid launcher
@@ -746,6 +751,28 @@ cmd_doctor() {
   else
     report info session.mutter "mutter ${mv:-unknown} (APIs not checked: no running session)"
   fi
+  section "Window decorations"
+  if [ "${CFG[decorations]}" = off ]; then
+    report info decor.config "decorations off: shown X windows have no frame (as in 0.2.0)" "Turn them on: $PROG config set decorations on"
+  else
+    local bl td tm tr tf cs ac cairo pango
+    bl=${CFG[windowbuttons]:-$(t5 gsettings get org.gnome.desktop.wm.preferences button-layout 2>/dev/null)}
+    bl=${bl#\'} ; bl=${bl%\'}
+    td=$(t5 gsettings get org.gnome.desktop.wm.preferences action-double-click-titlebar 2>/dev/null); td=${td#\'} ; td=${td%\'}
+    tm=$(t5 gsettings get org.gnome.desktop.wm.preferences action-middle-click-titlebar 2>/dev/null); tm=${tm#\'} ; tm=${tm%\'}
+    tr=$(t5 gsettings get org.gnome.desktop.wm.preferences action-right-click-titlebar 2>/dev/null); tr=${tr#\'} ; tr=${tr%\'}
+    tf=$(t5 gsettings get org.gnome.desktop.wm.preferences titlebar-font 2>/dev/null); tf=${tf#\'} ; tf=${tf%\'}
+    cs=$(t5 gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null); cs=${cs#\'} ; cs=${cs%\'}
+    ac=$(t5 gsettings get org.gnome.desktop.interface accent-color 2>/dev/null); ac=${ac#\'} ; ac=${ac%\'}
+    if ldconfig -p 2>/dev/null | grep -q 'libcairo\.so\.2' && ldconfig -p 2>/dev/null | grep -q 'libpangocairo-1\.0\.so\.0'; then
+      report ok decor.libs "cairo and pango present: titles and buttons are drawn"
+    else
+      report warn decor.libs "cairo or pango not found: frames without titles (geometry, resize and input still work)"
+    fi
+    report ok decor.settings "decorations on: button-layout ${CFG[windowbuttons]:-${bl:-GNOME default}}${CFG[windowbuttons]:+ (-windowbuttons)}, titlebar actions ${td:-toggle-maximize}/${tm:-lower}/${tr:-menu}, font ${tf:-system}, color-scheme ${cs:-default}, accent ${ac:-blue}" \
+      "The bridge follows GNOME's live settings through the settings portal (dconf fallback)."
+  fi
+
   if [ "${CFG[capture]}" = monitor ]; then
     if [ -n "$mv" ] && version_ge "$mv" 51; then report ok session.capture "capture=monitor (RecordMonitor) on mutter $mv"
     else report fail session.capture "capture=monitor on mutter ${mv:-unknown}: crashes GNOME when a recorded monitor is disabled (mutter#2718)" "Use: $PROG config set capture area"; fi

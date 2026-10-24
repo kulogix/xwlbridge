@@ -85,6 +85,11 @@ mod a11ybus;
 mod attrib;
 mod clip;
 mod cursor;
+// -showwindows decorations (research/release/design_decorations.md)
+mod decor;
+// GNOME's live settings for the decorations (settings portal, dconf fallback)
+#[cfg(feature = "gnome")]
+mod decor_settings;
 mod motion;
 mod record;
 mod reverse;
@@ -1138,6 +1143,8 @@ fn supervise(server: Arc<Server>, display: u32, auth: Auth) {
                     devs.clone(),
                     auth.clone(),
                     server.config.showscreen,
+                    !server.config.nodecorations,
+                    server.config.windowbuttons.clone(),
                 );
             }
             if restart {

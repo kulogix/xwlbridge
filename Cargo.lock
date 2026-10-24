@@ -1755,6 +1755,7 @@ name = "xwlbridge"
 version = "0.2.0"
 dependencies = [
  "libc",
+ "libloading",
  "pipewire",
  "reis",
  "wayland-backend",

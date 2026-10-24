@@ -87,7 +87,7 @@ This is an accident filter, not a security boundary.
 
 ## -showwindows, -reverseinput, -a11ybus
 
-- `-showwindows` (stock engines, experimental): X windows mapped on the engine display are shown natively on the desktop. The desktop's input on them goes to them only. `-showscreen` shows the whole X screen as one window.
+- `-showwindows` (stock engines, experimental): X windows mapped on the engine display are shown natively on the desktop. The desktop's input on them goes to them only. `-showscreen` shows the whole X screen as one window. Per-window decorations (`src/xvfb/decor.rs`, `-nodecorations` to opt out): a header `wl_subsurface` painted with cairo/pango `dlopen`, a content-vs-surface `FrameGeom` conversion so winsync keeps working in client coordinates (the window geometry is the surface box, because mutter clips pointer input to it), `_NET_FRAME_EXTENTS`, and presses on the header handed to mutter's `xdg_toplevel.move`/`resize`. `decor_settings.rs` follows GNOME's live settings (settings portal, dconf fallback).
 - `-a11ybus` (stock engines): a private AT-SPI bus for the display.
 - `-reverseinput`: a second XInput2 master, `xwlbridge-reverse`. A desktop-side proxy types and clicks through it into windows on the display without echoing to the desktop.
 
@@ -107,7 +107,7 @@ Two systemd user units, both PartOf, After and Requisite of `graphical-session.t
 | Path | Content |
 |---|---|
 | `src/bridge` | X protocol server, input, keymap/XKB, capture, clipboard, backends (`wayland/`, `gnome/`) |
-| `src/xvfb` | Stock engines and agent: `record.rs` input attribution, `reverse.rs` -showwindows/-reverseinput, `wlhost.rs` private compositor for `-engine xwayland`, `xrelay.rs` Xwayland clipboard relay, `a11ybus.rs` |
+| `src/xvfb` | Stock engines and agent: `record.rs` input attribution, `reverse.rs` -showwindows/-reverseinput, `decor.rs`/`decor_settings.rs` window decorations, `wlhost.rs` private compositor for `-engine xwayland`, `xrelay.rs` Xwayland clipboard relay, `a11ybus.rs` |
 | `src/uidisplay.rs`, `uihook/` | `-uidisplay` |
 | `src/childenv.rs` | `run` and the environment |
 | `dynres/` | Upstream's RealVNC dynamic-resolution hook |

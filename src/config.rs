@@ -39,6 +39,10 @@ define_config! {
         tray: bool = noflag,
         /// with -showwindows: show the whole X screen as one window (its X windows composited in stacking order over a plain background, like a rootful X server), instead of one window per X window
         showscreen: bool = flag,
+        /// with -showwindows: draw no decorations (title bar, buttons, resize edges) around X windows
+        nodecorations: bool = flag,
+        /// with -showwindows: use this GNOME button layout (e.g. ":minimize,maximize,close") instead of the desktop's live button-layout setting
+        windowbuttons: Option<String> = value("layout"),
         /// let clients change the resolution (RealVNC also needs the dynres hook); on GNOME, one of the monitor's own modes, temporarily: the layout it replaced comes back once the viewers have gone and at exit
         dynres: bool = flag,
         /// with -dynres on GNOME, keep the resolution X clients set when the viewers leave and at exit, instead of restoring the layout it replaced

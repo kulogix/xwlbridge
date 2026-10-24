@@ -439,6 +439,7 @@ fn main() {
     for (set, flag) in [
         (config.showwindows, "-showwindows"),
         (config.showscreen, "-showscreen"),
+        (config.nodecorations, "-nodecorations"),
         (config.a11ybus, "-a11ybus"),
         (config.reverseinput, "-reverseinput"),
     ] {
@@ -447,6 +448,11 @@ fn main() {
                 "{flag} is for -engine xvfb, xvnc or xwayland; ignored with the built-in engine"
             );
         }
+    }
+    if config.windowbuttons.is_some() && !xvfb_engine {
+        crate::warning!(
+            "-windowbuttons is for -showwindows with -engine xvfb, xvnc or xwayland; ignored with the built-in engine"
+        );
     }
     // which X server program: resolved now, so a missing (or refused) one stops
     // us before anything starts
