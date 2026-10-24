@@ -228,7 +228,7 @@ TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021
 
 ### Keeping an X app entirely on the bridge
 
-`-showwindows` (stock engines, experimental) shows X windows mapped on the engine display as native desktop windows. See [docs/no-split.md](docs/no-split.md).
+`-showwindows` (stock engines, experimental) shows X windows mapped on the engine display as native desktop windows. Each X window gets a GNOME-style header (title, close/minimise/maximise buttons in your `button-layout`, double-click to maximise) and invisible resize edges; a click on the header is handed to GNOME's move/resize at the press, so there is no bridge-side drag loop. The header follows GNOME's live settings (button layout, titlebar actions and font, colour scheme, accent) through the settings portal, with dconf as the fallback. Windows that draw their own title bar (`_GTK_FRAME_EXTENTS`, `_MOTIF_WM_HINTS` decorations 0) keep it: one title bar, never two. `-nodecorations`, or `decorations=off` in the service settings, restores the 0.2.0 look. See [docs/no-split.md](docs/no-split.md).
 
 ### Accessibility
 

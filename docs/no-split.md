@@ -56,8 +56,8 @@ On the bridge they capture correctly but their windows are invisible; on the des
 
 These options keep an X app entirely on the engine and still show it on GNOME. They need a stock engine (xvnc, xvfb or xwayland).
 
-- `-showwindows` (experimental): X windows mapped on the engine display are shown natively on the desktop. The desktop's input on them goes to them only.
-- `-showscreen` (experimental, used with `-showwindows`): the whole X screen as one window.
+- `-showwindows` (experimental): X windows mapped on the engine display are shown natively on the desktop. The desktop's input on them goes to them only. Each shown window gets a bridge-drawn Adwaita-style header and invisible resize edges (see below).
+- `-showscreen` (experimental, used with `-showwindows`): the whole X screen as one window (no per-window header; it is one window).
 - The accessibility proxy (`tools/x11-a11y-proxy`, supported): shows each X top-level window as a GNOME window with live pixels and accessible objects.
 
 ### Start each option
@@ -129,3 +129,40 @@ Ubuntu 26.04 VM: `-showwindows` with xcalc and a GTK 3 app passed 6/6. Both GNOM
 | accessibility for apps without a usable accessibility tree | the accessibility proxy, not as the window mode |
 
 Without the proxy, an app on the engine registers on the desktop's accessibility bus and Orca may follow an invisible window. With `-showwindows` the windows are visible and their accessibility is Xwayland's.
+
+## Window decorations
+
+A shown X window gets the frame a window manager would give it on X, drawn by
+the bridge on GNOME:
+
+- a header in its own `wl_subsurface` above the client (never a copy of the
+  client's pixels), with the title and the GNOME button layout, painted with
+  cairo and pango through `dlopen` (no new build dependency);
+- a press on the header is `xdg_toplevel.move`/`resize` at that press: mutter
+  owns the drag, so there is no bridge-side move loop and no extra latency;
+  double click toggles maximise, right click opens GNOME's window menu, and the
+  close/minimise/maximise buttons follow `_MOTIF_WM_HINTS` functions;
+- a 6 px invisible resize margin around the content. Mutter clips pointer input
+  to the xdg window geometry, so (measured on GNOME 50.1) the window geometry
+  is the whole surface box while framed; winsync converts every rectangle at
+  its boundary, so the client area still lands exactly where it would without
+  a frame plus the header, and the header/margins take input. Maximised or
+  fullscreen the geometry becomes the content (the header is detached).
+  `_NET_FRAME_EXTENTS` = `0,0,header,0` and `_NET_REQUEST_FRAME_EXTENTS` are
+  published as EWMH asks;
+- GNOME's live settings are followed through `org.freedesktop.portal.Settings`
+  (`Read` and `SettingChanged`) with dconf as the fallback: `button-layout`,
+  `action-double/middle/right-click-titlebar`, `titlebar-font`,
+  `color-scheme` and `accent-color`; `-windowbuttons=LAYOUT` overrides the
+  button layout;
+- no heuristics for client-drawn title bars: `_GTK_FRAME_EXTENTS` (GTK CSD)
+  and `_MOTIF_WM_HINTS decorations 0` mean the client keeps its own bar, and
+  the bridge draws none;
+- `-nodecorations` (or `decorations=off` with the service) turns all of it
+  off, restoring 0.2.0 bit for bit (no `_NET_FRAME_EXTENTS`, cairo/pango never
+  loaded).
+
+The header is removed while a window is maximised or fullscreen, as GNOME's
+own windows are, and comes back on restore. The doctor prints the setting and
+the values in force; `-verbose` logs the reason for every window's frame
+decision.

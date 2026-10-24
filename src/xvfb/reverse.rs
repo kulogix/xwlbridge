@@ -48,9 +48,12 @@ use std::time::Instant;
 
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_pointer, wl_region, wl_registry,
-    wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
+    wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
 };
 use wayland_client::{Connection as WlConnection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 use wayland_protocols::wp::pointer_constraints::zv1::client::{
     zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
 };
@@ -80,6 +83,9 @@ use x11rb::protocol::{Event, composite, damage, shm, xtest};
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 
+use super::decor;
+#[cfg(feature = "gnome")]
+use super::decor_settings;
 use super::selfdrag;
 use super::winsync::{self, Due, Raise, Rect, Request};
 use super::{AnyError, Auth};
@@ -585,14 +591,21 @@ fn find_master(conn: &RustConnection) -> Result<Option<Devices>, AnyError> {
 /// Runs the reverse direction on its own thread (own X and Wayland
 /// connections) for the life of the process; later calls (agent restarts)
 /// do nothing.
-pub fn spawn_once(display: u32, devs: Devices, auth: Auth, screen: bool) {
+pub fn spawn_once(
+    display: u32,
+    devs: Devices,
+    auth: Auth,
+    screen: bool,
+    decorations: bool,
+    windowbuttons: Option<String>,
+) {
     if SPAWNED.swap(true, Ordering::SeqCst) {
         return;
     }
     let _ = std::thread::Builder::new()
         .name("xvfb-reverse".into())
         .spawn(move || {
-            if let Err(e) = run(display, devs, &auth, screen) {
+            if let Err(e) = run(display, devs, &auth, screen, decorations, windowbuttons) {
                 crate::warning!("-showwindows: stopped: {e}");
             }
             // our X connection is gone (or never was): its slot is anyone's
@@ -626,6 +639,9 @@ struct Atoms {
     net_wm_state_demands_attention: u32,
     net_workarea: u32,
     gtk_workareas: u32,
+    net_frame_extents: u32,
+    net_request_frame_extents: u32,
+    gtk_frame_extents: u32,
 }
 
 /// A shown window's pixels: a memfd holding two frames, attached to the X
@@ -638,7 +654,120 @@ struct Buffers {
     width: u16,
     height: u16,
     frame: usize,
+    /// The memfd's mapping, for the framed layout: the X server writes the
+    /// content packed (its width, not the surface's), so the rows are moved
+    /// to the surface stride here (no second buffer, no second copy into
+    /// the compositor).
+    map: *mut u8,
+    len: usize,
 }
+
+impl Drop for Buffers {
+    fn drop(&mut self) {
+        // SAFETY: `map` is the mmap of `len` bytes made in `try_paint`.
+        unsafe { libc::munmap(self.map.cast(), self.len) };
+    }
+}
+
+/// The xdg_toplevel resize edge for a decoration edge.
+fn resize_edge(e: decor::Edge) -> xdg_toplevel::ResizeEdge {
+    match e {
+        decor::Edge::North => xdg_toplevel::ResizeEdge::Top,
+        decor::Edge::South => xdg_toplevel::ResizeEdge::Bottom,
+        decor::Edge::East => xdg_toplevel::ResizeEdge::Right,
+        decor::Edge::West => xdg_toplevel::ResizeEdge::Left,
+        decor::Edge::NorthWest => xdg_toplevel::ResizeEdge::TopLeft,
+        decor::Edge::NorthEast => xdg_toplevel::ResizeEdge::TopRight,
+        decor::Edge::SouthWest => xdg_toplevel::ResizeEdge::BottomLeft,
+        decor::Edge::SouthEast => xdg_toplevel::ResizeEdge::BottomRight,
+    }
+}
+
+/// The wp_cursor_shape_device_v1 edge shapes.
+fn cursor_shape(e: decor::Edge) -> wp_cursor_shape_device_v1::Shape {
+    use wp_cursor_shape_device_v1::Shape;
+    match e {
+        decor::Edge::North => Shape::NResize,
+        decor::Edge::South => Shape::SResize,
+        decor::Edge::East => Shape::EResize,
+        decor::Edge::West => Shape::WResize,
+        decor::Edge::NorthWest => Shape::NwResize,
+        decor::Edge::NorthEast => Shape::NeResize,
+        decor::Edge::SouthWest => Shape::SwResize,
+        decor::Edge::SouthEast => Shape::SeResize,
+    }
+}
+
+/// The user data of a `wl_surface`/// The user data of a `wl_surface`: the shown window whose X window its
+/// pixels are, and whether it is the content or the header. The header is a
+/// `wl_subsurface` of the content surface, so its surface-local coordinates
+/// start at the surface origin, not the content origin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    Content(Window),
+    Header(Window),
+}
+
+/// The header's pixels: its own memfd and two wl_shm buffers, painted only
+/// when the title, focus, layout or theme changes (never per client frame).
+struct HeaderBuffers {
+    pool: wl_shm_pool::WlShmPool,
+    buffers: [wl_buffer::WlBuffer; 2],
+    busy: [bool; 2],
+    width: u16,
+    height: u16,
+    stride: usize,
+    map: *mut u8,
+    len: usize,
+}
+
+impl Drop for HeaderBuffers {
+    fn drop(&mut self) {
+        // SAFETY: `map` is the mmap of `len` bytes made in `paint_header`.
+        unsafe { libc::munmap(self.map.cast(), self.len) };
+    }
+}
+
+/// A framed window's header: a `wl_subsurface` above the content surface.
+struct Chrome {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    state: decor::HeaderState,
+    frame: decor::FrameGeom,
+    buffers: Option<HeaderBuffers>,
+    dirty: bool,
+    /// The header surface has a buffer committed (not while maximised or
+    /// fullscreen, where the design removes it).
+    shown: bool,
+}
+
+impl Chrome {
+    /// Drops the header's buffers (a fresh allocation on the next paint; a
+    /// detached header gets no buffer releases, so stale busy flags must not
+    /// survive a hide/restore).
+    fn drop_buffers(&mut self) {
+        if let Some(b) = self.buffers.take() {
+            for buf in &b.buffers {
+                buf.destroy();
+            }
+            b.pool.destroy();
+        }
+    }
+
+    fn destroy(self) {
+        if let Some(b) = self.buffers {
+            for buf in &b.buffers {
+                buf.destroy();
+            }
+            b.pool.destroy();
+        }
+        self.subsurface.destroy();
+        self.surface.destroy();
+    }
+}
+
+/// A header buffer's release (its user data).
+struct HeaderMark(Window, usize);
 
 enum Role {
     Toplevel(xdg_toplevel::XdgToplevel),
@@ -700,6 +829,15 @@ struct Shown {
     p1_waiting: bool,
     /// P2: how many times P2 moved the window back on the X screen.
     p2_moves: u8,
+    /// The frame around the content (`NONE` = as 0.2.0).
+    frame: decor::FrameGeom,
+    /// What the frame may do (the section 5.1 decision), for the header and
+    /// `_NET_FRAME_EXTENTS`.
+    decision: decor::Decision,
+    /// The header, when framed (its own `wl_subsurface`).
+    chrome: Option<Chrome>,
+    /// The window geometry last set (`content` at the surface offset).
+    window_geometry: (i32, i32, i32, i32),
 }
 
 /// `-showscreen`: a window of the X screen, composited onto the canvas.
@@ -988,6 +1126,7 @@ struct State {
     atoms: Atoms,
     resource_mask: u32,
     compositor: Option<wl_compositor::WlCompositor>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     /// The queue xdg_wm_base's pings are answered on (`spawn_pinger`).
@@ -1053,6 +1192,20 @@ struct State {
     states: Vec<(Window, bool, bool)>,
     /// Serial of the last button press on a shown window (for an interactive move).
     press_serial: u32,
+    /// A button the header consumed (no XTest press/release reaches X).
+    header_button: Option<u32>,
+    /// The last left click on a title bar: (window, when, content x, y), for
+    /// the double-click titlebar action.
+    last_title_click: Option<(Window, Instant, f64, f64)>,
+    /// wp_cursor_shape_v1, if the compositor offers it (edge cursors).
+    cursor_shape_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    cursor_shape: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+    /// The resize edge the pointer is on (the cursor shape in force).
+    edge_cursor: Option<decor::Edge>,
+    /// When the last header move/resize press went to mutter, and when a
+    /// title change was seen (the latency log, `-verbose`).
+    header_press_at: Option<Instant>,
+    title_changed_at: Option<Instant>,
     /// The shown window the first of the held buttons went down on: X is
     /// authoritative for its geometry until the last comes up.
     held_on: Option<Window>,
@@ -1086,6 +1239,8 @@ struct State {
     /// wl_pointer is entered on a shown surface (as against a pointer_on a
     /// touch point or a tablet tool is driving).
     pointer_entered: bool,
+    /// The surface wl_pointer is on: the content or the header subsurface.
+    pointer_target: Option<Target>,
     /// The touch screen's device, the touch point that drives the reverse
     /// pointer (pointer emulation, as Xwayland does for core clients:
     /// (id, window)), and how many points are down.
@@ -1116,10 +1271,45 @@ struct State {
     /// The compositor time of the latest key or button press on a shown
     /// window (an activation's timestamp).
     input_time: u32,
+    /// Draw frames (`-nodecorations` turns this off, restoring 0.2.0).
+    decorations: bool,
+    /// cairo + pango, loaded at start when decorations are on (a missing
+    /// library leaves the geometry and input, without titles).
+    decor: Option<decor::Painter>,
+    /// Why cairo/pango could not be loaded, for the doctor/log.
+    decor_error: Option<String>,
+    /// The GNOME `button-layout` in force (settings portal in M3; the
+    /// default until then).
+    button_layout: decor::Layout,
+    /// Dark colour scheme (GNOME's live color-scheme).
+    dark: bool,
+    /// `-windowbuttons`: overrides GNOME's button-layout.
+    windowbuttons: Option<String>,
+    /// The titlebar click actions in force (GNOME's settings).
+    double_action: decor::TitlebarAction,
+    middle_action: decor::TitlebarAction,
+    right_action: decor::TitlebarAction,
+    /// `titlebar-font` when it overrides the system font.
+    title_font: Option<String>,
+    /// GNOME's accent colour name (doctor/table; Adwaita headerbars do not
+    /// paint it).
+    accent: String,
+    /// The live settings' origin, as last logged.
+    settings_origin: Option<&'static str>,
+    /// GNOME's live settings, when the gnome build can watch them.
+    #[cfg(feature = "gnome")]
+    settings_rx: Option<std::sync::mpsc::Receiver<decor_settings::Settings>>,
     qh: QueueHandle<State>,
 }
 
-fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<(), AnyError> {
+fn run(
+    display: u32,
+    devs: Devices,
+    auth: &Auth,
+    screen_mode: bool,
+    decorations: bool,
+    windowbuttons: Option<String>,
+) -> Result<(), AnyError> {
     let (x, screen) = super::connect(display, auth)?;
     CONNECTION_BASE.store(x.setup().resource_id_base, Ordering::Relaxed);
     let resource_mask = x.setup().resource_id_mask;
@@ -1176,6 +1366,9 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         net_wm_state_demands_attention: atom(b"_NET_WM_STATE_DEMANDS_ATTENTION")?,
         net_workarea: atom(b"_NET_WORKAREA")?,
         gtk_workareas: atom(b"_GTK_WORKAREAS")?,
+        net_frame_extents: atom(b"_NET_FRAME_EXTENTS")?,
+        net_request_frame_extents: atom(b"_NET_REQUEST_FRAME_EXTENTS")?,
+        gtk_frame_extents: atom(b"_GTK_FRAME_EXTENTS")?,
     };
 
     let wl = WlConnection::connect_to_env()
@@ -1192,6 +1385,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         atoms,
         resource_mask,
         compositor: None,
+        subcompositor: None,
         shm: None,
         wm_base: None,
         ping_qh,
@@ -1230,6 +1424,13 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         relative: Vec::new(),
         states: Vec::new(),
         press_serial: 0,
+        header_button: None,
+        last_title_click: None,
+        cursor_shape_manager: None,
+        cursor_shape: None,
+        edge_cursor: None,
+        header_press_at: None,
+        title_changed_at: None,
         held_on: None,
         drag_rel: None,
         drag: None,
@@ -1243,6 +1444,7 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         axis_discrete_seen: false,
         axis_rest: (0.0, 0.0),
         pointer_entered: false,
+        pointer_target: None,
         touch: None,
         touch_emulating: None,
         touch_down: 0,
@@ -1257,6 +1459,20 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         wm_announced: false,
         work_area: false,
         input_time: 0,
+        decorations,
+        decor: None,
+        decor_error: None,
+        button_layout: decor::Layout::parse("appmenu:minimize,maximize,close"),
+        dark: std::env::var_os("XWLBRIDGE_DECOR_DARK").is_some_and(|v| !v.is_empty()),
+        windowbuttons,
+        double_action: decor::TitlebarAction::ToggleMaximize,
+        middle_action: decor::TitlebarAction::Lower,
+        right_action: decor::TitlebarAction::Menu,
+        title_font: None,
+        accent: "blue".into(),
+        settings_origin: None,
+        #[cfg(feature = "gnome")]
+        settings_rx: None,
         qh: qh.clone(),
     };
     queue.roundtrip(&mut state)?;
@@ -1295,6 +1511,46 @@ fn run(display: u32, devs: Devices, auth: &Auth, screen_mode: bool) -> Result<()
         });
     }
     state.update_cursor();
+
+    if decorations && !screen_mode {
+        if let Some(layout) = state.windowbuttons.clone() {
+            state.button_layout = decor::Layout::parse(&layout);
+            crate::log!(
+                "-showwindows: decorations: -windowbuttons={layout} overrides GNOME's button-layout"
+            );
+        }
+        if state.subcompositor.is_none() {
+            crate::warning!(
+                "-showwindows: the compositor has no wl_subcompositor: no decorations (frames need their own header surface)"
+            );
+        } else {
+            match decor::Painter::load(state.dark) {
+                Ok(p) => {
+                    let (cairo, pango) = p.versions();
+                    crate::log!(
+                        "-showwindows: decorations on (cairo {cairo}, pango {pango}; header {} px, margin {} px; buttons {:?}/{:?})",
+                        decor::HEADER_HEIGHT,
+                        decor::RESIZE_MARGIN,
+                        state.button_layout.left,
+                        state.button_layout.right
+                    );
+                    state.decor = Some(p);
+                }
+                Err(e) => {
+                    crate::warning!(
+                        "-showwindows: cairo/pango not found: frames without titles ({e})"
+                    );
+                    state.decor_error = Some(e);
+                }
+            }
+        }
+    }
+    #[cfg(feature = "gnome")]
+    if decorations && !screen_mode {
+        let (tx, rx) = std::sync::mpsc::channel();
+        decor_settings::watch(tx);
+        state.settings_rx = Some(rx);
+    }
 
     if screen_mode {
         state.show_screen(&qh, display)?;
@@ -1398,6 +1654,598 @@ impl State {
             .and_then(|c| c.reply().ok())
             .and_then(|r| r.value32().map(|v| v.collect()))
             .unwrap_or_default()
+    }
+
+    /// `_MOTIF_WM_HINTS` as 32-bit values (empty: none).
+    fn motif_hints(&self, w: Window) -> Vec<u32> {
+        self.x
+            .get_property(false, w, self.atoms.motif_wm_hints, AtomEnum::ANY, 0, 5)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| r.value32().map(|v| v.collect()))
+            .unwrap_or_default()
+    }
+
+    /// `_GTK_FRAME_EXTENTS` (left, right, top, bottom) when the client set it:
+    /// the toolkit draws its own header bar and shadow.
+    fn gtk_frame_extents(&self, w: Window) -> Option<[i32; 4]> {
+        let r = self
+            .x
+            .get_property(
+                false,
+                w,
+                self.atoms.gtk_frame_extents,
+                AtomEnum::CARDINAL,
+                0,
+                4,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        if r.format != 32 {
+            return None;
+        }
+        let v: Vec<u32> = r.value32()?.collect();
+        (v.len() == 4).then(|| [v[0] as i32, v[1] as i32, v[2] as i32, v[3] as i32])
+    }
+
+    /// The section 5.1 decision for `w`, from the properties it declares.
+    fn frame_decision(&self, w: Window, no_input: bool) -> decor::Decision {
+        let kind = self.window_type(w);
+        let motif = self.motif_hints(w);
+        let gtk = self.gtk_frame_extents(w);
+        decor::decide(Some(kind.as_str()), &motif, gtk, no_input)
+    }
+
+    /// The header subsurface of a framed window: above the content, at the
+    /// surface origin, full surface width and header height.
+    fn make_chrome(
+        &self,
+        w: Window,
+        parent: &wl_surface::WlSurface,
+        qh: &QueueHandle<State>,
+        frame: decor::FrameGeom,
+        decision: decor::Decision,
+        content: (u16, u16),
+    ) -> Option<Chrome> {
+        let sub = self.subcompositor.as_ref()?;
+        let compositor = self.compositor.as_ref()?;
+        let surface = compositor.create_surface(qh, Target::Header(w));
+        let subsurface = sub.get_subsurface(&surface, parent, qh, ());
+        subsurface.set_position(0, 0);
+        // the header repaints on its own (title, focus, settings), so its
+        // commits must not wait for a parent commit: desynchronized
+        subsurface.set_desync();
+        // a new sub-surface is already at the top of the stack (above the
+        // parent); `place_above(parent)` is not portable across mutter
+        // versions and put it under the parent on GNOME 50.1
+        // the header is outside the xdg window geometry (content only); say
+        // explicitly that the whole header band takes input, or the
+        // compositor clips it to the window geometry
+        let (sw, _) = frame.surface_size(content);
+        let region = compositor.create_region(qh, ());
+        region.add(0, 0, i32::from(sw), frame.header.max(0));
+        surface.set_input_region(Some(&region));
+        region.destroy();
+        Some(Chrome {
+            surface,
+            subsurface,
+            state: decor::HeaderState {
+                title: self.title(w),
+                active: self.keyboard_on == Some(w),
+                dark: self.dark,
+                layout: self.button_layout.allowed(&decision),
+                hover: None,
+                pressed: None,
+                font: self.title_font.clone(),
+            },
+            frame,
+            buffers: None,
+            dirty: true,
+            shown: false,
+        })
+    }
+
+    /// Publishes `_NET_FRAME_EXTENTS` on a framed client (and removes it when
+    /// the window is maximised/fullscreen or not framed), as mutter does.
+    fn publish_frame_extents(&self, w: Window) {
+        let Some(s) = self.windows.get(&w) else {
+            return;
+        };
+        if s.frame.is_framed() && !s.maximized && !s.fullscreen {
+            let extents = [0, 0, s.frame.header.max(0) as u32, 0];
+            let _ = self.x.change_property32(
+                PropMode::REPLACE,
+                w,
+                self.atoms.net_frame_extents,
+                x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                &extents,
+            );
+        } else {
+            let _ = self.x.delete_property(w, self.atoms.net_frame_extents);
+        }
+    }
+
+    /// Answers `_NET_REQUEST_FRAME_EXTENTS` for `w` before it maps: Java, Qt
+    /// and GTK read the extents to size their own saved geometry.
+    fn answer_frame_extents(&self, w: Window) {
+        if !self.decorations || self.subcompositor.is_none() {
+            return;
+        }
+        let decision = self.frame_decision(w, self.takes_no_input(w));
+        if decision.framed {
+            let h = decor::FrameGeom::ADWAITA.header.max(0) as u32;
+            let _ = self.x.change_property32(
+                PropMode::REPLACE,
+                w,
+                self.atoms.net_frame_extents,
+                x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                &[0, 0, h, 0],
+            );
+            crate::vlog!(
+                "-showwindows: {w:#x} asked for its frame extents before mapping: 0,0,{h},0"
+            );
+        }
+    }
+
+    /// Paints a dirty header into its own buffer and commits its surface.
+    fn paint_header(&mut self, w: Window) {
+        let Some(painter) = self.decor.as_ref() else {
+            return;
+        };
+        let shm = self.shm.clone().expect("checked at start");
+        let qh = self.qh.clone();
+        let Some(s) = self.windows.get_mut(&w) else {
+            return;
+        };
+        let Some(c) = s.chrome.as_mut() else {
+            return;
+        };
+        if !c.dirty {
+            return;
+        }
+        let (ox, _) = c.frame.content_origin();
+        let width = (i32::from(s.width) + 2 * ox).max(1) as u16;
+        let height = c.frame.header.max(1) as u16;
+        let realloc = c
+            .buffers
+            .as_ref()
+            .is_none_or(|b| (b.width, b.height) != (width, height));
+        if realloc {
+            if let Some(b) = c.buffers.take() {
+                for buf in &b.buffers {
+                    buf.destroy();
+                }
+                b.pool.destroy();
+            }
+            match header_buffers(&shm, &qh, w, width, height) {
+                Ok(b) => c.buffers = Some(b),
+                Err(e) => {
+                    crate::vlog!("-showwindows: can't allocate {w:#x}'s header: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(b) = c.buffers.as_mut() else {
+            return;
+        };
+        let Some(i) = (0..2).find(|&i| !b.busy[i]) else {
+            return;
+        };
+        // SAFETY: `map` is the mmap of `len` bytes made by `header_buffers`.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(b.map, b.len) };
+        painter.paint(pixels, width, height, b.stride, &c.state);
+        c.surface.attach(Some(&b.buffers[i]), 0, 0);
+        c.surface
+            .damage_buffer(0, 0, i32::from(width), i32::from(height));
+        c.surface.commit();
+        b.busy[i] = true;
+        c.dirty = false;
+        c.shown = true;
+        crate::vlog!(
+            "-showwindows: {w:#x} header painted into buffer {i} ({}x{})",
+            width,
+            height
+        );
+        if let Some(t) = self.title_changed_at.take() {
+            crate::vlog!(
+                "-showwindows: {w:#x} header repainted {} ms after its title changed",
+                t.elapsed().as_millis()
+            );
+        }
+    }
+
+    /// Shows or hides the header with the compositor's maximised/fullscreen
+    /// state (the design removes it there; the geometry stays content).
+    fn update_header(&mut self, w: Window) {
+        let Some(s) = self.windows.get_mut(&w) else {
+            return;
+        };
+        let Some(c) = s.chrome.as_mut() else {
+            return;
+        };
+        let want = !s.maximized && !s.fullscreen;
+        crate::vlog!(
+            "-showwindows: {w:#x} header want {want}, shown {}, maximized {} fullscreen {}",
+            c.shown,
+            s.maximized,
+            s.fullscreen
+        );
+        if want && !c.shown {
+            c.drop_buffers();
+            c.dirty = true;
+        } else if !want && c.shown {
+            c.surface.attach(None, 0, 0);
+            c.surface.commit();
+            c.shown = false;
+            c.drop_buffers();
+        }
+        // the window geometry follows: whole surface normally, content while
+        // maximised/fullscreen (the header is detached)
+        if s.frame.is_framed() {
+            let (ox, oy) = s.frame.content_origin();
+            let (sw, sh) = s.frame.surface_size((s.width, s.height));
+            let geom = if want {
+                (0, 0, i32::from(sw), i32::from(sh))
+            } else {
+                (ox, oy, i32::from(s.width), i32::from(s.height))
+            };
+            if s.window_geometry != geom {
+                s.xdg_surface
+                    .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
+                s.window_geometry = geom;
+                s.surface.commit();
+            }
+        }
+    }
+
+    /// The Adwaita metrics in force (the painter's, or the design's before
+    /// cairo/pango loaded).
+    fn decor_metrics(&self) -> decor::Metrics {
+        self.decor
+            .as_ref()
+            .map_or_else(|| decor::Metrics::adwaita(50, self.dark), |p| p.metrics())
+    }
+
+    /// Applies a GNOME settings snapshot: layout, actions, font, scheme and
+    /// accent, then repaints the headers once (not per client frame).
+    fn apply_settings(&mut self, s: &decor_settings::Settings) {
+        self.dark = s.dark;
+        self.button_layout = self.windowbuttons.as_deref().map_or_else(
+            || decor::Layout::parse(&s.button_layout),
+            decor::Layout::parse,
+        );
+        self.double_action = s.double_click;
+        self.middle_action = s.middle_click;
+        self.right_action = s.right_click;
+        self.title_font = s.title_font();
+        self.accent = s.accent.clone();
+        if self.settings_origin != Some(s.origin) {
+            self.settings_origin = Some(s.origin);
+            crate::log!(
+                "-showwindows: decorations follow GNOME's settings ({}): button-layout {:?}/{:?}{}, actions {}/{}/{}, font {}, color-scheme {}, accent {}",
+                s.origin,
+                self.button_layout.left,
+                self.button_layout.right,
+                if self.windowbuttons.is_some() {
+                    " (-windowbuttons)"
+                } else {
+                    ""
+                },
+                self.double_action.as_str(),
+                self.middle_action.as_str(),
+                self.right_action.as_str(),
+                self.title_font.as_deref().unwrap_or("system"),
+                if self.dark { "prefer-dark" } else { "default" },
+                self.accent,
+            );
+        }
+        crate::vlog!(
+            "-showwindows: decor settings applied: dark {}, layout {:?}/{:?}, font {:?}",
+            self.dark,
+            self.button_layout.left,
+            self.button_layout.right,
+            self.title_font
+        );
+        let layout = self.button_layout.clone();
+        let font = self.title_font.clone();
+        let dark = self.dark;
+        for (_, sh) in self.windows.iter_mut() {
+            if let Some(c) = sh.chrome.as_mut() {
+                let allowed = layout.allowed(&sh.decision);
+                if c.state.layout != allowed || c.state.font != font || c.state.dark != dark {
+                    c.state.layout = allowed;
+                    c.state.font = font.clone();
+                    c.state.dark = dark;
+                    c.drop_buffers();
+                    c.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Applies the settings snapshots that arrived since the last dispatch.
+    #[cfg(feature = "gnome")]
+    fn poll_settings(&mut self) {
+        let mut last = None;
+        if let Some(rx) = self.settings_rx.as_ref() {
+            while let Ok(s) = rx.try_recv() {
+                last = Some(s);
+            }
+        }
+        if let Some(s) = last {
+            self.apply_settings(&s);
+        }
+    }
+
+    #[cfg(not(feature = "gnome"))]
+    fn poll_settings(&mut self) {}
+
+    /// The header action of a press at content-local `p`: true when the
+    /// header consumed it (the press never reaches X). `serial` is the
+    /// wl_pointer press serial, which `move`/`resize`/`show_window_menu`
+    /// need.
+    fn header_press(&mut self, w: Window, button: u32, serial: u32, p: (f64, f64)) -> bool {
+        let m = self.decor_metrics();
+        let Some(s) = self.windows.get(&w) else {
+            return false;
+        };
+        if !s.frame.is_framed() {
+            return false;
+        }
+        let Role::Toplevel(t) = &s.role else {
+            return false;
+        };
+        let t = t.clone();
+        let frame = s.frame;
+        let decision = s.decision;
+        let maximized = s.maximized;
+        let content = (s.width, s.height);
+        let (ox, oy) = frame.content_origin();
+        let sp = (p.0 + f64::from(ox), p.1 + f64::from(oy));
+        let surface_w = f64::from(frame.surface_size(content).0);
+        let layout = s
+            .chrome
+            .as_ref()
+            .map(|c| c.state.layout.clone())
+            .unwrap_or_default();
+        // a button first (the whole header band)
+        if sp.1 < f64::from(frame.header)
+            && let Some(b) = decor::hit_button(&m, surface_w, &layout, sp)
+        {
+            if button != 1 {
+                return true;
+            }
+            match b {
+                decor::Button::Close if decision.close => {
+                    crate::log!("-showwindows: {w:#x} header: close button");
+                    self.close.push(w);
+                }
+                decor::Button::Maximize if decision.maximize => {
+                    crate::log!(
+                        "-showwindows: {w:#x} header: maximize button ({})",
+                        if maximized { "restore" } else { "maximize" }
+                    );
+                    if maximized {
+                        t.unset_maximized();
+                    } else {
+                        t.set_maximized();
+                    }
+                }
+                decor::Button::Minimize if decision.minimize => {
+                    crate::log!("-showwindows: {w:#x} header: minimize button");
+                    t.set_minimized();
+                }
+                decor::Button::Menu => {
+                    crate::log!("-showwindows: {w:#x} header: window menu button");
+                    self.show_window_menu(&t, serial, p);
+                }
+                _ => {}
+            }
+            return true;
+        }
+        match frame.hit(sp, content) {
+            decor::Hit::Title => {
+                let (action, double) = if button == 1 {
+                    let now = Instant::now();
+                    let double = self.last_title_click.is_some_and(|(lw, t0, x0, y0)| {
+                        lw == w
+                            && now.duration_since(t0).as_millis() < 400
+                            && (p.0 - x0).abs() < 5.0
+                            && (p.1 - y0).abs() < 5.0
+                    });
+                    self.last_title_click = Some((w, now, p.0, p.1));
+                    if double {
+                        self.last_title_click = None;
+                        (self.double_action, true)
+                    } else {
+                        // the first press moves the window, as on GNOME: the
+                        // compositor owns the drag from the press serial
+                        if let Some(seat) = self.seat.as_ref() {
+                            crate::log!(
+                                "-showwindows: {w:#x} header: move at the press (serial {serial})"
+                            );
+                            self.header_press_at = Some(Instant::now());
+                            t._move(seat, serial);
+                        }
+                        return true;
+                    }
+                } else if button == 2 {
+                    (self.middle_action, false)
+                } else if button == 3 {
+                    (self.right_action, false)
+                } else {
+                    return true;
+                };
+                crate::log!(
+                    "-showwindows: {w:#x} header: {} click action {:?}{}",
+                    button,
+                    action.as_str(),
+                    if double { " (double)" } else { "" }
+                );
+                self.titlebar_action(&t, action, serial, p, maximized, decision);
+                true
+            }
+            decor::Hit::Edge(e) if button == 1 => {
+                if let Some(seat) = self.seat.as_ref()
+                    && decision.resize
+                {
+                    crate::log!(
+                        "-showwindows: {w:#x} header: resize {e:?} at the press (serial {serial})"
+                    );
+                    self.header_press_at = Some(Instant::now());
+                    t.resize(seat, serial, resize_edge(e));
+                }
+                true
+            }
+            decor::Hit::Edge(_) => true,
+            _ => false,
+        }
+    }
+
+    /// GNOME's window menu (minimise, maximise, move, resize, always on top,
+    /// workspace, close) at a content-local point.
+    fn show_window_menu(&self, t: &xdg_toplevel::XdgToplevel, serial: u32, p: (f64, f64)) {
+        let Some(seat) = self.seat.as_ref() else {
+            return;
+        };
+        let x = p.0.round() as i32;
+        let y = p.1.round() as i32;
+        t.show_window_menu(seat, serial, x.max(0), y.max(0));
+    }
+
+    /// Carries out a titlebar click action. `lower` has no xdg_toplevel
+    /// request (mutter owns stacking), so it is consumed and logged rather
+    /// than emulated.
+    fn titlebar_action(
+        &mut self,
+        t: &xdg_toplevel::XdgToplevel,
+        action: decor::TitlebarAction,
+        serial: u32,
+        p: (f64, f64),
+        maximized: bool,
+        decision: decor::Decision,
+    ) {
+        match action {
+            decor::TitlebarAction::ToggleMaximize if decision.maximize => {
+                if maximized {
+                    t.unset_maximized();
+                } else {
+                    t.set_maximized();
+                }
+            }
+            decor::TitlebarAction::Maximize if decision.maximize => t.set_maximized(),
+            decor::TitlebarAction::Minimize if decision.minimize => t.set_minimized(),
+            decor::TitlebarAction::Menu => self.show_window_menu(t, serial, p),
+            decor::TitlebarAction::Lower => {
+                crate::vlog!("-showwindows: titlebar lower: mutter owns stacking; nothing to send")
+            }
+            _ => {}
+        }
+    }
+
+    /// Repaints the header when the pointer enters/leaves a button.
+    fn update_hover(&mut self) {
+        let m = self.decor_metrics();
+        let on = self.pointer_on;
+        let p = self.pointer_s.unwrap_or((0.0, 0.0));
+        for (w, s) in self.windows.iter_mut() {
+            let Some(c) = s.chrome.as_mut() else {
+                continue;
+            };
+            let hover = if Some(*w) == on && s.frame.is_framed() {
+                let (ox, oy) = s.frame.content_origin();
+                let sp = (p.0 + f64::from(ox), p.1 + f64::from(oy));
+                if sp.1 < f64::from(s.frame.header) {
+                    decor::hit_button(
+                        &m,
+                        f64::from(s.frame.surface_size((s.width, s.height)).0),
+                        &c.state.layout,
+                        sp,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if c.state.hover != hover {
+                c.state.hover = hover;
+                c.dirty = true;
+            }
+        }
+    }
+
+    /// Clears the pressed button on every header (the pointer left or the
+    /// button came up).
+    fn clear_header_pressed(&mut self) {
+        for s in self.windows.values_mut() {
+            if let Some(c) = s.chrome.as_mut()
+                && c.state.pressed.is_some()
+            {
+                c.state.pressed = None;
+                c.dirty = true;
+            }
+        }
+    }
+
+    /// The resize edge under the pointer, if any (for the edge cursor).
+    fn edge_at(&self) -> Option<decor::Edge> {
+        let w = self.pointer_on?;
+        let s = self.windows.get(&w)?;
+        if !s.frame.is_framed() {
+            return None;
+        }
+        let p = self.pointer_s?;
+        let (ox, oy) = s.frame.content_origin();
+        match s.frame.hit(
+            (p.0 + f64::from(ox), p.1 + f64::from(oy)),
+            (s.width, s.height),
+        ) {
+            decor::Hit::Edge(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Sets the edge cursor through wp_cursor_shape_v1 when the pointer moves
+    /// onto an edge, and restores the X cursor when it leaves it.
+    fn update_edge_cursor(&mut self) {
+        let edge = self.edge_at();
+        if edge == self.edge_cursor {
+            return;
+        }
+        self.edge_cursor = edge;
+        if let Some(e) = edge
+            && let Some(dev) = self.cursor_shape.as_ref()
+        {
+            dev.set_shape(self.enter_serial, cursor_shape(e));
+            return;
+        }
+        // back over the client (or no cursor-shape protocol): the X cursor
+        self.apply_cursor();
+    }
+
+    /// The content-local point of a pointer event on `surface` (the header is
+    /// offset by the content origin in the surface).
+    fn surface_point(
+        &self,
+        surface: &wl_surface::WlSurface,
+        x: f64,
+        y: f64,
+    ) -> Option<(Window, (f64, f64))> {
+        let w = if let Some(&w) = surface.data::<Window>() {
+            w
+        } else {
+            let Target::Header(w) = *surface.data::<Target>()? else {
+                return None;
+            };
+            w
+        };
+        // both the content surface and the header (at the surface origin)
+        // are surface boxes: content starts at the frame's origin
+        let frame = self.frame_of(w);
+        let (ox, oy) = frame.content_origin();
+        Some((w, (x - f64::from(ox), y - f64::from(oy))))
     }
 
     /// WM_NORMAL_HINTS as 32-bit values (empty: none).
@@ -1553,8 +2401,25 @@ impl State {
         let (input, iconic) = self.hints(w);
         let no_input = !input && !self.protocols(w).contains(&self.atoms.wm_take_focus);
         self.adopt_client(w);
-        let compositor = self.compositor.as_ref().expect("checked at start");
-        let wm_base = self.wm_base.as_ref().expect("checked at start");
+        // the section 5.1 decision, from what the client declares; the frame
+        // needs wl_subcompositor for its own header surface
+        let decision = self.frame_decision(w, no_input);
+        let mut frame = if self.decorations && decision.framed && self.subcompositor.is_some() {
+            decor::FrameGeom::ADWAITA
+        } else {
+            decor::FrameGeom::NONE
+        };
+        if frame.is_framed() {
+            let (sx, sy) = frame.surface_size((width, height));
+            if u32::from(sx) > u32::from(MAX_SIDE) || u32::from(sy) > u32::from(MAX_SIDE) {
+                crate::warning!(
+                    "-showwindows: {w:#x} with a frame would be {sx}x{sy}, too big to show: not framed"
+                );
+                frame = decor::FrameGeom::NONE;
+            }
+        }
+        let compositor = self.compositor.clone().expect("checked at start");
+        let wm_base = self.wm_base.clone().expect("checked at start");
         let surface = compositor.create_surface(qh, w);
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, w);
         let toplevel = xdg_surface.get_toplevel(qh, w);
@@ -1586,7 +2451,7 @@ impl State {
             }
         }
         // WM_NORMAL_HINTS' min/max size, as a window manager honours them
-        self.apply_size_hints(w, &toplevel);
+        self.apply_size_hints(w, &toplevel, frame);
         // a modal dialog (_NET_WM_STATE_MODAL, or Motif's modal input mode)
         // with a parent: GNOME attaches it to the parent, as it does on X -
         // but not one P1 chose (P1.md F7: GNOME then centres it on that
@@ -1608,10 +2473,11 @@ impl State {
                 winsync::initial_position(&self.normal_hints(w), asked.0, asked.1)
             && let Some(sync) = self.sync.as_ref()
         {
+            let (ox, oy) = frame.content_origin();
             sync.client.send(Request::SetInitialPosition {
                 xid: w,
-                x: ix,
-                y: iy,
+                x: ix - ox,
+                y: iy - oy,
             });
             crate::log!(
                 "-showwindows: {w:#x} asks to open at {ix},{iy}: the desktop places it there"
@@ -1622,16 +2488,34 @@ impl State {
             // screen's rules put it (show's fit), so the desktop opens it
             // there too
             if let Some(sync) = self.sync.as_ref() {
+                let (ox, oy) = frame.content_origin();
                 sync.client.send(Request::SetInitialPosition {
                     xid: w,
-                    x: i32::from(x),
-                    y: i32::from(y),
+                    x: i32::from(x) - ox,
+                    y: i32::from(y) - oy,
                 });
             }
         }
+        // the header, its own subsurface of the content surface
+        let chrome = if frame.is_framed() {
+            self.make_chrome(w, &surface, qh, frame, decision, (width, height))
+        } else {
+            None
+        };
+        if frame.is_framed() {
+            // the window geometry is the whole surface while framed: mutter
+            // clips pointer input (the header and the resize margins) to it,
+            // so the chrome must be inside. winsync still works in content
+            // coordinates; the conversion is at its boundary.
+            let (sw, sh) = frame.surface_size((width, height));
+            xdg_surface.set_window_geometry(0, 0, i32::from(sw), i32::from(sh));
+        }
         surface.commit();
+        if chrome.is_none() {
+            frame = decor::FrameGeom::NONE;
+        }
         crate::log!(
-            "-showwindows: showing {w:#x} {:?} (class {:?}) {}x{}+{}+{} depth {}{}{}",
+            "-showwindows: showing {w:#x} {:?} (class {:?}) {}x{}+{}+{} depth {}{}{}{}",
             title,
             class,
             width,
@@ -1644,6 +2528,16 @@ impl State {
                 ", takes no keyboard input"
             } else {
                 ""
+            },
+            if frame.is_framed() {
+                format!(
+                    ", framed (header {} px, margin {} px)",
+                    frame.header, frame.margin
+                )
+            } else if self.decorations && !decision.framed {
+                format!(", not framed ({})", decision.why.as_str())
+            } else {
+                String::new()
             },
         );
         let client = self.client_of(w);
@@ -1676,6 +2570,15 @@ impl State {
             p1_grouped: grouped,
             p1_waiting: waiting,
             p2_moves: 0,
+            frame,
+            decision,
+            chrome,
+            window_geometry: if frame.is_framed() {
+                let (sw, sh) = frame.surface_size((width, height));
+                (0, 0, i32::from(sw), i32::from(sh))
+            } else {
+                (0, 0, i32::from(width), i32::from(height))
+            },
         };
         if let Some(sync) = self.sync.as_mut() {
             let r = Rect::new(
@@ -1687,6 +2590,9 @@ impl State {
             sync.geo.track(w, r);
         }
         self.windows.insert(w, shown);
+        if frame.is_framed() {
+            self.publish_frame_extents(w);
+        }
         if grouped && waiting {
             crate::log!(
                 "-showwindows: {w:#x} belongs to a main window: none of its client's is shown yet"
@@ -1894,10 +2800,13 @@ impl State {
         let p = self.windows.get(&parent).expect("found above");
         let (dx, dy) = (i32::from(x) - origin.0, i32::from(y) - origin.1);
         let ((ax, ay), (ox, oy)) = popup_anchor(dx, dy, p.width, p.height);
+        // xdg_positioner's anchor rectangle is in the parent surface's space:
+        // content at the frame's origin in the surface
+        let (fx, fy) = p.frame.content_origin();
         let wm_base = self.wm_base.as_ref().expect("checked at start");
         let positioner = wm_base.create_positioner(qh, ());
         positioner.set_size(i32::from(width), i32::from(height));
-        positioner.set_anchor_rect(ax, ay, 1, 1);
+        positioner.set_anchor_rect(ax + fx, ay + fy, 1, 1);
         positioner.set_offset(ox, oy);
         positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
         positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
@@ -1963,6 +2872,18 @@ impl State {
                 p1_grouped: false,
                 p1_waiting: false,
                 p2_moves: 0,
+                frame: decor::FrameGeom::NONE,
+                decision: decor::Decision {
+                    framed: false,
+                    why: decor::Why::WindowType,
+                    move_: false,
+                    resize: false,
+                    close: false,
+                    minimize: false,
+                    maximize: false,
+                },
+                chrome: None,
+                window_geometry: (0, 0, i32::from(width), i32::from(height)),
             },
         );
         self.popups.push(w);
@@ -2034,6 +2955,9 @@ impl State {
                 buf.destroy();
             }
             b.pool.destroy();
+        }
+        if let Some(c) = s.chrome {
+            c.destroy();
         }
         if self.lock.as_ref().is_some_and(|l| l.window == w) {
             self.unlock();
@@ -2190,6 +3114,9 @@ impl State {
                             return;
                         }
                         (s.width, s.height) = (w, h);
+                        if let Some(c) = &mut s.chrome {
+                            c.dirty = true;
+                        }
                         // the window got a new pixmap
                         if let Some(p) = s.pixmap.take() {
                             let _ = self.x.free_pixmap(p);
@@ -2224,13 +3151,21 @@ impl State {
                     && self.windows.contains_key(&e.window) =>
             {
                 let title = self.title(e.window);
-                if let Some(Shown {
-                    role: Role::Toplevel(t),
-                    ..
-                }) = self.windows.get(&e.window)
-                {
-                    t.set_title(title);
+                if let Some(s) = self.windows.get_mut(&e.window) {
+                    if let Role::Toplevel(t) = &s.role {
+                        t.set_title(title.clone());
+                    }
+                    // the header's title is its own surface: relayout it, no
+                    // client pixels are copied
+                    if let Some(c) = &mut s.chrome
+                        && c.state.title != title
+                    {
+                        c.state.title = title;
+                        c.dirty = true;
+                        self.title_changed_at = Some(Instant::now());
+                    }
                 }
+                self.paint_header(e.window);
             }
             Event::PropertyNotify(e)
                 if e.atom == u32::from(AtomEnum::WM_NORMAL_HINTS)
@@ -2241,7 +3176,7 @@ impl State {
                     ..
                 }) = self.windows.get(&e.window)
                 {
-                    self.apply_size_hints(e.window, t);
+                    self.apply_size_hints(e.window, t, self.frame_of(e.window));
                 }
                 if let Some(s) = self.windows.get_mut(&e.window) {
                     s.dirty = true;
@@ -2266,6 +3201,7 @@ impl State {
 
     /// Work the Wayland handlers queued.
     fn after_dispatch(&mut self, qh: &QueueHandle<State>) {
+        self.poll_settings();
         for w in std::mem::take(&mut self.frame_done) {
             if let Some(s) = self.windows.get_mut(&w) {
                 s.frame_pending = false;
@@ -2307,12 +3243,31 @@ impl State {
                 && frame_bytes(width as u16, height as u16).is_some()
             {
                 let synced = self.synced_toplevel(w);
+                // the configure is a window-geometry size; a normally framed
+                // window's geometry is the whole surface, a maximised one's
+                // is the content (the header is detached)
+                let pending = self
+                    .states
+                    .iter()
+                    .find(|(x, _, _)| *x == w)
+                    .map(|(_, m, f)| (*m, *f));
+                let (max, full) = pending.unwrap_or((s.maximized, s.fullscreen));
+                let (gw, gh) = if s.frame.is_framed() && !max && !full {
+                    let (_, _, cw, ch) = s.frame.content_rect(0, 0, width, height);
+                    (cw, ch)
+                } else {
+                    (width, height)
+                };
+                crate::vlog!(
+                    "-showwindows: configure {w:#x}: geometry {width}x{height} -> content {gw}x{gh} (frame {:?}, max {max}/{full})",
+                    s.frame
+                );
                 // with the sync the size is the window geometry's, border
                 // included (0.1.2 sets it as the size inside the border)
-                let (iw, ih) = if synced {
-                    winsync::inner_size(width, height, s.border)
+                let (iw, ih) = if synced || s.frame.is_framed() {
+                    winsync::inner_size(gw, gh, s.border)
                 } else {
-                    (width as u32, height as u32)
+                    (gw as u32, gh as u32)
                 };
                 let at = s.at;
                 let cookie = self
@@ -2326,7 +3281,9 @@ impl State {
                     && let Some(sync) = self.sync.as_mut()
                     && !sync.geo.pending(w)
                 {
-                    let r = Rect::new(i32::from(at.0), i32::from(at.1), width, height);
+                    // winsync keeps content coordinates: what X was just
+                    // configured to, not the window geometry
+                    let r = Rect::new(i32::from(at.0), i32::from(at.1), gw, gh);
                     sync.geo.x_sent(w, r, c.sequence_number());
                 }
             }
@@ -2348,6 +3305,8 @@ impl State {
                     if fullscreen { ", fullscreen" } else { "" }
                 );
                 self.set_net_wm_state(w, maximized, fullscreen);
+                self.publish_frame_extents(w);
+                self.update_header(w);
             }
         }
         for w in std::mem::take(&mut self.popup_done) {
@@ -2382,6 +3341,24 @@ impl State {
         // after the last drain of X events: a window that moved or grew off
         // the X screen goes back on it (P2)
         self.keep_on_screen();
+        // headers repaint on focus changes, never per client frame
+        let focus = self.keyboard_on;
+        let headers: Vec<Window> = self
+            .windows
+            .iter_mut()
+            .filter_map(|(w, s)| {
+                let c = s.chrome.as_mut()?;
+                let active = focus == Some(*w);
+                if c.state.active != active {
+                    c.state.active = active;
+                    c.dirty = true;
+                }
+                c.dirty.then_some(*w)
+            })
+            .collect();
+        for w in headers {
+            self.paint_header(w);
+        }
         let dirty: Vec<Window> = self
             .windows
             .iter()
@@ -2399,7 +3376,12 @@ impl State {
             && let Role::Popup { parent, .. } = s.role
             && let Ok(origin) = self.shown_origin(parent)
         {
-            let (nx, ny) = popup_position(origin, (px, py));
+            let p = self.windows.get(&parent);
+            let frame = p.map_or(decor::FrameGeom::NONE, |s| s.frame);
+            // xdg_popup's configure is relative to the parent's window
+            // geometry (the surface origin), the X window to its content
+            let (ox, oy) = frame.content_origin();
+            let (nx, ny) = popup_position(origin, (px - ox, py - oy));
             if (nx, ny) != (i32::from(s.x), i32::from(s.y)) {
                 crate::vlog!(
                     "-showwindows: popup {w:#x} placed at {nx},{ny}, not {},{}",
@@ -2436,14 +3418,15 @@ impl State {
             return Ok(());
         }
         let realloc = self.windows.get(&w).is_some_and(|s| {
+            let (sw, sh) = s.frame.surface_size((s.width, s.height));
             s.configured
                 && s.dirty
                 && s.buffers
                     .as_ref()
-                    .is_none_or(|b| (b.width, b.height) != (s.width, s.height))
+                    .is_none_or(|b| (b.width, b.height) != (sw, sh))
         });
         if realloc {
-            // (re)allocate for the current size
+            // (re)allocate for the current surface size (content + frame)
             let s = self.windows.get_mut(&w).expect("checked");
             if let Some(b) = s.buffers.take() {
                 let _ = shm::detach(&self.x, b.seg);
@@ -2452,12 +3435,30 @@ impl State {
                 }
                 b.pool.destroy();
             }
-            let (width, height) = (s.width, s.height);
+            let (cw, ch) = (s.width, s.height);
+            let (width, height) = s.frame.surface_size((cw, ch));
             let frame = frame_bytes(width, height).ok_or("too big")?;
             let fd = memfd(frame * 2)?;
+            // SAFETY: the fd is `frame * 2` bytes; mapped shared for the
+            // packed-row rearrangement, unmapped by `Buffers::drop`.
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    frame * 2,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd.as_raw_fd(),
+                    0,
+                )
+            };
+            if map == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().into());
+            }
             let seg = self.x.generate_id()?;
             shm::attach_fd(&self.x, seg, fd.try_clone()?, false)?;
-            let format = if s.depth == 32 {
+            // a framed parent has transparent margins, so it needs alpha;
+            // the content is made opaque below for depth-24 clients
+            let format = if s.frame.is_framed() || s.depth == 32 {
                 wl_shm::Format::Argb8888
             } else {
                 wl_shm::Format::Xrgb8888
@@ -2484,6 +3485,8 @@ impl State {
                 width,
                 height,
                 frame,
+                map: map.cast::<u8>(),
+                len: frame * 2,
             });
         }
         let Some(s) = self.windows.get(&w) else {
@@ -2515,17 +3518,20 @@ impl State {
         let s = self.windows.get_mut(&w).expect("checked");
         let b = s.buffers.as_mut().expect("checked");
         s.dirty = false;
+        let (ox, oy) = s.frame.content_origin();
+        let (cw, ch) = (s.width, s.height);
+        let base = (b.frame * i) + ((oy as usize) * (b.width as usize) + (ox as usize)) * 4;
         let reply = shm::get_image(
             &self.x,
             source,
             0,
             0,
-            b.width,
-            b.height,
+            cw,
+            ch,
             !0,
             x11rb::protocol::xproto::ImageFormat::Z_PIXMAP.into(),
             b.seg,
-            (b.frame * i) as u32,
+            base as u32,
         )?
         .reply();
         if let Err(e) = reply {
@@ -2538,9 +3544,43 @@ impl State {
             s.dirty = true;
             return Err(e.into());
         }
+        if s.frame.is_framed() {
+            let radius = self.decor.as_ref().map_or(12.0, |p| p.metrics().radius);
+            // SAFETY: `map` is the mmap of `len` bytes made above.
+            let pixels = unsafe { std::slice::from_raw_parts_mut(b.map, b.len) };
+            decor::arrange_content(
+                pixels,
+                base,
+                b.width,
+                (cw, ch),
+                s.frame.margin.max(0) as u16,
+                s.depth != 32,
+                radius,
+            );
+        }
+        if s.frame.is_framed() {
+            // normal: the whole surface (chrome takes input there);
+            // maximised/fullscreen: the content, because the header is gone
+            let (sw, sh) = s.frame.surface_size((cw, ch));
+            let geom = if s.maximized || s.fullscreen {
+                (ox, oy, i32::from(cw), i32::from(ch))
+            } else {
+                (0, 0, i32::from(sw), i32::from(sh))
+            };
+            if s.window_geometry != geom {
+                s.xdg_surface
+                    .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
+                s.window_geometry = geom;
+            }
+        }
         s.surface.attach(Some(&b.buffers[i]), 0, 0);
-        s.surface
-            .damage_buffer(0, 0, b.width as i32, b.height as i32);
+        if s.frame.is_framed() {
+            s.surface
+                .damage_buffer(ox, oy, i32::from(cw), i32::from(ch));
+        } else {
+            s.surface
+                .damage_buffer(0, 0, b.width as i32, b.height as i32);
+        }
         if self.throttle {
             s.surface.frame(&self.qh, w);
             s.frame_pending = true;
@@ -2549,6 +3589,7 @@ impl State {
         s.surface.commit();
         b.busy[i] = true;
         s.frames += 1;
+        let framed = s.frame.is_framed();
         if s.frames == 1 {
             crate::log!("-showwindows: first frame of {w:#x} on the desktop");
             if s.iconic
@@ -2558,6 +3599,9 @@ impl State {
                 t.set_minimized();
                 crate::log!("-showwindows: {w:#x} asked to start iconic: minimised");
             }
+        }
+        if framed {
+            self.paint_header(w);
         }
         Ok(())
     }
@@ -2903,7 +3947,12 @@ impl State {
         )?;
         self.wm_announced = true;
         crate::log!(
-            "-showwindows: announced _NET_WM_MOVERESIZE and _NET_WM_STATE (maximise, fullscreen) to clients"
+            "-showwindows: announced _NET_WM_MOVERESIZE, _NET_WM_STATE (maximise, fullscreen){} to clients",
+            if self.decorations {
+                " and _NET_FRAME_EXTENTS (decorations)"
+            } else {
+                ""
+            }
         );
         Ok(())
     }
@@ -2923,6 +3972,9 @@ impl State {
             a.net_wm_state_fullscreen,
             a.net_wm_state_modal,
         ];
+        if self.decorations {
+            v.extend([a.net_frame_extents, a.net_request_frame_extents]);
+        }
         if sync {
             v.extend([
                 a.net_active_window,
@@ -2965,11 +4017,20 @@ impl State {
     }
 
     /// WM_NORMAL_HINTS' minimum and maximum size on the shown toplevel.
-    fn apply_size_hints(&self, w: Window, t: &xdg_toplevel::XdgToplevel) {
+    fn apply_size_hints(&self, w: Window, t: &xdg_toplevel::XdgToplevel, f: decor::FrameGeom) {
         let v = self.normal_hints(w);
         let ((minw, minh), (maxw, maxh)) = size_limits(&v);
-        t.set_min_size(minw, minh);
-        t.set_max_size(maxw, maxh);
+        // the toplevel's size limits are window-geometry sizes: add the frame
+        let add = |v: i32, d: i32| {
+            if v > 0 {
+                (v + d).min(i32::from(MAX_SIDE))
+            } else {
+                0
+            }
+        };
+        let (dminw, dminh) = (2 * f.margin.max(0), f.header.max(0) + f.margin.max(0));
+        t.set_min_size(add(minw, dminw), add(minh, dminh));
+        t.set_max_size(add(maxw, dminw), add(maxh, dminh));
         if (minw, minh, maxw, maxh) != (0, 0, 0, 0) {
             crate::vlog!("-showwindows: {w:#x} size limits {minw}x{minh} .. {maxw}x{maxh}");
         }
@@ -3003,6 +4064,12 @@ impl State {
     /// fullscreen, hidden) and ICCCM's `WM_CHANGE_STATE` (iconify), for a
     /// shown toplevel.
     fn client_message(&mut self, e: ClientMessageEvent) {
+        if e.type_ == self.atoms.net_request_frame_extents {
+            let d = e.data.as_data32();
+            let target = if d[0] != 0 { d[0] } else { e.window };
+            self.answer_frame_extents(target);
+            return;
+        }
         if self.synced_toplevel(e.window) && self.sync_client_message(&e) {
             return;
         }
@@ -3480,6 +4547,13 @@ impl State {
                 .is_some_and(|s| matches!(s.role, Role::Toplevel(_)))
     }
 
+    /// `w`'s frame (`NONE` when unframed).
+    fn frame_of(&self, w: Window) -> decor::FrameGeom {
+        self.windows
+            .get(&w)
+            .map_or(decor::FrameGeom::NONE, |s| s.frame)
+    }
+
     /// The user pressed a key or button on shown window `w`: its client's
     /// raise requests are honoured for a while (`winsync::RaiseGate`).
     fn input_on(&mut self, w: Option<Window>) {
@@ -3701,6 +4775,7 @@ impl State {
     /// MoveResize, if one waits.
     fn sync_send(&mut self, w: Window) {
         let synced = self.synced();
+        let f = self.frame_of(w);
         let Some(sync) = self.sync.as_mut() else {
             return;
         };
@@ -3712,9 +4787,12 @@ impl State {
             return;
         }
         if let Some(mr) = sync.geo.frame(w) {
+            // winsync works in content coordinates; the extension's
+            // MoveResize is the xdg window geometry (the whole surface)
+            let (sx, sy, sw, sh) = f.surface_rect(mr.rect.x, mr.rect.y, mr.rect.w, mr.rect.h);
             sync.client.send(Request::MoveResize {
                 xid: w,
-                rect: mr.rect,
+                rect: Rect::new(sx, sy, sw, sh),
                 flags: mr.flags,
             });
             sync.sent_at.insert(w, Instant::now());
@@ -3857,6 +4935,12 @@ impl State {
                 applied,
                 wire,
             } => {
+                let f = self.frame_of(xid);
+                let to_content = |r: Rect| {
+                    let (x, y, w, h) = f.content_rect(r.x, r.y, r.w, r.h);
+                    Rect::new(x, y, w, h)
+                };
+                let (requested, applied) = (to_content(requested), to_content(applied));
                 let Some(sync) = self.sync.as_mut() else {
                     return;
                 };
@@ -3885,6 +4969,10 @@ impl State {
                 wire,
                 ..
             } => {
+                let f = self
+                    .windows
+                    .get(&xid)
+                    .map_or(decor::FrameGeom::NONE, |s| s.frame);
                 let Some(sync) = self.sync.as_mut() else {
                     return;
                 };
@@ -3892,7 +4980,31 @@ impl State {
                     return;
                 };
                 let fresh = sync.geo.is_fresh(xid, wire);
-                let rect = winsync::desktop_position(rect, x);
+                if flags & winsync::st::USER != 0
+                    && let Some(t) = self.header_press_at.take()
+                {
+                    crate::vlog!(
+                        "-showwindows: {xid:#x} mutter's grab started {} ms after the header press",
+                        t.elapsed().as_millis()
+                    );
+                }
+                let (cx, cy, cw, ch) = f.content_rect(rect.x, rect.y, rect.w, rect.h);
+                crate::vlog!(
+                    "-showwindows: sync changed {xid:#x} {f:?}: desk {}x{}+{}+{} -> content {}x{}+{}+{} (x {}x{}+{}+{})",
+                    rect.w,
+                    rect.h,
+                    rect.x,
+                    rect.y,
+                    cw,
+                    ch,
+                    cx,
+                    cy,
+                    x.w,
+                    x.h,
+                    x.x,
+                    x.y
+                );
+                let rect = winsync::desktop_position(Rect::new(cx, cy, cw, ch), x);
                 let back = sync.geo.changed(xid, rect, flags, wire, Instant::now());
                 // the user's Always on Top on the desktop is the window's
                 // keep-above (_NET_WM_STATE_ABOVE), so a retell repeats it
@@ -3917,13 +5029,16 @@ impl State {
             }
             E::State(list, wire) => {
                 for ws in list.iter().filter(|w| w.shown) {
+                    let f = self.frame_of(ws.xid);
                     let Some(sync) = self.sync.as_mut() else {
                         return;
                     };
                     let Some(x) = sync.geo.x_rect(ws.xid) else {
                         continue;
                     };
-                    let rect = winsync::desktop_position(ws.rect, x);
+                    let (cx, cy, cw, ch) =
+                        f.content_rect(ws.rect.x, ws.rect.y, ws.rect.w, ws.rect.h);
+                    let rect = winsync::desktop_position(Rect::new(cx, cy, cw, ch), x);
                     let back = sync.geo.resync(ws.xid, rect, ws.flags, wire);
                     self.set_origin(ws.xid);
                     if let Some(r) = back {
@@ -4549,6 +5664,18 @@ impl State {
                 p1_grouped: false,
                 p1_waiting: false,
                 p2_moves: 0,
+                frame: decor::FrameGeom::NONE,
+                decision: decor::Decision {
+                    framed: false,
+                    why: decor::Why::WindowType,
+                    move_: false,
+                    resize: false,
+                    close: false,
+                    minimize: false,
+                    maximize: false,
+                },
+                chrome: None,
+                window_geometry: (0, 0, i32::from(sw), i32::from(sh)),
             },
         );
         Ok(())
@@ -4833,6 +5960,62 @@ fn memfd(len: usize) -> Result<OwnedFd, AnyError> {
     Ok(fd)
 }
 
+/// The header surface's pixel pool: an anonymous memfd, mapped here and
+/// attached to the compositor as two `wl_shm` ARGB8888 buffers.
+fn header_buffers(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<State>,
+    w: Window,
+    width: u16,
+    height: u16,
+) -> Result<HeaderBuffers, AnyError> {
+    let stride = width as usize * 4;
+    let len = stride
+        .checked_mul(height as usize)
+        .ok_or("header too big")?;
+    let fd = memfd(len * 2)?;
+    // SAFETY: `fd` is `len * 2` bytes (ftruncate in `memfd`), mapped shared,
+    // and unmapped by `HeaderBuffers::drop`.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len * 2,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if map == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let pool = shm.create_pool(fd.as_fd(), (len * 2) as i32, qh, ());
+    let buffers = {
+        let mk = |i: usize| {
+            pool.create_buffer(
+                (len * i) as i32,
+                i32::from(width),
+                i32::from(height),
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                HeaderMark(w, i),
+            )
+        };
+        [mk(0), mk(1)]
+    };
+    Ok(HeaderBuffers {
+        pool,
+        buffers,
+        busy: [false; 2],
+        width,
+        height,
+        stride,
+        map: map.cast::<u8>(),
+        len: len * 2,
+    })
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
@@ -4853,6 +6036,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
                 }
                 "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
+                "wl_subcompositor" => state.subcompositor = Some(registry.bind(name, 1, qh, ())),
                 "xdg_wm_base" => {
                     state.wm_base = Some(registry.bind(name, version.min(2), &state.ping_qh, ()))
                 }
@@ -4866,6 +6050,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.relative_manager = Some(registry.bind(name, 1, qh, ()))
                 }
                 "wp_viewporter" => state.viewporter = Some(registry.bind(name, 1, qh, ())),
+                "wp_cursor_shape_manager_v1" => {
+                    let m: wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 =
+                        registry.bind(name, 1, qh, ());
+                    state.cursor_shape = state.pointer.as_ref().map(|p| m.get_pointer(p, qh, ()));
+                    state.cursor_shape_manager = Some(m);
+                }
                 "xdg_wm_dialog_v1" => state.dialogs = Some(registry.bind(name, 1, qh, ())),
                 "xdg_toplevel_tag_manager_v1" => state.tags = Some(registry.bind(name, 1, qh, ())),
                 "zwp_tablet_manager_v2" => {
@@ -4905,13 +6095,19 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             // more: let it go, and take a new one when it is back.
             if caps.contains(wl_seat::Capability::Pointer) {
                 if state.pointer.is_none() {
-                    state.pointer = Some(seat.get_pointer(qh, ()));
+                    let p = seat.get_pointer(qh, ());
+                    state.cursor_shape = state
+                        .cursor_shape_manager
+                        .as_ref()
+                        .map(|m| m.get_pointer(&p, qh, ()));
+                    state.pointer = Some(p);
                 }
             } else if let Some(p) = state.pointer.take() {
                 crate::vlog!("-showwindows: the seat has no pointer now");
                 state.release_buttons();
                 state.pointer_on = None;
                 state.pointer_entered = false;
+                state.pointer_target = None;
                 scroll_forgets(
                     &mut state.axis_rest,
                     &mut state.axis_source,
@@ -5127,6 +6323,28 @@ impl Dispatch<wl_buffer::WlBuffer, (Window, usize)> for State {
     }
 }
 
+impl Dispatch<wl_buffer::WlBuffer, HeaderMark> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        data: &HeaderMark,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_buffer::Event::Release = event
+            && let Some(c) = state
+                .windows
+                .get_mut(&data.0)
+                .and_then(|s| s.chrome.as_mut())
+            && let Some(b) = c.buffers.as_mut()
+            && data.1 < 2
+        {
+            b.busy[data.1] = false;
+        }
+    }
+}
+
 impl Dispatch<wl_callback::WlCallback, Window> for State {
     fn event(
         state: &mut Self,
@@ -5189,15 +6407,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 surface_x,
                 surface_y,
             } => {
-                let Some(&w) = surface.data::<Window>() else {
+                let Some((w, (sx, sy))) = state.surface_point(&surface, surface_x, surface_y)
+                else {
                     return;
                 };
                 if w == 0 {
                     return; // the cursor surface
                 }
-                state.pointer_s = Some((surface_x, surface_y));
+                state.pointer_s = Some((sx, sy));
                 state.pointer_on = Some(w);
                 state.pointer_entered = true;
+                crate::vlog!(
+                    "-showwindows: pointer entered {w:#x} {:?} at {sx},{sy} (surface {surface_x},{surface_y})",
+                    surface.data::<Target>().copied()
+                );
+                state.pointer_target = surface
+                    .data::<Target>()
+                    .copied()
+                    .or_else(|| surface.data::<Window>().map(|w| Target::Content(*w)));
                 state.enter_serial = serial;
                 scroll_forgets(
                     &mut state.axis_rest,
@@ -5231,13 +6458,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                         }
                     }
                 }
-                state.motion(w, surface_x, surface_y, None);
+                state.motion(w, sx, sy, None);
+                state.update_hover();
+                state.update_edge_cursor();
                 state.apply_cursor();
             }
             wl_pointer::Event::Leave { .. } => {
                 state.release_buttons();
+                // a header press owns its release even if a compositor grab
+                // (move/resize) moves the pointer off our surfaces first
+                state.clear_header_pressed();
                 state.pointer_on = None;
                 state.pointer_entered = false;
+                state.pointer_target = None;
+                state.edge_cursor = None;
                 scroll_forgets(
                     &mut state.axis_rest,
                     &mut state.axis_source,
@@ -5249,16 +6483,31 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 surface_x,
                 surface_y,
             } => {
-                state.pointer_s = Some((surface_x, surface_y));
+                let Some(target) = state.pointer_target else {
+                    return;
+                };
+                let (w, (sx, sy)) = match target {
+                    Target::Content(w) | Target::Header(w) => {
+                        let frame = state
+                            .windows
+                            .get(&w)
+                            .map_or(decor::FrameGeom::NONE, |s| s.frame);
+                        let (ox, oy) = frame.content_origin();
+                        (w, (surface_x - f64::from(ox), surface_y - f64::from(oy)))
+                    }
+                };
+                state.pointer_s = Some((sx, sy));
                 if state
                     .drag
                     .as_ref()
                     .is_some_and(|d| d.of_pointer(state.pointer_on))
                 {
-                    state.drag_parts.motion((surface_x, surface_y), time);
-                } else if let Some(w) = state.pointer_on {
-                    state.motion(w, surface_x, surface_y, Some(time));
+                    state.drag_parts.motion((sx, sy), time);
+                } else if state.pointer_on.is_some() {
+                    state.motion(w, sx, sy, Some(time));
                 }
+                state.update_hover();
+                state.update_edge_cursor();
             }
             wl_pointer::Event::Button {
                 serial,
@@ -5270,8 +6519,33 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 if pressed {
                     state.press_serial = serial;
                     state.input_time = time;
+                    let p = state.pointer_s.unwrap_or((0.0, 0.0));
+                    // wl_pointer gives Linux BTN_* codes; the header's
+                    // actions are X buttons (1/2/3), as `button()` maps them
+                    let xb = injectable_button(button).map_or(button, u32::from);
+                    let consumed = state
+                        .pointer_on
+                        .is_some_and(|w| state.header_press(w, xb, serial, p));
+                    if consumed {
+                        // the header took it: no XTest press reaches the client
+                        state.header_button = Some(button);
+                        if let Some(w) = state.pointer_on
+                            && let Some(c) =
+                                state.windows.get_mut(&w).and_then(|s| s.chrome.as_mut())
+                            && c.state.hover.is_some()
+                        {
+                            c.state.pressed = c.state.hover;
+                            c.dirty = true;
+                        }
+                    } else {
+                        state.button(button, true);
+                    }
+                } else if state.header_button == Some(button) {
+                    state.header_button = None;
+                    state.clear_header_pressed();
+                } else {
+                    state.button(button, false);
                 }
-                state.button(button, pressed);
             }
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(src),
@@ -5334,7 +6608,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     ) {
         match event {
             wl_keyboard::Event::Enter { surface, .. } => {
-                let Some(&w) = surface.data::<Window>() else {
+                let Some((w, _)) = state.surface_point(&surface, 0.0, 0.0) else {
                     return;
                 };
                 on_keyboard_enter(&mut state.keyboard_left, &mut state.keyboard_on, w);
@@ -5448,13 +6722,29 @@ impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for State {
     }
 }
 
+impl Dispatch<wl_surface::WlSurface, Target> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_surface::WlSurface,
+        _: wl_surface::Event,
+        _: &Target,
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
+wayland_client::delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
+wayland_client::delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
 wayland_client::delegate_noop!(State: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
 wayland_client::delegate_noop!(State: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
 wayland_client::delegate_noop!(State: ignore wp_viewporter::WpViewporter);
+wayland_client::delegate_noop!(State: ignore wp_cursor_shape_manager_v1::WpCursorShapeManagerV1);
+wayland_client::delegate_noop!(State: ignore wp_cursor_shape_device_v1::WpCursorShapeDeviceV1);
 wayland_client::delegate_noop!(State: ignore wp_viewport::WpViewport);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_manager_v2::ZwpTabletManagerV2);
 wayland_client::delegate_noop!(State: ignore zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2);
@@ -5483,7 +6773,7 @@ impl Dispatch<wl_touch::WlTouch, ()> for State {
                 ..
             } => {
                 state.touch_down += 1;
-                let Some(&w) = surface.data::<Window>() else {
+                let Some((w, (x, y))) = state.surface_point(&surface, x, y) else {
                     return;
                 };
                 // only the first point of a touch sequence emulates
@@ -5608,7 +6898,7 @@ impl Dispatch<zwp_tablet_tool_v2::ZwpTabletToolV2, ()> for State {
     ) {
         match event {
             zwp_tablet_tool_v2::Event::ProximityIn { surface, .. } => {
-                let Some(&w) = surface.data::<Window>() else {
+                let Some((w, _)) = state.surface_point(&surface, 0.0, 0.0) else {
                     return;
                 };
                 if w == 0 || state.tool_on.is_some() {

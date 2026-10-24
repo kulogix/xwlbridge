@@ -10,6 +10,8 @@ repository = "https://github.com/kulogix/xwlbridge"
 
 [dependencies]
 libc = "0.2"
+# cairo/pango for -showwindows decorations, opened with dlopen at runtime
+libloading = "0.8"
 wayland-client = "0.31.14"
 # the server half of the same crate wayland-client is built on: the private
 # compositor of -engine xwayland (src/xvfb/wlhost.rs)
