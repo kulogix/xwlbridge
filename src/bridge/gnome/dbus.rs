@@ -46,6 +46,8 @@ pub struct Monitor {
     pub width: u32,
     pub height: u32,
     pub refresh_mhz: u32,
+    /// The logical monitor's scale (1.0 with a physical layout).
+    pub scale: f64,
     /// GNOME's primary monitor (the top bar's, where new windows go).
     pub primary: bool,
 }
@@ -217,6 +219,7 @@ fn display_state_everything(conn: &Connection) -> zbus::Result<(Vec<Monitor>, Co
             width: w,
             height: h,
             refresh_mhz: (mode.3 * 1000.0).round() as u32,
+            scale: if physical_layout { 1.0 } else { scale },
             primary,
         });
     }

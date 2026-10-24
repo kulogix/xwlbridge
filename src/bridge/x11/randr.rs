@@ -32,6 +32,10 @@ pub struct Screen {
     /// The compositor's primary output (its `wl_name`), 0 if it has none or
     /// says none; the first output stands in then.
     pub primary: u32,
+    /// S: X pixels = logical pixels x this (1 without HiDPI). The window
+    /// sync's S; the X screen is the logical layout times it (design
+    /// section 4).
+    pub x_scale: u32,
     /// Gamma ramps clients set, per CRTC (red, green, blue). Kept to be read
     /// back, and nothing more: the desktop owns the colours (night light),
     /// so they are never applied.
@@ -85,8 +89,14 @@ pub struct Output {
     /// overlap (see `logical_*` below). The width/height are the physical mode.
     pub x: i16,
     pub y: i16,
+    /// The output's size in **X pixels**: logical x S under HiDPI, the
+    /// native mode otherwise.
     pub width: u16,
     pub height: u16,
+    /// The native mode's size, for placing the capture buffer (which is
+    /// always the native resolution) in the framebuffer.
+    pub phys_width: u16,
+    pub phys_height: u16,
     /// The output's rectangle in the compositor's **logical** coordinate space
     /// (from xdg-output, or wl_output geometry + mode/scale as a fallback). Used
     /// only to reconstruct the relative arrangement; physical positions are
@@ -133,6 +143,7 @@ impl Screen {
             timestamp: 1,
             config_timestamp: 1,
             primary: 0,
+            x_scale: 1,
             gamma: BTreeMap::new(),
         };
         let mode = s.alloc_mode(width, height, 0);
@@ -145,6 +156,8 @@ impl Screen {
             y: 0,
             width,
             height,
+            phys_width: width,
+            phys_height: height,
             lx: 0,
             ly: 0,
             lw: i32::from(width),
@@ -158,6 +171,77 @@ impl Screen {
             listed: None,
         });
         s
+    }
+
+    /// Sets S (X pixels = logical x S) and re-expresses every output in the
+    /// new space: its X size and position, and the CRTC mode it drives.
+    /// Returns whether anything changed. S = 1 restores the native layout.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))] // only the gnome backend sets S
+    pub fn set_x_scale(&mut self, scale: u32) -> bool {
+        let scale = scale.max(1);
+        if scale == self.x_scale {
+            return false;
+        }
+        self.x_scale = scale;
+        for i in 0..self.outputs.len() {
+            let (lw, lh, lx, ly, pw, ph) = {
+                let o = &self.outputs[i];
+                (o.lw, o.lh, o.lx, o.ly, o.phys_width, o.phys_height)
+            };
+            let o = &mut self.outputs[i];
+            if o.is_wayland() && scale > 1 {
+                o.width = (i64::from(lw) * i64::from(scale)).clamp(1, i64::from(u16::MAX)) as u16;
+                o.height = (i64::from(lh) * i64::from(scale)).clamp(1, i64::from(u16::MAX)) as u16;
+                o.x = (i64::from(lx) * i64::from(scale)).clamp(0, i64::from(i16::MAX)) as i16;
+                o.y = (i64::from(ly) * i64::from(scale)).clamp(0, i64::from(i16::MAX)) as i16;
+            } else if o.is_wayland() {
+                o.width = pw;
+                o.height = ph;
+            }
+            if o.is_wayland() {
+                let (mw, mh) = if scale > 1 {
+                    (lw, lh)
+                } else {
+                    (i32::from(pw), i32::from(ph))
+                };
+                o.mm_width = mm(mw.clamp(1, i32::from(u16::MAX)) as u16);
+                o.mm_height = mm(mh.clamp(1, i32::from(u16::MAX)) as u16);
+            }
+        }
+        if scale > 1 {
+            // direct logical x S placement (the design's X space)
+        } else {
+            self.relayout_physical();
+        }
+        for i in 0..self.outputs.len() {
+            self.ensure_x_mode(i);
+        }
+        self.recompute_bounds();
+        self.bump();
+        true
+    }
+
+    /// Makes output `i`'s CRTC mode the one for its current X size.
+    #[cfg_attr(not(feature = "gnome"), allow(dead_code))]
+    fn ensure_x_mode(&mut self, i: usize) {
+        let Some(o) = self.outputs.get(i) else {
+            return;
+        };
+        let (w, h) = (o.width, o.height);
+        if self.mode_size(o.mode) == Some((w, h)) {
+            return;
+        }
+        let found = o
+            .mode_ids
+            .iter()
+            .copied()
+            .find(|&id| self.mode_size(id) == Some((w, h)));
+        let mode = found.unwrap_or_else(|| self.alloc_mode(w, h, 0));
+        let o = &mut self.outputs[i];
+        o.mode = mode;
+        if !o.mode_ids.contains(&mode) {
+            o.mode_ids.push(mode);
+        }
     }
 
     fn alloc_id(&mut self) -> u32 {
@@ -245,7 +329,15 @@ impl Screen {
             .iter()
             .filter(|s| s.preferred)
             .chain(specs.iter().filter(|s| !s.preferred));
-        for s in ordered {
+        let scale = self.x_scale;
+        for spec in ordered {
+            let mut s = *spec;
+            if scale > 1 {
+                s.width =
+                    (i64::from(s.width) * i64::from(scale)).clamp(1, i64::from(MAX_SCREEN)) as u16;
+                s.height =
+                    (i64::from(s.height) * i64::from(scale)).clamp(1, i64::from(MAX_SCREEN)) as u16;
+            }
             if s.width == 0 || s.height == 0 || s.width > MAX_SCREEN || s.height > MAX_SCREEN {
                 continue;
             }
@@ -262,7 +354,7 @@ impl Screen {
                 ids.push(current);
                 continue;
             }
-            ids.push(self.alloc_listed_mode(*s));
+            ids.push(self.alloc_listed_mode(s));
         }
         // then the CRTC's mode if the compositor's list didn't stand for it,
         // and modes a client added
@@ -562,17 +654,32 @@ impl Screen {
         {
             return true;
         }
-        let xs: Vec<(i32, i32, i32)> = self
-            .outputs
-            .iter()
-            .map(|o| (o.lx, o.lw, i32::from(o.width)))
-            .collect();
-        let ys: Vec<(i32, i32, i32)> = self
-            .outputs
-            .iter()
-            .map(|o| (o.ly, o.lh, i32::from(o.height)))
-            .collect();
-        let (px, py) = (pack_axis(&xs), pack_axis(&ys));
+        let (px, py) = if self.x_scale > 1 {
+            let s = i64::from(self.x_scale);
+            let x: Vec<i32> = self
+                .outputs
+                .iter()
+                .map(|o| (i64::from(o.lx) * s).clamp(0, i64::from(i16::MAX)) as i32)
+                .collect();
+            let y: Vec<i32> = self
+                .outputs
+                .iter()
+                .map(|o| (i64::from(o.ly) * s).clamp(0, i64::from(i16::MAX)) as i32)
+                .collect();
+            (x, y)
+        } else {
+            let xs: Vec<(i32, i32, i32)> = self
+                .outputs
+                .iter()
+                .map(|o| (o.lx, o.lw, i32::from(o.phys_width)))
+                .collect();
+            let ys: Vec<(i32, i32, i32)> = self
+                .outputs
+                .iter()
+                .map(|o| (o.ly, o.lh, i32::from(o.phys_height)))
+                .collect();
+            (pack_axis(&xs), pack_axis(&ys))
+        };
         let max = i32::from(i16::MAX);
         let (mut w, mut h) = (0u16, 0u16);
         for (i, o) in self.outputs.iter().enumerate() {
@@ -658,15 +765,27 @@ impl Screen {
     /// edge ended. This is exact for edge-aligned layouts (rows, columns,
     /// aligned grids); gaps are bridged 1:1.
     fn relayout_physical(&mut self) {
+        if self.x_scale > 1 {
+            // X space is logical x S, monitor for monitor (not the native
+            // packing: a 1x monitor's windows are 2x on a mixed desktop)
+            let s = i64::from(self.x_scale);
+            for o in &mut self.outputs {
+                if o.is_wayland() {
+                    o.x = (i64::from(o.lx) * s).clamp(0, i64::from(i16::MAX)) as i16;
+                    o.y = (i64::from(o.ly) * s).clamp(0, i64::from(i16::MAX)) as i16;
+                }
+            }
+            return;
+        }
         let xs: Vec<(i32, i32, i32)> = self
             .outputs
             .iter()
-            .map(|o| (o.lx, o.lw, i32::from(o.width)))
+            .map(|o| (o.lx, o.lw, i32::from(o.phys_width)))
             .collect();
         let ys: Vec<(i32, i32, i32)> = self
             .outputs
             .iter()
-            .map(|o| (o.ly, o.lh, i32::from(o.height)))
+            .map(|o| (o.ly, o.lh, i32::from(o.phys_height)))
             .collect();
         let px = pack_axis(&xs);
         let py = pack_axis(&ys);
@@ -709,18 +828,29 @@ impl Screen {
         height: u16,
         refresh_mhz: u32,
     ) -> bool {
+        // X size under HiDPI: logical x S; the native size drives the capture
+        let xw = if self.x_scale > 1 {
+            (i64::from(lw) * i64::from(self.x_scale)).clamp(1, i64::from(u16::MAX)) as u16
+        } else {
+            width
+        };
+        let xh = if self.x_scale > 1 {
+            (i64::from(lh) * i64::from(self.x_scale)).clamp(1, i64::from(u16::MAX)) as u16
+        } else {
+            height
+        };
         // Find or create the output and its native mode.
         let existing = self.outputs.iter().position(|o| o.wl_name == wl_name);
         match existing {
             Some(i) => {
                 let o = &self.outputs[i];
-                // a native mode stands for the compositor's size *and* refresh
+                // a mode stands for the compositor's size *and* refresh
                 // (a client-created mode the compositor was driven to keeps the
                 // client's own clock)
-                let want_clock = Mode::clock(width, height, refresh_mhz);
+                let want_clock = Mode::clock(xw, xh, refresh_mhz);
                 let fits = |m: &Mode| {
-                    m.info.width == width
-                        && m.info.height == height
+                    m.info.width == xw
+                        && m.info.height == xh
                         && (!m.ours || refresh_mhz == 0 || m.info.dot_clock == want_clock)
                 };
                 let same_mode = self
@@ -732,15 +862,17 @@ impl Screen {
                     && o.ly == ly
                     && o.lw == lw
                     && o.lh == lh
-                    && o.width == width
-                    && o.height == height
+                    && o.phys_width == width
+                    && o.phys_height == height
+                    && o.width == xw
+                    && o.height == xh
                     && same_mode;
                 if unchanged {
                     return false;
                 }
                 // keep the mode if it already has this size; else reuse one of
                 // the output's listed modes with it (a client-created mode the
-                // compositor was just driven to); else allocate a native one
+                // compositor was just driven to); else allocate one
                 let listed = self.outputs[i]
                     .mode_ids
                     .iter()
@@ -757,24 +889,33 @@ impl Screen {
                 } else if let Some(id) = listed {
                     id
                 } else {
-                    self.alloc_mode(width, height, refresh_mhz)
+                    self.alloc_mode(xw, xh, refresh_mhz)
                 };
                 let o = &mut self.outputs[i];
                 o.lx = lx;
                 o.ly = ly;
                 o.lw = lw;
                 o.lh = lh;
-                o.width = width;
-                o.height = height;
+                o.phys_width = width;
+                o.phys_height = height;
+                o.width = xw;
+                o.height = xh;
+                // logical size at 96 dpi: the reported DPI is 96*S, which is
+                // how X clients learn S (design section 4); without HiDPI the
+                // X size is the native one
+                let (mw, mh) = if self.x_scale > 1 {
+                    (lw, lh)
+                } else {
+                    (i32::from(xw), i32::from(xh))
+                };
+                o.mm_width = mm(mw.clamp(1, i32::from(u16::MAX)) as u16);
+                o.mm_height = mm(mh.clamp(1, i32::from(u16::MAX)) as u16);
                 o.mode = mode;
                 if !o.mode_ids.contains(&mode) {
                     o.mode_ids.push(mode);
                 }
                 // Any native mode of another size is ours to retire: a native
                 // mode only ever stands for what the compositor is driving now.
-                // (Looked up by size rather than by the previous CRTC mode, which
-                // is 0 when a client disabled the CRTC before changing it, as
-                // RealVNC does.)
                 let stale: Vec<u32> = self
                     .modes
                     .iter()
@@ -789,7 +930,7 @@ impl Screen {
                 }
             }
             None => {
-                let mode = self.alloc_mode(width, height, refresh_mhz);
+                let mode = self.alloc_mode(xw, xh, refresh_mhz);
                 let (output_id, crtc_id) = (self.alloc_id(), self.alloc_id());
                 let name = if name.is_empty() {
                     format!("output-{wl_name}").into_bytes()
@@ -800,18 +941,38 @@ impl Screen {
                     output_id,
                     crtc_id,
                     name,
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
+                    x: if self.x_scale > 1 {
+                        (i64::from(lx) * i64::from(self.x_scale)).clamp(0, i64::from(i16::MAX))
+                            as i16
+                    } else {
+                        0
+                    },
+                    y: if self.x_scale > 1 {
+                        (i64::from(ly) * i64::from(self.x_scale)).clamp(0, i64::from(i16::MAX))
+                            as i16
+                    } else {
+                        0
+                    },
+                    width: xw,
+                    height: xh,
+                    phys_width: width,
+                    phys_height: height,
                     lx,
                     ly,
                     lw,
                     lh,
                     mode,
                     mode_ids: vec![mode],
-                    mm_width: mm(width),
-                    mm_height: mm(height),
+                    mm_width: mm(if self.x_scale > 1 {
+                        lw.clamp(1, i32::from(u16::MAX)) as u16
+                    } else {
+                        xw
+                    }),
+                    mm_height: mm(if self.x_scale > 1 {
+                        lh.clamp(1, i32::from(u16::MAX)) as u16
+                    } else {
+                        xh
+                    }),
                     wl_name,
                     connected: true,
                     listed: None,
@@ -974,6 +1135,55 @@ mod tests {
             .filter(|m| m.ours)
             .map(|m| (m.info.width, m.info.height))
             .collect()
+    }
+
+    #[test]
+    fn hidpi_lays_the_x_screen_out_as_logical_times_s() {
+        // 2x: the X output is twice the logical rectangle, native size = X size
+        let mut s = Screen::new(640, 480);
+        assert!(s.sync_wayland_output(7, b"DP-1", 0, 0, 1280, 800, 2560, 1600, 60_000));
+        assert!(s.set_x_scale(2));
+        assert_eq!((s.width, s.height), (2560, 1600));
+        {
+            let o = the_output(&s);
+            assert_eq!(
+                (o.width, o.height, o.phys_width, o.phys_height),
+                (2560, 1600, 2560, 1600)
+            );
+            assert_eq!((o.x, o.y), (0, 0));
+            // 1280 logical px at 96 dpi: the reported DPI is 192
+            assert_eq!(o.mm_width, super::mm(1280));
+        }
+        // 1.25x runs at S = 2 (integer Xwayland model): the buffer is 2x,
+        // the viewport destination is the 1.25x logical size
+        let mut s = Screen::new(640, 480);
+        assert!(s.sync_wayland_output(7, b"DP-1", 0, 0, 1536, 864, 1920, 1080, 60_000));
+        assert!(s.set_x_scale(2));
+        assert_eq!((s.width, s.height), (3072, 1728));
+        assert_eq!((the_output(&s).width, the_output(&s).height), (3072, 1728));
+        // back to 1x: the native layout comes back
+        assert!(s.set_x_scale(1));
+        assert_eq!((s.width, s.height), (1920, 1080));
+        assert_eq!((the_output(&s).width, the_output(&s).height), (1920, 1080));
+    }
+
+    #[test]
+    fn hidpi_mixed_1x_2x_uses_one_s_for_the_whole_screen() {
+        let mut s = Screen::new(640, 480);
+        assert!(s.sync_wayland_output(7, b"DP-1", 0, 0, 1280, 800, 1280, 800, 60_000));
+        assert!(s.sync_wayland_output(9, b"DP-2", 1280, 0, 1280, 800, 2560, 1600, 60_000));
+        assert!(s.set_x_scale(2));
+        // 1x monitor: 1280 logical -> 2560 X; 2x monitor: 1280 -> 2560 at x=2560
+        assert_eq!((s.width, s.height), (5120, 1600));
+        let a = s.output_by_wl_name(7).unwrap();
+        let b = s.output_by_wl_name(9).unwrap();
+        assert_eq!((a.x, a.width), (0, 2560));
+        assert_eq!((b.x, b.width), (2560, 2560));
+        let mons = s.monitors();
+        assert_eq!(
+            mons.iter().map(|m| (m.x, m.width)).collect::<Vec<_>>(),
+            vec![(0, 2560), (2560, 2560)]
+        );
     }
 
     #[test]

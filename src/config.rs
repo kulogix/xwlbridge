@@ -39,6 +39,8 @@ define_config! {
         tray: bool = noflag,
         /// with -showwindows: show the whole X screen as one window (its X windows composited in stacking order over a plain background, like a rootful X server), instead of one window per X window
         showscreen: bool = flag,
+        /// with -showwindows: HiDPI/mixed-DPI scaling on (the default): the X screen is the desktop's logical layout times S (the largest monitor scale, rounded up), apps learn S through RandR/Xft.dpi/XSETTINGS, and each shown surface is scaled to its logical size; -nohidpi keeps the old behaviour (X pixels = logical pixels, scaled layouts turn the sync off)
+        hidpi: bool = noflag,
         /// let clients change the resolution (RealVNC also needs the dynres hook); on GNOME, one of the monitor's own modes, temporarily: the layout it replaced comes back once the viewers have gone and at exit
         dynres: bool = flag,
         /// with -dynres on GNOME, keep the resolution X clients set when the viewers leave and at exit, instead of restoring the layout it replaced
@@ -105,6 +107,19 @@ impl Config {
     pub fn tray(&self) -> bool {
         let _ = self;
         cfg!(all(feature = "gnome", feature = "xvfb")) && self.tray
+    }
+
+    /// Whether HiDPI scaling is on: `-nohidpi` (config `hidpi=off`) or
+    /// `XWLBRIDGE_HIDPI=off` turns it off. Only `-showwindows` uses it.
+    pub fn hidpi(&self) -> bool {
+        self.hidpi
+            && std::env::var("XWLBRIDGE_HIDPI")
+                .map_or(true, |v| !v.trim().eq_ignore_ascii_case("off"))
+            // without the window sync there are no shown windows to scale:
+            // keep 0.1.2's X screen (the extension=off fallback)
+            && std::env::var("XWLBRIDGE_WINDOWS_EXTENSION").map_or(true, |v| {
+                !v.trim().eq_ignore_ascii_case("off")
+            })
     }
 }
 

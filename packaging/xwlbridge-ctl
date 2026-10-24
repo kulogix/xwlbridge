@@ -49,11 +49,11 @@ die() { local rc=$1; shift; say "$*"; exit "$rc"; }
 
 # ---------------------------------------------------------------- configuration
 
-CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension tray)
+CONFIG_KEYS=(engine capture uidisplay server rfb_port server_log server_args log bridge_args xvnc xvfb backend bridge display extension tray hidpi)
 declare -A CFG=(
   [engine]=auto [capture]=area [uidisplay]=auto [server]=vncserver-x11 [rfb_port]=5900
   [server_log]=30 [server_args]="" [log]=normal [bridge_args]="" [xvnc]=auto [xvfb]=auto
-  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto [tray]=on
+  [backend]=gnome [bridge]=auto [display]=auto [extension]=auto [tray]=on [hidpi]=on
 )
 # the GNOME Shell extension for -showwindows' window integration (install.sh installs it; setting `extension`)
 WINDOWS_EXT=xwlbridge-windows@xwlbridge
@@ -110,6 +110,7 @@ cfg_validate() {
   case ${CFG[log]} in quiet|normal|verbose) ;; *) CFG_ERRORS+=("log: '${CFG[log]}' is not quiet, normal or verbose");; esac
   case ${CFG[extension]} in auto|off) ;; *) CFG_ERRORS+=("extension: '${CFG[extension]}' is not auto or off");; esac
   case ${CFG[tray]} in on|off) ;; *) CFG_ERRORS+=("tray: '${CFG[tray]}' is not on or off");; esac
+  case ${CFG[hidpi]} in on|off) ;; *) CFG_ERRORS+=("hidpi: '${CFG[hidpi]}' is not on or off");; esac
   if [ -n "${CFG[rfb_port]}" ] && [ "${CFG[rfb_port]}" != realvnc ]; then
     if [[ ! ${CFG[rfb_port]} =~ ^[0-9]{1,5}$ ]] || (( 10#${CFG[rfb_port]} < 1 || 10#${CFG[rfb_port]} > 65535 )); then
       CFG_ERRORS+=("rfb_port: '${CFG[rfb_port]}' is not a TCP port (1-65535), realvnc or empty")
@@ -313,6 +314,8 @@ build_command() {
   [ "${CFG[extension]}" = off ] && CMD_ENV+=(XWLBRIDGE_WINDOWS_EXTENSION=off)
   # tray=off: no X tray icons in the top bar (the bridge runs with -notray, as 0.2.0 behaved)
   local tray_args=(); [ "${CFG[tray]}" = on ] || tray_args=(-notray)
+  # hidpi=off: X pixels are logical pixels again (0.2.0), as -nohidpi
+  local hidpi_args=(); [ "${CFG[hidpi]}" = on ] || hidpi_args=(-nohidpi)
   local w
   if [ "$MODE" = display ]; then
     # the bridge's X display alone, for X11 tools (xwlbridge.service): no VNC server, no RealVNC UI
@@ -323,6 +326,7 @@ build_command() {
     [ "${CFG[capture]}" = monitor ] && CMD+=(-recordmonitor)
     [[ -v BRIDGE_OVERRIDES[display] || ${CFG[display]} = auto ]] || CMD+=(-display "$((10#${CFG[display]#:}))")
     CMD+=("${tray_args[@]}")
+    CMD+=("${hidpi_args[@]}")
     CMD+=("${BRIDGE_ARGS[@]}")
     CMD+=(-nowrap)
     return 0
@@ -367,6 +371,7 @@ build_command() {
   [[ -v BRIDGE_OVERRIDES[uidisplay] ]] || CMD+=(-uidisplay "$ui")
 
   CMD+=("${tray_args[@]}")
+  CMD+=("${hidpi_args[@]}")
   CMD+=("${BRIDGE_ARGS[@]}")
 
   # Under NoNewPrivileges (the service's hardening) RealVNC's set-uid launcher
@@ -538,7 +543,7 @@ ensure_config_file() {
 
 default_of() {
   case $1 in
-    engine|xvnc|xvfb|uidisplay|bridge|display|extension) echo auto;; capture) echo area;; server) echo vncserver-x11;;
+    engine|xvnc|xvfb|uidisplay|bridge|display|extension) echo auto;; capture) echo area;; server) echo vncserver-x11;; hidpi|tray) echo on;;
     rfb_port) echo 5900;; server_log) echo 30;; log) echo normal;; backend) echo gnome;; *) echo "";;
   esac
 }

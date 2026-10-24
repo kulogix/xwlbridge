@@ -1875,7 +1875,30 @@ impl Backend {
             .collect();
         let mut changed = false;
         {
+            // HiDPI (design section 4), with -showwindows: X space is the
+            // desktop's logical layout times S, the largest monitor scale
+            // rounded up. `-nohidpi` / `hidpi=off` keeps the native layout.
+            let scale = if self.server.config.showwindows
+                && !self.server.config.showscreen
+                && self.server.config.hidpi()
+            {
+                self.monitors
+                    .iter()
+                    .map(|m| m.scale.max(1.0).ceil() as u32)
+                    .max()
+                    .unwrap_or(1)
+            } else {
+                1
+            };
             let mut screen = self.server.screen.lock().unwrap();
+            if screen.set_x_scale(scale) {
+                crate::log!(
+                    "gnome: HiDPI: X space = logical x {scale}; X screen {}x{}",
+                    screen.width,
+                    screen.height
+                );
+                changed = true;
+            }
             for m in &self.monitors {
                 let key = self.keys[&m.connector];
                 changed |= screen.sync_wayland_output(
