@@ -247,6 +247,29 @@ fn letterbox(src: (i32, i32), dst: (i32, i32)) -> (i32, i32) {
     }
 }
 
+/// Where a logical (viewport-destination) point on an emulated-mode parent
+/// surface is in the game's X pixels: the letterbox offset and size are X
+/// pixels (divided by S once), so the result is the game's pixel / S plus
+/// the monitor's logical origin (the game window sits at the monitor's X
+/// origin, and `root_position` puts it back into X).
+fn present_game_point(
+    surface: (f64, f64),
+    origin: (i32, i32),
+    game: (i32, i32),
+    dest: (i32, i32),
+    offset: (i32, i32),
+    scale: f64,
+) -> (f64, f64) {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let gx = (surface.0 - f64::from(offset.0) / s) * f64::from(game.0) / f64::from(dest.0.max(1));
+    let gy = (surface.1 - f64::from(offset.1) / s) * f64::from(game.1) / f64::from(dest.1.max(1));
+    (f64::from(origin.0) / s + gx, f64::from(origin.1) / s + gy)
+}
+
 fn fit(p: i16, len: u16, max: i32) -> i16 {
     if len as i32 >= max {
         0
@@ -359,6 +382,29 @@ fn surface_x(frame: decor::FrameGeom, content: (u16, u16), scale: u32) -> (u16, 
 fn logical_x(w: i32, h: i32, scale: u32) -> (i32, i32) {
     let s = scale.max(1) as i32;
     (((w + s / 2) / s).max(1), ((h + s / 2) / s).max(1))
+}
+
+/// The logical content size of an X-pixel content size: what `FrameGeom`
+/// (logical) and pointer positions are measured in.  The header hit-test,
+/// hover and edge cursor must use this, never the X content size, or at S = 2
+/// every logical point is compared with a surface twice as wide as it is.
+fn content_logical(w: i32, h: i32, scale: u32) -> (u16, u16) {
+    let (w, h) = logical_x(w, h, scale);
+    (
+        u16::try_from(w.max(1)).unwrap_or(u16::MAX),
+        u16::try_from(h.max(1)).unwrap_or(u16::MAX),
+    )
+}
+
+/// The X content rectangle of an X-pixel surface configure: `w`/`h` are the
+/// toplevel's configure size after `Space::configure_size`, i.e. the surface
+/// box (content + the frame) in X pixels.  The frame's header and margin are
+/// logical, so they are converted to X once here (subtracting the logical
+/// values would leave the client the frame's size again: 624x504 for a
+/// 300x200 request at S = 2).
+fn configure_content(frame: decor::FrameGeom, w: i32, h: i32, scale: u32) -> (i32, i32) {
+    let (_, _, cw, ch) = frame_x(frame, scale).content_rect(0, 0, w, h);
+    (cw, ch)
 }
 
 /// An anchor rectangle inside a parent of `pw`x`ph` for a popup at `(dx, dy)`
@@ -1015,7 +1061,14 @@ enum Role {
 /// letterbox).
 struct Present {
     monitor: (i32, i32),
-    /// Where the game buffer is drawn in the parent (letterbox).
+    /// The monitor's origin on the X screen: the game window sits there, so
+    /// pointer mapping must add it back before XTest (logical = X / S).
+    origin: (i32, i32),
+    /// The game's own pixels (its RandR mode) in X pixels.  This is the
+    /// source aspect the letterbox keeps and the size input maps into; the
+    /// fullscreen toplevel may be the monitor's size, which is not the game.
+    game: (i32, i32),
+    /// Where the game buffer is drawn in the parent (letterbox), X pixels.
     dest: (i32, i32),
     offset: (i32, i32),
     painted: bool,
@@ -1610,6 +1663,10 @@ struct State {
     /// When the last header move/resize press went to mutter, and when a
     /// title change was seen (the latency log, `-verbose`).
     header_press_at: Option<Instant>,
+    /// An emulated-mode presentation is re-entering fullscreen: the
+    /// compositor's `fullscreen false` configure from the deliberate unset is
+    /// not the client leaving its mode (window, when).
+    present_entering: Option<(Window, Instant)>,
     title_changed_at: Option<Instant>,
     /// The shown window the first of the held buttons went down on: X is
     /// authoritative for its geometry until the last comes up.
@@ -1850,6 +1907,7 @@ fn run(
         cursor_shape: None,
         edge_cursor: None,
         header_press_at: None,
+        present_entering: None,
         title_changed_at: None,
         held_on: None,
         drag_rel: None,
@@ -2577,7 +2635,9 @@ impl State {
         let frame = s.frame;
         let decision = s.decision;
         let maximized = s.maximized;
-        let content = (s.width, s.height);
+        // the header hit-test and its button layout are logical; the X
+        // content size is X pixels (S times too large at 2x)
+        let content = content_logical(i32::from(s.width), i32::from(s.height), self.scale());
         let (ox, oy) = frame.content_origin();
         let sp = (p.0 + f64::from(ox), p.1 + f64::from(oy));
         let surface_w = f64::from(frame.surface_size(content).0);
@@ -2726,6 +2786,7 @@ impl State {
         let m = self.decor_metrics();
         let on = self.pointer_on;
         let p = self.pointer_s.unwrap_or((0.0, 0.0));
+        let scale = self.scale();
         for (w, s) in self.windows.iter_mut() {
             let Some(c) = s.chrome.as_mut() else {
                 continue;
@@ -2733,10 +2794,11 @@ impl State {
             let hover = if Some(*w) == on && s.frame.is_framed() {
                 let (ox, oy) = s.frame.content_origin();
                 let sp = (p.0 + f64::from(ox), p.1 + f64::from(oy));
+                let content = content_logical(i32::from(s.width), i32::from(s.height), scale);
                 if sp.1 < f64::from(s.frame.header) {
                     decor::hit_button(
                         &m,
-                        f64::from(s.frame.surface_size((s.width, s.height)).0),
+                        f64::from(s.frame.surface_size(content).0),
                         &c.state.layout,
                         sp,
                     )
@@ -2775,10 +2837,11 @@ impl State {
         }
         let p = self.pointer_s?;
         let (ox, oy) = s.frame.content_origin();
-        match s.frame.hit(
-            (p.0 + f64::from(ox), p.1 + f64::from(oy)),
-            (s.width, s.height),
-        ) {
+        let content = content_logical(i32::from(s.width), i32::from(s.height), self.scale());
+        match s
+            .frame
+            .hit((p.0 + f64::from(ox), p.1 + f64::from(oy)), content)
+        {
             decor::Hit::Edge(e) => Some(e),
             _ => None,
         }
@@ -3991,13 +4054,21 @@ impl State {
                 let restoring = (s.maximized || s.fullscreen)
                     && (width < self.screen.0 as i32 || height < self.screen.1 as i32);
                 let use_frame = if !max && !full {
-                    if restoring { chrome_frame } else { s.frame }
+                    // a restore configure arrives while `s.frame` is still
+                    // NONE (the maximised state was cleared just before):
+                    // the chrome's frame is the one to subtract
+                    if restoring || !s.frame.is_framed() {
+                        chrome_frame
+                    } else {
+                        s.frame
+                    }
                 } else {
                     decor::FrameGeom::NONE
                 };
+                // `width`/`height` are the surface box in X pixels; the
+                // frame is logical, so subtract its X size (once)
                 let (gw, gh) = if use_frame.is_framed() {
-                    let (_, _, cw, ch) = use_frame.content_rect(0, 0, width, height);
-                    (cw, ch)
+                    configure_content(use_frame, width, height, self.scale())
                 } else {
                     (width, height)
                 };
@@ -4032,6 +4103,16 @@ impl State {
             }
         }
         for (w, maximized, fullscreen, tiled) in std::mem::take(&mut self.states) {
+            // The deliberate unset before a presentation re-enters fullscreen
+            // produces a `fullscreen false` configure; it is not the client
+            // leaving its mode (the emulated-mode property is still there).
+            if !fullscreen
+                && self
+                    .present_entering
+                    .is_some_and(|(pw, at)| pw == w && at.elapsed() < Duration::from_millis(250))
+            {
+                continue;
+            }
             // While maximised/fullscreen the header is detached and the
             // surface must be the content itself: the X client fills the work
             // area, so its surface origin is the work-area origin.  Keeping
@@ -4360,7 +4441,9 @@ impl State {
         let mut commit_parent = false;
         if let Some(p) = s.present.as_mut() {
             let (sw, sh) = (i32::from(b.width), i32::from(b.height));
-            let (dw0, dh0) = letterbox((sw, sh), p.monitor);
+            // the letterbox keeps the game mode's aspect, not the fullscreen
+            // toplevel's (which may be the monitor at 2x)
+            let (dw0, dh0) = letterbox(p.game, p.monitor);
             p.dest = (dw0, dh0);
             p.offset = ((p.monitor.0 - dw0) / 2, (p.monitor.1 - dh0) / 2);
             if let Some(v) = s.viewport.as_ref() {
@@ -4659,7 +4742,7 @@ impl State {
     /// fallback, into a monitor-sized CPU-composed buffer with the aspect kept
     /// (nearest-neighbour; the bars are black).
     fn refresh_presentation(&mut self, w: Window, qh: &QueueHandle<State>) {
-        let Some((mx, my, mw, mh, _mode_w, _mode_h)) = self.emulated_mode_of(w) else {
+        let Some((mx, my, mw, mh, mode_w, mode_h)) = self.emulated_mode_of(w) else {
             if self.windows.get(&w).is_some_and(|s| s.present.is_some()) {
                 crate::vlog!("-showwindows: {w:#x} left its emulated mode");
             }
@@ -4678,20 +4761,36 @@ impl State {
         let scale = i32::try_from(self.scale()).unwrap_or(1).max(1);
         let (lw, lh) = logical_x(mw, mh, scale as u32);
         let monitor = (mw, mh);
-        let (sw, sh) = self
-            .windows
-            .get(&w)
-            .map_or((mw, mh), |s| (i32::from(s.width), i32::from(s.height)));
+        // The game's pixels are its mode (X pixels); at 2x the fullscreen
+        // configure may have made the X window the monitor's size, which
+        // would present the game at 1:1 instead of letterboxing its aspect.
+        let game = (mode_w.max(1), mode_h.max(1));
+        let (dw, dh) = letterbox(game, monitor);
+        let offset = ((mw - dw) / 2, (mh - dh) / 2);
         if let Some(p) = self
             .windows
             .get_mut(&w)
             .and_then(|s| s.present.as_mut())
-            .filter(|p| p.monitor == monitor)
+            .filter(|p| p.monitor == monitor && p.game == game)
         {
-            let (dw, dh) = letterbox((sw, sh), monitor);
             p.dest = (dw, dh);
-            p.offset = ((mw - dw) / 2, (mh - dh) / 2);
+            p.offset = offset;
             return;
+        }
+        // the emulated mode's X window is its own mode size on its monitor,
+        // not the fullscreen monitor: the game draws in mode pixels and the
+        // presentation scales them
+        if let Some(s) = self.windows.get(&w)
+            && (i32::from(s.width), i32::from(s.height)) != game
+        {
+            let _ = self.x.configure_window(
+                w,
+                &ConfigureWindowAux::new()
+                    .x(mx)
+                    .y(my)
+                    .width(game.0 as u32)
+                    .height(game.1 as u32),
+            );
         }
         self.drop_present(w);
         let (gpu, sync) = self.present_kind().unwrap_or((false, false));
@@ -4699,12 +4798,11 @@ impl State {
             crate::warning!("-showwindows: can't allocate the letterbox buffer");
             return;
         };
-        let (sw, sh) = self
-            .windows
-            .get(&w)
-            .map_or((mw, mh), |s| (i32::from(s.width), i32::from(s.height)));
-        let (dw, dh) = letterbox((sw, sh), monitor);
-        let offset = ((mw - dw) / 2, (mh - dh) / 2);
+        // set before the window borrow below; only used when a toplevel is
+        // actually re-entered
+        if !gpu && self.synced() {
+            self.present_entering = Some((w, Instant::now()));
+        }
         let Some(s) = self.windows.get(&w) else {
             for b in &buffers {
                 b.destroy();
@@ -4724,6 +4822,9 @@ impl State {
         // monitor-sized parent, then enter it again on this output. Headless
         // mutter (the container tier) has no extension and composites the
         // plain fullscreen surface correctly: keep round 1's path there.
+        // The unset's `fullscreen false` configure is ignored by the states
+        // handler below, or on re-entry it ended the emulation right after it
+        // began.
         let window_synced = self.synced();
         if let Some(t) = &toplevel
             && !gpu
@@ -4753,7 +4854,7 @@ impl State {
                 .map(|v| v.get_viewport(&child, qh, ()));
             if let Some(v) = &viewport {
                 let (ldw, ldh) = logical_x(dw, dh, scale as u32);
-                v.set_source(0.0, 0.0, f64::from(sw), f64::from(sh));
+                v.set_source(0.0, 0.0, f64::from(game.0), f64::from(game.1));
                 v.set_destination(ldw, ldh);
             }
             // the parent is the monitor: one black frame, then the child
@@ -4800,7 +4901,9 @@ impl State {
             crate::log!("-showwindows: {w:#x} fullscreen on the output at {mx},{my}");
         }
         crate::log!(
-            "-showwindows: {w:#x} shown on its emulated mode: game {sw}x{sh} in {mw}x{mh} at {dw}x{dh}+{}+{} ({})",
+            "-showwindows: {w:#x} shown on its emulated mode: game {}x{} in {mw}x{mh} at {dw}x{dh}+{}+{} ({})",
+            game.0,
+            game.1,
             offset.0,
             offset.1,
             if gpu {
@@ -4824,6 +4927,8 @@ impl State {
             }
             s.present = Some(Present {
                 monitor,
+                origin: (mx, my),
+                game,
                 dest: (dw, dh),
                 offset,
                 painted: false,
@@ -4927,11 +5032,18 @@ impl State {
         // game's content position in logical pixels (root_position scales it
         // back to X).
         if let Some(p) = s.present.as_ref().filter(|p| p.dest.0 > 0 && p.dest.1 > 0) {
-            // the presentation is the whole monitor: the game's window origin
-            // (where the desktop may have put it) is not part of this mapping
-            return Some((
-                (sx - f64::from(p.offset.0) / scale) * f64::from(s.width) / f64::from(p.dest.0),
-                (sy - f64::from(p.offset.1) / scale) * f64::from(s.height) / f64::from(p.dest.1),
+            // The presentation is the whole monitor: the game's own mode
+            // pixels (X) letterboxed into it.  Surface-local `sx` is logical
+            // (the viewport destination), so the letterbox offset is X / S;
+            // the result is the game pixel / S, a desktop-local position,
+            // plus the monitor's logical origin (the game window sits there).
+            return Some(present_game_point(
+                (sx, sy),
+                p.origin,
+                p.game,
+                p.dest,
+                p.offset,
+                scale,
             ));
         }
         // with a viewport the buffer is in X pixels and its destination in
@@ -5096,8 +5208,11 @@ impl State {
             && self.track.pos().is_some()
             && let Some(s) = self.windows.get(&w)
         {
-            // so far the pointer mapped from where the desktop has it
-            let origin = (i32::from(s.x), i32::from(s.y));
+            // so far the pointer mapped from where the desktop has it.
+            // `Shown.x` is the X-space origin (unlock and to_desk use it that
+            // way); SelfDrag works in logical desktop positions, so convert
+            // it once here or at S = 2 every origin is twice the pointer's.
+            let origin = selfdrag::desktop_origin((s.x, s.y), f64::from(self.scale()));
             self.drags += 1;
             // wl_pointer's press, or a touch point's or tablet tool's (they
             // drive the pointer without it)
@@ -5392,16 +5507,19 @@ impl State {
             };
             let props = [d[1], d[2]];
             if props.contains(&a.net_wm_state_fullscreen) {
-                if want(s.fullscreen) {
+                let on = want(s.fullscreen);
+                if on {
                     t.set_fullscreen(None);
                 } else {
                     t.unset_fullscreen();
                 }
-                crate::log!(
-                    "-showwindows: {:#x} asks for fullscreen {}",
-                    e.window,
-                    want(s.fullscreen)
-                );
+                // A window manager adds _NET_WM_STATE_FULLSCREEN when it
+                // accepts the request, not only once the compositor has
+                // configured it: a client that changes its RandR mode right
+                // after asking (SDL) then has the fullscreen state the mode
+                // emulation looks for, with no race on re-entry.
+                self.set_net_wm_state(e.window, s.maximized, on);
+                crate::log!("-showwindows: {:#x} asks for fullscreen {}", e.window, on);
             }
             if props.contains(&a.net_wm_state_max_vert) || props.contains(&a.net_wm_state_max_horz)
             {
@@ -9236,5 +9354,109 @@ mod tests {
             p1_main(&[(0x20, false, false, 500), (0x10, false, false, 50)]),
             Some(0x20)
         );
+    }
+    #[test]
+    fn header_hit_testing_uses_logical_content_at_1x_and_2x() {
+        let m = decor::Metrics::adwaita(50, false);
+        let frame = decor::FrameGeom::ADWAITA;
+        // the 2x repro's xterm: 378x318 X content is 189x159 logical, so the
+        // frame is 201x211 logical, not 402x422.
+        for scale in [1u32, 2] {
+            let content = content_logical(189 * scale as i32, 159 * scale as i32, scale);
+            assert_eq!(content, (189, 159), "S = {scale}");
+            let surface_w = f64::from(frame.surface_size(content).0);
+            assert_eq!(surface_w, 201.0, "S = {scale}");
+            // every button's centre hits that button, and the title band
+            // outside the button group is the title
+            for layout in [
+                decor::Layout::parse(":minimize,maximize,close"),
+                decor::Layout::parse("minimize,maximize,close:"),
+            ] {
+                let rects = decor::button_rects(&m, surface_w, &layout);
+                assert_eq!(rects.len(), 3);
+                for &(b, x, y, w, h) in &rects {
+                    let p = (x + w / 2.0, y + h / 2.0);
+                    assert_eq!(decor::hit_button(&m, surface_w, &layout, p), Some(b));
+                    assert!(matches!(frame.hit(p, content), decor::Hit::Title));
+                }
+                // a point on the free side of the header: title, not a
+                // button
+                let p = if layout.left.is_empty() {
+                    (10.0, f64::from(frame.header) / 2.0)
+                } else {
+                    (surface_w - 10.0, f64::from(frame.header) / 2.0)
+                };
+                assert_eq!(decor::hit_button(&m, surface_w, &layout, p), None);
+                assert!(matches!(frame.hit(p, content), decor::Hit::Title));
+            }
+        }
+        // the old bug: the X content size (378) was used as the logical
+        // surface width, putting the right-hand close button at 178 (not 372)
+        let title = (178.5, 23.0);
+        let right = decor::Layout::parse(":minimize,maximize,close");
+        assert_eq!(
+            decor::hit_button(&m, 201.0, &right, title),
+            Some(decor::Button::Close)
+        );
+        assert_eq!(decor::hit_button(&m, 390.0, &right, title), None);
+    }
+
+    #[test]
+    fn frame_geometry_and_configure_sizes_convert_once_at_1x_and_2x() {
+        let frame = decor::FrameGeom::ADWAITA;
+        // a client 300x200 request: S = 1 -> 300x200 X, S = 2 -> 600x400 X
+        for (scale, content_x, surface_x_px, logical) in [
+            (1u32, (300u16, 200u16), (312u16, 252u16), (312, 252)),
+            (2, (600, 400), (624, 504), (312, 252)),
+        ] {
+            // the surface box the xdg window geometry / configure carries
+            assert_eq!(surface_x(frame, content_x, scale), surface_x_px);
+            assert_eq!(
+                logical_x(i32::from(surface_x_px.0), i32::from(surface_x_px.1), scale),
+                logical
+            );
+            // and the configure -> X content conversion subtracts the frame
+            // in X pixels (the logical frame would give 612x452 at 2x)
+            assert_eq!(
+                configure_content(
+                    frame,
+                    i32::from(surface_x_px.0),
+                    i32::from(surface_x_px.1),
+                    scale
+                ),
+                (i32::from(content_x.0), i32::from(content_x.1))
+            );
+        }
+        // unframed: no conversion
+        assert_eq!(
+            configure_content(decor::FrameGeom::NONE, 312, 252, 2),
+            (312, 252)
+        );
+    }
+
+    #[test]
+    fn the_emulated_mode_maps_logical_points_to_game_pixels_at_1x_and_2x() {
+        // 1024x768 game, 1920x1200 monitor, letterbox 1600x1200 in X pixels
+        let game = (1024, 768);
+        let monitor = (1920, 1200);
+        let dest = letterbox(game, monitor);
+        assert_eq!(dest, (1600, 1200));
+        let offset = ((monitor.0 - dest.0) / 2, (monitor.1 - dest.1) / 2);
+        assert_eq!(offset, (160, 0));
+        let at = |s: f64| {
+            let p = present_game_point((s, 156.25), (0, 0), game, dest, offset, 2.0);
+            selfdrag::root_position(p, (3840, 1200), 2.0)
+        };
+        // desktop logical 236.25 (physical 472.5) -> game pixel 200
+        assert_eq!(at(236.25), (200, 200));
+        // the letterbox edge and the far corner
+        assert_eq!(at(80.0), (0, 200));
+        assert_eq!(at(880.0), (1024, 200)); // game pixel 1024 (the far edge)
+        // 1x: the same point is logical 472.5 -> game pixel 200
+        let p = present_game_point((472.5, 312.5), (0, 0), game, dest, offset, 1.0);
+        assert_eq!(selfdrag::root_position(p, (3840, 1200), 1.0), (200, 200));
+        // a fullscreen game on the second monitor adds its X origin once
+        let p = present_game_point((236.25, 156.25), (1920, 0), game, dest, offset, 2.0);
+        assert_eq!(selfdrag::root_position(p, (3840, 1200), 2.0), (2120, 200));
     }
 }

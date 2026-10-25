@@ -474,7 +474,11 @@ impl Geometry {
     ) -> Option<Rect> {
         let space = self.space;
         let w = self.wins.get_mut(&xid)?;
-        if w.in_flight != Some(space.to_x(requested)) {
+        // Compare in logical desktop pixels: an odd X coordinate at S = 2
+        // rounds to the nearest logical one and back (405 -> 203 -> 406), so
+        // an exact X comparison rejects our own reply and leaves the request
+        // in flight forever (a self-drag then followed only its first step).
+        if w.in_flight.map(|r| space.to_desk(r)) != Some(requested) {
             return None; // not the request in flight (a reset dropped it)
         }
         w.in_flight = None;
@@ -559,7 +563,12 @@ impl Geometry {
             if w.in_flight.is_some() {
                 w.overridden = Some(rect);
             }
-            return (rect != w.x).then_some(rect);
+            // `rect` is the desktop's content rectangle in logical pixels
+            // while `w.x` is X pixels: compare and return in X space, once.
+            // (At S = 2 comparing them directly made every report during a
+            // header grab half the X window: 366 -> 183 -> 92 ...)
+            let rect_x = space.to_x(rect);
+            return (rect_x != w.x).then_some(rect_x);
         }
         if w.in_flight.is_some() {
             return None; // ours landing, or overtaken by it: the reply settles it
@@ -2546,6 +2555,45 @@ mod tests {
         assert!(g.in_flight(XID), "still waiting for its own");
         assert_eq!(g.applied(XID, m.rect, m.rect, None), None);
         assert!(!g.in_flight(XID));
+    }
+
+    #[test]
+    fn a_reply_matches_an_odd_x_position_through_the_rounding_at_2x() {
+        let mut g = Geometry::new();
+        g.set_scale(2);
+        g.track(XID, Rect::new(600, 400, 220, 160));
+        assert_eq!(g.resync(XID, Rect::new(300, 200, 110, 80), 0, 1), None);
+        let t = t0();
+        // the client moved its X window to an odd y: 405 -> logical 203
+        assert_eq!(
+            g.x_configured(XID, Rect::new(610, 405, 220, 160), 2, t),
+            None
+        );
+        let m = g.frame(XID).expect("the move is pending");
+        assert_eq!(m.rect, Rect::new(305, 203, 110, 80));
+        assert!(g.in_flight(XID));
+        // the desktop's reply carries the same logical content rectangle
+        assert_eq!(g.applied(XID, m.rect, m.rect, None), None);
+        assert!(!g.in_flight(XID), "the reply must settle the request");
+    }
+
+    #[test]
+    fn a_grab_at_2x_keeps_the_content_size_in_x_pixels() {
+        let mut g = Geometry::new();
+        g.set_scale(2);
+        g.track(XID, Rect::new(200, 100, 400, 300));
+        let t = t0();
+        // the desktop reports the same content in logical pixels (200x150),
+        // not a resize to half the X content
+        assert_eq!(
+            g.changed(XID, Rect::new(100, 50, 200, 150), st::USER, 11, t),
+            None
+        );
+        // a user move to logical 150,75: X content 300,150 in X pixels
+        assert_eq!(
+            g.changed(XID, Rect::new(150, 75, 200, 150), st::USER, 12, t),
+            Some(Rect::new(300, 150, 400, 300))
+        );
     }
 
     /// While the user has the window, a client that re-asserts its

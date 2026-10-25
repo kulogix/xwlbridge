@@ -810,6 +810,18 @@ fn log_sum(terms: &[f64]) -> f64 {
 
 /// The X root position of desktop position `pos`, on the X screen: X pixels
 /// are logical x `scale` (S; 1 without HiDPI).
+pub fn desktop_origin(x: (i16, i16), scale: f64) -> (i32, i32) {
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (
+        (f64::from(x.0) / s).round() as i32,
+        (f64::from(x.1) / s).round() as i32,
+    )
+}
+
 pub fn root_position(pos: Pos, screen: (u16, u16), scale: f64) -> (i16, i16) {
     let clamp = |v: f64, size: u16| {
         let max = i32::from(size).max(1) - 1;
@@ -1257,6 +1269,55 @@ mod tests {
         assert_eq!(root_position((-0.5, 700.0), s, 1.0), (0, 700));
         assert_eq!(root_position((5000.0, 1e12), s, 1.0), (1279, 719));
         assert_eq!(root_position((f64::NAN, -1e12), s, 1.0), (0, 0));
+    }
+    #[test]
+    fn a_2x_window_origin_is_converted_to_logical_desktop_pixels_once() {
+        // Shown.x is X pixels (unlock and to_desk use it in X space) while
+        // SelfDrag's origins are desktop logical pixels: 600,400 X is 300,200
+        assert_eq!(desktop_origin((600, 400), 2.0), (300, 200));
+        assert_eq!(desktop_origin((301, 201), 1.0), (301, 201));
+        // and root_position puts a logical drag position back into X once
+        assert_eq!(root_position((300.0, 200.0), (3840, 1200), 2.0), (600, 400));
+        assert_eq!(desktop_origin((600, 400), 2.0), (300, 200));
+    }
+
+    #[test]
+    fn an_absolute_drag_at_2x_moves_240_by_140_x_pixels() {
+        let t = t0();
+        let mut d = SelfDrag::new((300, 200), Track::default(), Some((10.0, 10.0)));
+        let f = |s: (f64, f64), ms| Frame {
+            surface: Some(s),
+            rel: None,
+            time: Some(ms),
+        };
+        let p0 = d.frame(f((10.0, 10.0), 1000), t, Some(1000)).unwrap();
+        let p1 = d.frame(f((130.0, 80.0), 1030), t, Some(1030)).unwrap();
+        let r0 = root_position(p0, (3840, 1200), 2.0);
+        let r1 = root_position(p1, (3840, 1200), 2.0);
+        assert_eq!((r1.0 - r0.0, r1.1 - r0.1), (240, 140));
+        assert_eq!(p1, (430.0, 280.0));
+    }
+
+    #[test]
+    fn a_relative_drag_at_2x_moves_240_by_140_x_pixels() {
+        // relative motion updates the logical track; the X pointer follows
+        // that track, scaled once
+        let mut track = Track::default();
+        track.update((410.0, 280.0), Some(1000));
+        track.update((530.0, 350.0), Some(1030));
+        let p = track.pos().unwrap();
+        assert_eq!(p, (530.0, 350.0));
+        let r = root_position(p, (3840, 1200), 2.0);
+        assert_eq!(r, (1060, 700));
+        let start = root_position((410.0, 280.0), (3840, 1200), 2.0);
+        assert_eq!((r.0 - start.0, r.1 - start.1), (240, 140));
+        // relative frames stay in surface-local logical pixels too
+        let mut parts = Parts::default();
+        parts.motion((10.0, 10.0), 1000);
+        parts.relative((120.0, 70.0), 1030);
+        let f = parts.end().unwrap();
+        assert_eq!(f.surface, Some((10.0, 10.0)));
+        assert_eq!(f.rel, Some((120.0, 70.0)));
     }
 }
 
