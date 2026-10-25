@@ -2528,7 +2528,15 @@ impl State {
             s.xdg_surface
                 .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
             s.window_geometry = geom;
-            s.surface.commit();
+            // The geometry applies with the next buffer commit. Do not commit
+            // an empty surface here: it consumes the pending
+            // xdg_surface.ack_configure, mutter never matches the ack to its
+            // configure, and the configure stays pending. A maximise then
+            // saves its rectangle from that stale (position-less) configure,
+            // so the unmaximise goes to the work-area origin instead of the
+            // pre-maximise rectangle. `try_paint`'s buffer commit carries the
+            // ack instead (the same fix as rc_fix3 item 1; needed here for the
+            // restore row this task measures).
         }
         self.paint_shadow(w);
     }
@@ -4130,6 +4138,21 @@ impl State {
             } else {
                 chrome_frame
             };
+            // The sync keeps the desktop's rectangle in content coordinates.
+            // Detaching or re-attaching the header changes that conversion
+            // while the desktop surface stays the same: re-express the
+            // rectangle in the new frame, or the first `Changed` after a
+            // restore (still the maximised surface, now read as content)
+            // looks like a move and re-sends the maximised rectangle.
+            let old_frame = self
+                .windows
+                .get(&w)
+                .map_or(decor::FrameGeom::NONE, |s| s.frame);
+            let old_desk = self.sync.as_ref().and_then(|s| s.geo.desk(w));
+            let old_state = self
+                .windows
+                .get(&w)
+                .map(|s| (s.maximized, s.fullscreen, s.tiled));
             let changed = self.windows.get_mut(&w).is_some_and(|s| {
                 let c = (s.maximized, s.fullscreen, s.tiled) != (maximized, fullscreen, tiled);
                 (s.maximized, s.fullscreen) = (maximized, fullscreen);
@@ -4143,6 +4166,24 @@ impl State {
                 }
                 c
             });
+            if old_frame != want_frame
+                && let (Some(desk), Some(sync)) = (old_desk, self.sync.as_mut())
+            {
+                let (sx, sy, sw, sh) = old_frame.surface_rect(desk.x, desk.y, desk.w, desk.h);
+                let (cx, cy, cw, ch) = want_frame.content_rect(sx, sy, sw, sh);
+                sync.geo.reframe_desk(w, Rect::new(cx, cy, cw, ch));
+            }
+            // A maximise/restore (or fullscreen) transition: the compositor
+            // has just configured X to its new rectangle, so for a moment the
+            // desktop may still report the old state's surface. Do not follow
+            // that as a move (it re-sent the maximised rectangle over an
+            // unmaximise); settle until the desktop reports a new position.
+            if old_state != Some((maximized, fullscreen, tiled)) {
+                let expected = self.sync.as_ref().and_then(|s| s.geo.x_rect(w));
+                if let (Some(expected), Some(sync)) = (expected, self.sync.as_mut()) {
+                    sync.geo.settle(w, expected, Instant::now());
+                }
+            }
             if changed {
                 crate::log!(
                     "-showwindows: {w:#x} is {}{}",
