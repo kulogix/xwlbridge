@@ -69,8 +69,7 @@ displays (without this a CSD window was 50 px smaller in each direction than
 on Xwayland, and a GTK app that sizes itself from its content drew a smaller
 window).
 
-Toolkits that read these settings scale their UI. Measured at 2x (the full
-matrix is in `research/release/p5_hidpi.md`):
+Toolkits that read these settings scale their UI. Measured at 2x on GNOME 50:
 
 - GTK 3/4 and Qt 6 apply S: a 300x200 logical window becomes a 600x400 X
   window, and with the viewporter destination at 300x200 it is pixel-exact on

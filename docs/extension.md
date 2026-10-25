@@ -85,8 +85,9 @@ While it is not there, `-showwindows` behaves exactly as 0.1.2 did (and `_NET_SU
 0.1.2 carries out). The log says which: `window sync with the desktop: extension version 1, ...` or
 `no window sync with the desktop (...): windows keep the 0.1.2 behaviour`.
 
-Not yet supported: HiDPI scaling (a scaled desktop keeps the 0.1.2 behaviour), workspaces, sticky, minimise
-through the extension, keep-below (mutter has no call for it).
+HiDPI scaling is handled by the bridge itself (`Space`, [hidpi.md](hidpi.md)); the extension receives and returns
+logical coordinates. Not yet supported: workspaces, sticky, minimise through the extension, keep-below (mutter has
+no call for it).
 
 The bridge accepts the name `org.xwlbridge.Windows` only from gnome-shell's own connection (the owner of
 `org.gnome.Shell`): the name is free while the screen is locked, and another process could take it.

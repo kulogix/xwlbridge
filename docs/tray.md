@@ -30,7 +30,7 @@ tray, and it shows what the icons do in GNOME's top bar:
   GNOME directly, and with `-showwindows` they behave as for any GNOME application. When the application
   acts on its notification's default action and raises its X window, the window follows on the desktop like
   any other raise (it activates after recent input in that application, and asks for attention otherwise,
-  as [design_x_capability_gaps.md](../../research/release/design_x_capability_gaps.md) has it).
+  as GNOME does for its own windows).
 
 ## Clicks
 

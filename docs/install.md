@@ -16,7 +16,7 @@ For RealVNC Server (its UI on your desktop, the systemd user unit, ports, authen
 The build and the runtime packages below were checked in a clean container of each distribution listed: with 0.1.0
 on Ubuntu 26.04, Debian 13, Fedora 44 and AlmaLinux 10 (351 of 351 tests each), the others with an earlier version of
 the code. 0.1.0 was checked on fresh Ubuntu 26.04.1 (the bundle) and AlmaLinux 10.2 (a source build) virtual machines;
-0.1.1, 0.1.2 and 0.2.0 change no build dependency; 0.2.0 adds the bundled GNOME Shell extension (GNOME 49 or newer; see [extension.md](extension.md)), which install.sh installs and enables.
+0.1.1, 0.1.2 and 0.2.0 change no build dependency; 0.2.0 adds the bundled GNOME Shell extension (GNOME 49 or newer; see [extension.md](extension.md)), which install.sh installs and enables. 0.3.0 adds no build dependency either: the decorations paint with cairo and pango through `dlopen` at runtime; HiDPI and the tray do not need a new package.
 
 ## Install the release bundle (recommended)
 

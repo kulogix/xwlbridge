@@ -228,7 +228,16 @@ TeamViewer 15.82 and newer works on GNOME 50 by itself. TeamViewer 15.20.6 (2021
 
 ### Keeping an X app entirely on the bridge
 
-`-showwindows` (stock engines, experimental) shows X windows mapped on the engine display as native desktop windows. Each X window gets a GNOME-style header (title, close/minimise/maximise buttons in your `button-layout`, double-click to maximise) and invisible resize edges; a click on the header is handed to GNOME's move/resize at the press, so there is no bridge-side drag loop. The header follows GNOME's live settings (button layout, titlebar actions and font, colour scheme, accent) through the settings portal, with dconf as the fallback. Windows that draw their own title bar (`_GTK_FRAME_EXTENTS`, `_MOTIF_WM_HINTS` decorations 0) keep it: one title bar, never two. `-nodecorations`, or `decorations=off` in the service settings, restores the 0.2.0 look. See [docs/no-split.md](docs/no-split.md).
+`-showwindows` (stock engines, experimental) shows X windows mapped on the engine display as native desktop windows.
+
+- **Decorations.** Each X window gets a GNOME-style header (title, close/minimise/maximise buttons in your `button-layout`, double-click to maximise) and invisible resize edges; a click on the header is handed to GNOME's move/resize at the press, so there is no bridge-side drag loop. The header follows GNOME's live settings (button layout, titlebar actions and font, colour scheme, accent) through the settings portal, with dconf as the fallback. Windows that draw their own title bar (`_GTK_FRAME_EXTENTS`, `_MOTIF_WM_HINTS` decorations 0) keep it: one title bar, never two. `-nodecorations`, or `decorations=off` in the service settings, restores the 0.2.0 look.
+- **Window types and transients.** A client's panels, toolbars, menus and dialogs belong to its main window, so they stay above it; a focused transient that goes away gives the keyboard back to its parent; a window a client moves off the X screen is put back on it; and a GTK 4 client-side-decorated window resizes from its shadow margin as it does on Xwayland.
+- **System tray and notifications.** XEmbed icons (Java, Wine, GTK, Qt, ...) appear on GNOME's top bar as StatusNotifierItems with the application's own menu (*Open*, *Menu*, *Middle click*) and its balloon messages become GNOME notifications. This needs GNOME's AppIndicator extension ([docs/tray.md](docs/tray.md)); `-notray`, or `tray=off`, leaves the tray alone as 0.2.0 did.
+- **HiDPI and mixed DPI.** Xwayland's native-scaling model: the X screen is the desktop's logical layout times S (the largest monitor scale, rounded up), surfaces are committed at S times their logical size, input is converted back, and the engine display mirrors GNOME's full 53-key XSETTINGS table and `RESOURCE_MANAGER` live. GTK 3/4, Qt 6 and Xft apps then get the same physical size as on GNOME's Xwayland at 1x and 2x. `-nohidpi`, `hidpi=off` or `XWLBRIDGE_HIDPI=off` restores the 0.2.0 behaviour.
+- **Games.** On Xvnc, one RandR output per monitor; a game's mode change on its own output is kept and the game is shown letterboxed on that monitor with clicks mapped through the letterbox. The mode is restored on unfullscreen, minimise, focus loss, exit or monitor change. The CPU composition is the default; `XWLBRIDGE_GAME_PRESENT=gpu` selects the opt-in GPU presentation path.
+- **Window sync.** With the GNOME Shell extension (`extension=off` opts out), an X window and its desktop window keep one position: a window that moves or resizes itself moves on the desktop too, X windows open where the app asks, and GNOME's moves, maximising, stacking and focus reach the X app. Without it, `-showwindows` works as in 0.2.0.
+
+`-windowbuttons LAYOUT` overrides the decoration button layout, and `-nodecorations`, `-notray`, `-nohidpi` and `extension=off` each turn one feature off. See [docs/no-split.md](docs/no-split.md), [docs/tray.md](docs/tray.md), [docs/hidpi.md](docs/hidpi.md) and [docs/extension.md](docs/extension.md).
 
 ### Accessibility
 
@@ -267,7 +276,7 @@ Report vulnerabilities privately through GitHub's private vulnerability reportin
 - Characters outside the current keyboard layout are not typed.
 - Stock engines: X bells are lost (the builtin engine rings the desktop bell).
 - GNOME's windows are not X windows: wmctrl and `xdotool search` find nothing.
-- Stock engines have one RandR output for the whole desktop.
+- Xvnc gets one RandR output per monitor; Xvfb has a fixed screen and one output for the whole desktop.
 - Runs inside a logged-in GNOME session only, not at the login screen. While the screen is locked, viewers see a padlock.
 - A restart of the bridge ends every X client on its display.
 - `-showwindows` and `-showscreen` are experimental.
