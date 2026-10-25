@@ -180,6 +180,14 @@ pub fn serial_newer(a: u32, b: u32) -> bool {
 /// fought over. Covers the end of a grab racing a client's move.
 pub const DESKTOP_GRACE: Duration = Duration::from_millis(300);
 
+/// How long after a maximise/restore (or fullscreen) state change the desktop
+/// may still report the geometry of the state it is leaving. The compositor's
+/// configure already gave X the new size; a report at the position the
+/// desktop already had in this window is that stale surface, not a move (an
+/// unmaximise's first `Changed` still carries the maximised surface, and the
+/// frame change alone makes it look like a new content rectangle).
+pub const SETTLE: Duration = Duration::from_millis(500);
+
 /// A MoveResize to send for a window: at most one per window is in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MoveResize {
@@ -228,6 +236,9 @@ struct Win {
     /// The user has a grab on it on the desktop (`st::USER` in its latest
     /// state).
     grab: bool,
+    /// A maximise/restore state change: the X rectangle the compositor just
+    /// configured, and until when the desktop may still report the old one.
+    settle: Option<(Rect, Instant)>,
     /// A user-initiated desktop change that came while a MoveResize was in
     /// flight.
     overridden: Option<Rect>,
@@ -309,6 +320,7 @@ impl Geometry {
             w.x_echo = None;
             w.desk = None;
             w.serial = None;
+            w.settle = None;
         }
     }
 
@@ -342,6 +354,27 @@ impl Geometry {
     /// The desktop's rectangle of `xid` as last reported (None: not yet).
     pub fn desk(&self, xid: Xid) -> Option<Rect> {
         self.wins.get(&xid)?.desk
+    }
+
+    /// The bridge changed the window's frame (the header detached on
+    /// maximise/fullscreen or came back on restore): `desk` is still the same
+    /// desktop surface, but its content rectangle is now `content` (reverse
+    /// converted it through the old and the new frame). Nothing moves.
+    pub fn reframe_desk(&mut self, xid: Xid, content: Rect) {
+        if let Some(w) = self.wins.get_mut(&xid) {
+            w.desk = Some(content);
+        }
+    }
+
+    /// A maximise/restore (or fullscreen) state change: the compositor has
+    /// just configured the X window to `expected`, and for [`SETTLE`] a
+    /// desktop report at the position it already had is the surface of the
+    /// state it is leaving, not a move. A report at another position (the
+    /// restored place) ends it.
+    pub fn settle(&mut self, xid: Xid, expected: Rect, now: Instant) {
+        if let Some(w) = self.wins.get_mut(&xid) {
+            w.settle = Some((expected, now + SETTLE));
+        }
     }
 
     /// The X window's rectangle as last known.
@@ -578,6 +611,20 @@ impl Geometry {
             w.late = None;
             if w.pending.is_some() {
                 return None;
+            }
+        }
+        if let Some((_expected, until)) = w.settle {
+            if now >= until {
+                w.settle = None;
+            } else if prev.is_some_and(|p| (p.x, p.y) == (rect.x, rect.y)) {
+                // The desktop reports the position it already had: the
+                // surface of the state it is leaving (see `settle`; its
+                // reported size is X's own anyway), not a move. Keep the
+                // geometry we had, X keeps the configure.
+                w.desk = prev;
+                return None;
+            } else {
+                w.settle = None; // the desktop moved it to the restored place
             }
         }
         if w.pending.is_some() && prev.is_some_and(|p| (p.x, p.y) == (rect.x, rect.y)) {
@@ -2492,6 +2539,63 @@ mod tests {
         g.x_sent(XID, back, 30);
         assert_eq!(g.x_configured(XID, back, 30, t), None);
         assert_eq!(g.changed(XID, a, 0, 13, t), Some(a), "X follows it back");
+    }
+
+    /// The restore configure of a maximised window: the first desktop report
+    /// still carries the maximised surface while the bridge has already
+    /// detached the header (frame NONE -> chrome), so the same surface is a
+    /// different *content* rectangle. It is not a move: X keeps the restore
+    /// size instead of re-sending the maximised rectangle (rc_fix4 item 1,
+    /// section 10.1 of rc_0.3.0_vm2.md).
+    #[test]
+    fn a_restore_echo_does_not_resend_the_maximised_rectangle() {
+        let t = t0();
+        let pre = Rect::new(200, 200, 366, 266);
+        let mut g = synced(pre);
+        // maximised: the compositor configure, frame NONE (content = surface)
+        let max = Rect::new(67, 32, 1853, 1168);
+        g.x_sent(XID, max, 10);
+        assert_eq!(g.x_configured(XID, max, 10, t), None);
+        assert_eq!(g.changed(XID, max, st::MAXIMIZED, 11, t), None);
+        // restore configure: X gets the pre-maximise *size* at the maximised
+        // position; the position comes with a later Changed
+        let sized = Rect::new(67, 32, 366, 266);
+        g.x_sent(XID, sized, 20);
+        assert_eq!(g.x_configured(XID, sized, 20, t), None);
+        g.settle(XID, sized, t);
+        // the header came back: the same maximised surface is now
+        // (67,32,1853,1168) -> content (73,78,1841,1116). Its position is
+        // the one the desktop already had: the stale state surface, no move.
+        let stale = Rect::new(73, 78, 1841, 1116);
+        g.reframe_desk(XID, stale);
+        // the sync takes its size from X (desktop_position), so the report
+        // is (73,78) with X's restore size
+        assert_eq!(g.changed(XID, Rect::new(73, 78, 366, 266), 0, 12, t), None);
+        assert_eq!(g.x_rect(XID), Some(sized), "X keeps the restore size");
+        // the desktop moves it to the pre-maximise position: followed
+        assert_eq!(
+            g.changed(XID, Rect::new(200, 200, 366, 266), 0, 13, t),
+            Some(pre)
+        );
+        g.x_sent(XID, pre, 30); // the caller configures X to what it returned
+        assert_eq!(g.x_rect(XID), Some(pre));
+    }
+
+    /// The settle window is bounded: a report of another size after it is a
+    /// real desktop move again (a maximised bridge window is still resizable
+    /// from the desktop after the transition).
+    #[test]
+    fn a_settle_window_expires() {
+        let t = t0();
+        let expected = Rect::new(0, 0, 400, 300);
+        let mut g = synced(expected);
+        g.settle(XID, expected, t);
+        // the same position, another size: a stale state surface while
+        // settling, a real desktop resize once the window has passed
+        let other = Rect::new(0, 0, 500, 400);
+        assert_eq!(g.changed(XID, other, 0, 11, t), None, "still settling");
+        let later = ms(t, SETTLE.as_millis() as u64 + 1);
+        assert_eq!(g.changed(XID, other, 0, 12, later), Some(other));
     }
 
     /// A state-only report (focus, keep-above) while X's own move waits
