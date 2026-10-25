@@ -4,25 +4,21 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use x11rb_protocol::protocol::xfixes;
 
-/// How much may be queued for one client before it is given up on. Events are
-/// pushed from the Wayland thread and replies from the connection thread, and
-/// neither waits on the socket: a writer thread per client drains the queue,
-/// so a client that stops reading (stopped, or wedged) only ever costs memory,
-/// up to this much, rather than stalling capture and the clipboard for every
-/// other client. A full-screen `GetImage` reply is tens of MB on a big screen,
-/// so this allows a few of those in flight; a single write is never refused
-/// on its own, however large.
+/// How much may be queued for one client before its replies wait. Events are
+/// pushed from the Wayland thread and replies from the connection thread; a
+/// writer thread per client drains the queue, so a client that stops reading
+/// (stopped, or wedged) only ever costs memory, up to this much, rather than
+/// stalling capture and the clipboard for every other client. Replies wait for
+/// space here (the connection thread blocks, which applies backpressure to
+/// that client); server events are dropped if they do not fit, because the
+/// Wayland thread must never wait on a client. A full-screen `GetImage` reply
+/// is tens of MB on a big screen, so a single write is never refused on its
+/// own: the queue takes an oversize reply when it is otherwise empty.
 const MAX_QUEUED_BYTES: usize = 64 << 20;
-
-/// How long one write may block before the client is given up on. With the
-/// queue bounded above this is belt and braces, but a client that has not
-/// read a byte in this long is not coming back.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The outbound queue, plus the last sequence stamped into it (in full: the
 /// wire carries its low 16 bits).
@@ -110,9 +106,10 @@ impl Client {
     /// Takes a duplicate of the connection's socket for writing, and starts
     /// the writer thread that drains the queue into it.
     pub fn new(writer: UnixStream) -> std::io::Result<Arc<Self>> {
-        // the option is on the socket, so the connection thread's reads on its
-        // duplicate fd are unaffected
-        let _ = writer.set_write_timeout(Some(WRITE_TIMEOUT));
+        // no write timeout: a client that stops reading must not be dropped
+        // (x11vnc is both the wrapped command and a client; an XIO would take
+        // the bridge down with it). The queue bounds its memory, and replies
+        // wait for space, so a slow client only slows itself.
         let socket = writer.try_clone()?;
         let client = Arc::new(Self {
             outbox: Mutex::new(Outbox {
@@ -147,6 +144,8 @@ impl Client {
                 loop {
                     if let Some(item) = o.queue.pop_front() {
                         o.bytes -= item.0.len();
+                        // a reply waiting for queue space (see `enqueue`)
+                        self.outbox_ready.notify_all();
                         break Some(item);
                     }
                     if o.closed {
@@ -171,27 +170,44 @@ impl Client {
         }
     }
 
-    /// Queues `buf` for the writer thread, or drops the client if it has
-    /// fallen too far behind. Call with the outbox locked.
-    fn enqueue(&self, o: &mut Outbox, buf: Vec<u8>, fd: Option<OwnedFd>) {
-        if o.closed {
-            return;
+    /// Queues `buf` for the writer thread. Call with the outbox locked.
+    ///
+    /// A reply (`wait`) waits until the queue has room: the connection thread
+    /// is the only producer of replies, so blocking it slows that client's
+    /// requests and X does not let it run ahead of what it reads. An event
+    /// (no `wait`) is dropped if it does not fit: the Wayland/capture thread
+    /// pushes those for every client and must never wait on one, and events
+    /// are recoverable (the next damage or configure carries the state again)
+    /// whereas dropping the client could take a wrapped VNC server with it.
+    /// Neither path drops the client: a client that misbehaves or disconnects
+    /// must never end the bridge.
+    fn enqueue<'a>(
+        &self,
+        mut o: MutexGuard<'a, Outbox>,
+        buf: Vec<u8>,
+        fd: Option<OwnedFd>,
+        wait: bool,
+    ) -> MutexGuard<'a, Outbox> {
+        while o.bytes > 0 && o.bytes + buf.len() > MAX_QUEUED_BYTES {
+            if o.closed || !wait {
+                // an event does not fit: drop that event, not the client
+                if !o.closed {
+                    crate::vlog!(
+                        "dropping server event for a client with {} bytes queued",
+                        o.bytes
+                    );
+                }
+                return o;
+            }
+            o = self.outbox_ready.wait(o).unwrap();
         }
-        // an empty queue always takes the write: the cap is about a backlog,
-        // and one oversize reply (a huge GetImage) is not one
-        if o.bytes > 0 && o.bytes + buf.len() > MAX_QUEUED_BYTES {
-            crate::vlog!("dropping client: {} bytes queued and not read", o.bytes);
-            self.dead.store(true, Ordering::Relaxed);
-            o.closed = true;
-            o.queue.clear();
-            o.bytes = 0;
-            let _ = self.socket.shutdown(Shutdown::Both);
-            self.outbox_ready.notify_one();
-            return;
+        if o.closed {
+            return o;
         }
         o.bytes += buf.len();
         o.queue.push_back((buf, fd));
         self.outbox_ready.notify_one();
+        o
     }
 
     /// Marks the client dead and shuts its socket down, so the connection
@@ -219,8 +235,8 @@ impl Client {
 
     /// Queues the connection-setup bytes, the only write with no sequence.
     pub fn write_setup(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut o = self.outbox.lock().unwrap();
-        self.enqueue(&mut o, bytes.to_vec(), None);
+        let o = self.outbox.lock().unwrap();
+        let o = self.enqueue(o, bytes.to_vec(), None, true);
         self.check_open(&o)
     }
 
@@ -232,7 +248,7 @@ impl Client {
         let seq = o.monotonic(widen(self.seq.load(Ordering::Relaxed), seq));
         buf[2..4].copy_from_slice(&(seq as u16).to_le_bytes());
         o.last_seq = seq;
-        self.enqueue(&mut o, buf.to_vec(), None);
+        let o = self.enqueue(o, buf.to_vec(), None, true);
         self.check_open(&o)
     }
 
@@ -243,7 +259,7 @@ impl Client {
         let seq = o.monotonic(widen(self.seq.load(Ordering::Relaxed), seq));
         buf[2..4].copy_from_slice(&(seq as u16).to_le_bytes());
         o.last_seq = seq;
-        self.enqueue(&mut o, buf.to_vec(), Some(fd));
+        let o = self.enqueue(o, buf.to_vec(), Some(fd), true);
         self.check_open(&o)
     }
 
@@ -262,7 +278,7 @@ impl Client {
         let seq = o.monotonic(self.seq.load(Ordering::Relaxed));
         buf[2..4].copy_from_slice(&(seq as u16).to_le_bytes());
         o.last_seq = seq;
-        self.enqueue(&mut o, buf.to_vec(), None);
+        drop(self.enqueue(o, buf.to_vec(), None, false));
     }
 
     fn check_open(&self, o: &Outbox) -> std::io::Result<()> {
@@ -555,39 +571,58 @@ mod tests {
     }
 
     #[test]
-    fn a_client_that_stops_reading_is_dropped_at_the_cap() {
-        let (a, b) = UnixStream::pair().unwrap();
+    fn a_slow_client_gets_backpressure_instead_of_being_dropped() {
+        let (a, mut b) = UnixStream::pair().unwrap();
         let client = Client::new(a).unwrap();
-        // nobody reads `b`, so the socket buffer fills and the queue grows
+        // nobody reads `b` at first, so the socket buffer fills and the queue
+        // grows to the cap; the reply that does not fit must wait there.
         let chunk = vec![0u8; 1 << 20];
-        let mut sent = 0usize;
-        let mut dropped = false;
-        while sent <= MAX_QUEUED_BYTES + (1 << 20) {
-            if client.send_reply(1, &mut chunk.clone()).is_err() {
-                dropped = true;
+        let sender = client.clone();
+        let t = std::thread::spawn(move || {
+            let mut n = 0;
+            for _ in 0..70 {
+                if sender.send_reply(1, &mut chunk.clone()).is_err() {
+                    return n;
+                }
+                n += 1;
+            }
+            n
+        });
+        let mut at_cap = false;
+        for _ in 0..500 {
+            if client.outbox.lock().unwrap().bytes >= MAX_QUEUED_BYTES {
+                at_cap = true;
                 break;
             }
-            sent += chunk.len();
-        }
-        assert!(dropped, "sent {sent} bytes without being dropped");
-        assert!(client.is_dead());
-        assert!(client.send_reply(1, &mut frame(1)).is_err());
-        // the queue was discarded, not left holding the memory
-        assert_eq!(client.outbox.lock().unwrap().bytes, 0);
-        // the socket was shut down, so the connection thread's read would end
-        let mut peek = [0u8; 1];
-        let mut b = b;
-        b.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        // drain whatever the writer managed to push before the shutdown
-        let mut sink = vec![0u8; 1 << 16];
-        loop {
-            match b.read(&mut sink) {
-                Ok(0) => break,
-                Ok(_) => continue,
-                Err(e) => panic!("read after shutdown failed: {e}"),
+            if t.is_finished() {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(b.read(&mut peek).unwrap(), 0);
+        assert!(
+            at_cap,
+            "the sender never filled the {MAX_QUEUED_BYTES}-byte queue"
+        );
+        assert!(!t.is_finished(), "the reply did not wait for queue space");
+        // a server event that does not fit is dropped; the client is not
+        let mut ev = frame(1);
+        client.send_event_bytes(&mut ev);
+        assert!(!client.is_dead(), "a full queue dropped the client");
+        // drain: the blocked reply completes and the client stays usable
+        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut got = 0usize;
+        let mut sink = vec![0u8; 1 << 16];
+        while got < 70 << 20 {
+            let n = b.read(&mut sink).unwrap();
+            assert!(n > 0);
+            got += n;
+        }
+        assert_eq!(t.join().unwrap(), 70);
+        assert!(
+            !client.is_dead(),
+            "the slow client was dropped after draining"
+        );
+        assert!(client.send_reply(1, &mut frame(2)).is_ok());
     }
 
     const CLIP: u32 = 83;

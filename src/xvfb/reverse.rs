@@ -933,6 +933,61 @@ fn cursor_shape(e: decor::Edge) -> wp_cursor_shape_device_v1::Shape {
     }
 }
 
+/// The resize edge of a CSD window's shadow border: `p` is content-local
+/// logical, `content` is the X content size, `ext` the `_GTK_FRAME_EXTENTS`
+/// in X pixels.  The borders are the four `_GTK_FRAME_EXTENTS` margins; a
+/// corner is where two of them meet.
+fn csd_edge_at(
+    p: (f64, f64),
+    content: (u16, u16),
+    ext: [i32; 4],
+    scale: u32,
+) -> Option<decor::Edge> {
+    if ext.iter().any(|v| *v <= 0) {
+        return None;
+    }
+    let s = f64::from(scale.max(1));
+    // X pixels: the extents and the content size are X; the pointer is
+    // logical (X / S).
+    let (px, py) = (p.0 * s, p.1 * s);
+    let (cw, ch) = (f64::from(content.0), f64::from(content.1));
+    let (l, r, t, b) = (
+        f64::from(ext[0]),
+        f64::from(ext[1]),
+        f64::from(ext[2]),
+        f64::from(ext[3]),
+    );
+    let (left, right) = (px < l, px >= cw - r);
+    let (top, bottom) = (py < t, py >= ch - b);
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(decor::Edge::NorthWest),
+        (_, true, true, _) => Some(decor::Edge::NorthEast),
+        (true, _, _, true) => Some(decor::Edge::SouthWest),
+        (_, true, _, true) => Some(decor::Edge::SouthEast),
+        (true, _, _, _) => Some(decor::Edge::West),
+        (_, true, _, _) => Some(decor::Edge::East),
+        (_, _, true, _) => Some(decor::Edge::North),
+        (_, _, _, true) => Some(decor::Edge::South),
+        _ => None,
+    }
+}
+
+/// The xdg_toplevel resize edge for a decor edge (a CSD shadow border or a
+/// bridge frame edge).
+fn toplevel_edge(e: decor::Edge) -> xdg_toplevel::ResizeEdge {
+    use xdg_toplevel::ResizeEdge;
+    match e {
+        decor::Edge::North => ResizeEdge::Top,
+        decor::Edge::South => ResizeEdge::Bottom,
+        decor::Edge::East => ResizeEdge::Right,
+        decor::Edge::West => ResizeEdge::Left,
+        decor::Edge::NorthWest => ResizeEdge::TopLeft,
+        decor::Edge::NorthEast => ResizeEdge::TopRight,
+        decor::Edge::SouthWest => ResizeEdge::BottomLeft,
+        decor::Edge::SouthEast => ResizeEdge::BottomRight,
+    }
+}
+
 /// The user data of a `wl_surface`/// The user data of a `wl_surface`: the shown window whose X window its
 /// pixels are, and whether it is the content or the header. The header is a
 /// `wl_subsurface` of the content surface, so its surface-local coordinates
@@ -1233,6 +1288,11 @@ struct Shown {
     /// What the frame may do (the section 5.1 decision), for the header and
     /// `_NET_FRAME_EXTENTS`.
     decision: decor::Decision,
+    /// A client-side-decorated window's `_GTK_FRAME_EXTENTS`, cached: its
+    /// shadow margins are the frame's resize border (`csd_edge`).  Cached so
+    /// the pointer-motion edge cursor does not make an X round-trip per
+    /// motion; refreshed on the property's PropertyNotify.
+    csd: Option<[i32; 4]>,
     /// The header, when framed (its own `wl_subsurface`).
     chrome: Option<Chrome>,
     /// The window geometry last set (`content` at the surface offset).
@@ -2528,7 +2588,15 @@ impl State {
             s.xdg_surface
                 .set_window_geometry(geom.0, geom.1, geom.2, geom.3);
             s.window_geometry = geom;
-            s.surface.commit();
+            // The geometry applies with the next buffer commit.  Do not
+            // commit here: an empty commit consumes the pending
+            // xdg_surface.ack_configure, and mutter then never matches the
+            // ack to its configure.  The configure stays pending, and when a
+            // maximise comes `save_rect` takes the saved
+            // rectangle from that stale configure (which has no position, so
+            // x/y stay 0): a decorated window unmaximised to the work-area
+            // origin instead of where it was.  The buffer commit in
+            // `try_paint` carries the ack instead.
         }
         self.paint_shadow(w);
     }
@@ -2615,6 +2683,49 @@ impl State {
 
     #[cfg(not(feature = "gnome"))]
     fn poll_settings(&mut self) {}
+
+    /// The resize border of a client-side-decorated (CSD) window: the
+    /// `_GTK_FRAME_EXTENTS` shadow margins around its content are the frame's
+    /// resize border, as a window manager's frame is on Xwayland.  The client
+    /// does not treat them as content (GTK's own CSD hit-test is inside the
+    /// content), so without this a drag at the frame's bottom-right corner
+    /// reaches the client and does nothing.  `p` is content-local logical.
+    fn csd_edge(&self, w: Window, p: (f64, f64)) -> Option<decor::Edge> {
+        let s = self.windows.get(&w)?;
+        if s.frame.is_framed() || !matches!(s.role, Role::Toplevel(_)) {
+            return None;
+        }
+        let ext = s.csd?;
+        csd_edge_at(p, (s.width, s.height), ext, self.scale())
+    }
+
+    /// A press in a CSD window's shadow resize border: starts the desktop's
+    /// interactive resize.  The client did not ask for this itself: GTK's CSD
+    /// shadow margins are not its content, so it ignores a press there (which
+    /// still reaches X, like a press on a window manager's frame window).
+    fn csd_press(&mut self, w: Window, button: u32, serial: u32, p: (f64, f64)) -> bool {
+        if button != 1 {
+            return false;
+        }
+        let Some(edge) = self.csd_edge(w, p) else {
+            return false;
+        };
+        let (Some(seat), Some(s)) = (self.seat.as_ref(), self.windows.get(&w)) else {
+            return false;
+        };
+        let Role::Toplevel(t) = &s.role else {
+            return false;
+        };
+        let t = t.clone();
+        t.resize(seat, serial, toplevel_edge(edge));
+        crate::log!("-showwindows: {w:#x} CSD shadow border: resize ({edge:?}) from the press");
+        // The compositor has the resize grab.  The press also goes to X, as it
+        // would on a window manager's frame window: consuming it here left the
+        // X button state without the press that the client's later clicks
+        // follow (GTK 4 stopped treating the next double-click as one and did
+        // not maximise), while the client ignores a press in its own shadow.
+        false
+    }
 
     /// The header action of a press at content-local `p`: true when the
     /// header consumed it (the press never reaches X). `serial` is the
@@ -2833,7 +2944,7 @@ impl State {
         let w = self.pointer_on?;
         let s = self.windows.get(&w)?;
         if !s.frame.is_framed() {
-            return None;
+            return self.csd_edge(w, self.pointer_s?);
         }
         let p = self.pointer_s?;
         let (ox, oy) = s.frame.content_origin();
@@ -3241,6 +3352,11 @@ impl State {
             },
         );
         let client = self.client_of(w);
+        let csd = if frame.is_framed() {
+            None
+        } else {
+            self.gtk_frame_extents(w)
+        };
         let shown = Shown {
             x,
             y,
@@ -3276,6 +3392,7 @@ impl State {
             present: None,
             frame,
             decision,
+            csd,
             chrome,
             window_geometry: if frame.is_framed() {
                 let (sw, sh) = self.surface_x(frame, (width, height));
@@ -3623,6 +3740,7 @@ impl State {
                     minimize: false,
                     maximize: false,
                 },
+                csd: None,
                 chrome: None,
                 window_geometry: (0, 0, i32::from(width), i32::from(height)),
             },
@@ -3950,6 +4068,17 @@ impl State {
                     s.dirty = true;
                 }
                 self.paint(e.window);
+            }
+            // a CSD window's shadow margins changed: refresh the cached
+            // resize border (no X round-trip on every pointer motion)
+            Event::PropertyNotify(e)
+                if e.atom == self.atoms.gtk_frame_extents
+                    && self.windows.contains_key(&e.window) =>
+            {
+                let ext = self.gtk_frame_extents(e.window);
+                if let Some(s) = self.windows.get_mut(&e.window) {
+                    s.csd = if s.frame.is_framed() { None } else { ext };
+                }
             }
             // a mode emulated for this fullscreen window (the agent set the
             // property): present it scaled on its monitor
@@ -7168,6 +7297,7 @@ impl State {
                     minimize: false,
                     maximize: false,
                 },
+                csd: None,
                 chrome: None,
                 window_geometry: (0, 0, i32::from(sw), i32::from(sh)),
             },
@@ -8098,9 +8228,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     // wl_pointer gives Linux BTN_* codes; the header's
                     // actions are X buttons (1/2/3), as `button()` maps them
                     let xb = injectable_button(button).map_or(button, u32::from);
-                    let consumed = state
-                        .pointer_on
-                        .is_some_and(|w| state.header_press(w, xb, serial, p));
+                    let consumed = state.pointer_on.is_some_and(|w| {
+                        state.header_press(w, xb, serial, p) || state.csd_press(w, xb, serial, p)
+                    });
                     if consumed {
                         // the header took it: no XTest press reaches the client
                         state.header_button = Some(button);
@@ -9458,5 +9588,49 @@ mod tests {
         // a fullscreen game on the second monitor adds its X origin once
         let p = present_game_point((236.25, 156.25), (1920, 0), game, dest, offset, 2.0);
         assert_eq!(selfdrag::root_position(p, (3840, 1200), 2.0), (2120, 200));
+    }
+
+    #[test]
+    fn a_csd_shadow_margin_is_a_resize_border_at_1x_and_2x() {
+        // GTK 4's measured extents and a 300x200 content
+        let ext = [14, 14, 12, 17];
+        // inside the content: no border
+        assert_eq!(csd_edge_at((150.0, 100.0), (300, 200), ext, 1), None);
+        assert_eq!(csd_edge_at((150.0, 100.0), (600, 400), ext, 2), None);
+        // the shadow bands, at S = 1
+        assert_eq!(
+            csd_edge_at((5.0, 100.0), (300, 200), ext, 1),
+            Some(decor::Edge::West)
+        );
+        assert_eq!(
+            csd_edge_at((295.0, 100.0), (300, 200), ext, 1),
+            Some(decor::Edge::East)
+        );
+        assert_eq!(
+            csd_edge_at((150.0, 5.0), (300, 200), ext, 1),
+            Some(decor::Edge::North)
+        );
+        assert_eq!(
+            csd_edge_at((150.0, 195.0), (300, 200), ext, 1),
+            Some(decor::Edge::South)
+        );
+        assert_eq!(
+            csd_edge_at((5.0, 5.0), (300, 200), ext, 1),
+            Some(decor::Edge::NorthWest)
+        );
+        assert_eq!(
+            csd_edge_at((295.0, 195.0), (300, 200), ext, 1),
+            Some(decor::Edge::SouthEast)
+        );
+        // S = 2: the pointer is logical, the extents/content are X pixels, so
+        // the same logical margins are half as wide (297,197 -> 594,394 X)
+        assert_eq!(
+            csd_edge_at((297.0, 197.0), (600, 400), ext, 2),
+            Some(decor::Edge::SouthEast)
+        );
+        // 292,190 -> 584,380 X: inside the 586/383 X content edges
+        assert_eq!(csd_edge_at((292.0, 190.0), (600, 400), ext, 2), None);
+        // no extents: not a CSD border
+        assert_eq!(csd_edge_at((1.0, 1.0), (300, 200), [0, 0, 0, 0], 1), None);
     }
 }
